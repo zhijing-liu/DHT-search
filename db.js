@@ -49,7 +49,7 @@ function loadConfig() {
     return {};
   }
 }
-const CONFIG = loadConfig();
+export const CONFIG = loadConfig();
 
 /** 源库主表名 */
 export const TABLE = 'magnets';

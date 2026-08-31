@@ -19,17 +19,17 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { createMagnetDb } from './db.js';
+import { createMagnetDb, CONFIG } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-/** 整集拉取的安全上限：单次请求最多返回这么多条，超出则 truncated=true */
-const MAX_RESULTS = 20000;
+/** 整集拉取的安全上限：单次请求最多返回这么多条，超出则 truncated=true；可由 config.json 的 maxResults 覆盖 */
+const MAX_RESULTS = CONFIG.maxResults ? Number(CONFIG.maxResults) : 20000;
 
 const SORT_WHITELIST = new Set(['fetchedAt', 'totalSize', 'relevance']);
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(CONFIG.port) || Number(process.env.PORT) || 3000;
 
 const api = createMagnetDb();
 

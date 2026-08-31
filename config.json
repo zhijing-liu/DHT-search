@@ -1,4 +1,6 @@
 {
   "sourceDbPath": "data/magnet.db",
-  "indexDbPath": "data/dht.search.db"
+  "indexDbPath": "data/dht.search.db",
+  "port": 3000,
+  "maxResults": 20000
 }
