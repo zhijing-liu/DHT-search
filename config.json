@@ -1,0 +1,4 @@
+{
+  "sourceDbPath": "data/magnet.db",
+  "indexDbPath": "data/dht.search.db"
+}

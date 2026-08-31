@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DHT Search</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand">DHT Search</span>
+    <span class="sub">基于 FTS5 全文检索</span>
+    <span id="countBadge" class="count-badge">加载中…</span>
+  </header>
+
+  <main class="container">
+    <section class="search-area">
+      <input id="q" type="text" placeholder="输入关键词搜索" autocomplete="off" />
+      <dht-sort-group id="sortGroup"></dht-sort-group>
+      <button id="searchBtn">搜索</button>
+      <button id="reindexBtn" type="button" title="源库被改/删后，手动重建本地索引">重建索引</button>
+    </section>
+
+    <div id="status" class="status"></div>
+
+    <result-list id="results"></result-list>
+
+    <div class="pager-row">
+      <nav id="pager" class="pager" hidden></nav>
+      <label class="page-size">
+        每页
+        <input id="pageSize" type="number" min="10" max="200" step="10" value="20" />
+        条
+      </label>
+    </div>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
