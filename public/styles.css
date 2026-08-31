@@ -69,10 +69,14 @@ body {
   flex-wrap: nowrap;
   min-width: 0;
 }
-.search-area input {
+.search-input-wrap {
+  position: relative;
   flex: 1 1 320px;
   min-width: 0;
-  padding: 12px 14px;
+}
+.search-input-wrap input {
+  width: 100%;
+  padding: 12px 40px 12px 14px; /* 右侧留出清空按钮空间 */
   border-radius: 10px;
   border: 1px solid var(--border);
   background: var(--card);
@@ -80,10 +84,37 @@ body {
   font-size: 15px;
   outline: none;
 }
-.search-area input:focus {
+.search-input-wrap input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
 }
+/* 注意：必须用 .search-input-wrap .clear-btn 提升优先级，
+   覆盖 .search-area button 的通用样式（height/padding/渐变背景等） */
+.search-input-wrap .clear-btn {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.search-input-wrap .clear-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  filter: none;
+}
+.search-input-wrap .clear-btn[hidden] { display: none; }
 .search-area button {
   display: inline-flex;
   align-items: center;
@@ -124,6 +155,30 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+
+/* 热词气泡（无搜索内容时的默认视图） */
+.hot-words {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 16px 0;
+}
+.hot-chip {
+  padding: 8px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+.hot-chip:hover {
+  border-color: var(--accent);
+  background: rgba(59, 130, 246, 0.12);
+  transform: translateY(-1px);
+}
 
 .pager {
   flex: none;

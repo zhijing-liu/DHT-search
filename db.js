@@ -89,6 +89,17 @@ const SELECT_COLUMNS = 'm.id, m.name, m.infohash, m.magnet, m.files, m.totalSize
 /** 只保留字母与数字，用于从用户输入中提取安全 token */
 const TOKEN_PATTERN = /[\p{L}\p{N}]+/gu;
 
+/** 热词统计表名（构建索引时随 populate 统计写入） */
+export const KEYWORD_TABLE = 'keyword_stats';
+/** 热词过滤表名（用户配置的噪声词；reindex 不清除） */
+export const KEYWORD_FILTER_TABLE = 'keyword_filter';
+/** 热词统计来源列：只统计 name，避开 files JSON 键名（path/size）噪声 */
+const KEYWORD_SOURCE = 'name';
+/** 热词过滤：低于此长度的 token 丢弃（去单字符噪声） */
+const MIN_KEYWORD_LEN = 2;
+/** 热词过滤：纯数字 token（年份/大小等噪声）丢弃 */
+const NUMERIC_ONLY = /^\d+$/;
+
 /* ------------------------------------------------------------------ */
 /* 工具函数                                                            */
 /* ------------------------------------------------------------------ */
@@ -137,6 +148,17 @@ function parseFiles(raw) {
 /** 把数据库行加工为对外返回的行对象 */
 function mapRow(row) {
   return { ...row, files: parseFiles(row.files) };
+}
+
+/** 从文本提取合格的热词 token（与 unicode61 折叠行为对齐：小写 + 去噪） */
+function keywordTokens(text) {
+  const out = [];
+  for (const t of String(text ?? '').match(TOKEN_PATTERN) ?? []) {
+    const w = t.toLowerCase();
+    if (w.length < MIN_KEYWORD_LEN || NUMERIC_ONLY.test(w)) continue;
+    out.push(w);
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -200,6 +222,12 @@ function populate(db, rowsIterable) {
   const CHUNK = 1000;
   let ftsBuf = [];
   let docBuf = [];
+  // 热词过滤集：populate 前从过滤表加载，统计时排除用户配置的噪声词
+  const filter = new Set(
+    db.all(sql`SELECT term FROM ${sql.raw(KEYWORD_FILTER_TABLE)}`).map((r) => r.term)
+  );
+  /** 热词累计：term -> { doc, occ }，随批次 flush 落库，控制内存峰值 */
+  const kwMap = new Map();
   const flush = () => {
     if (!docBuf.length) return;
     db.transaction((tx) => {
@@ -219,13 +247,34 @@ function populate(db, rowsIterable) {
         }));
         tx.insert(magnetsDocs).values(slice).run();
       }
+      // 热词 upsert 合并计数（全量重建时表已被清空，增量时按新行累加）
+      for (const [term, k] of kwMap) {
+        tx.run(sql`INSERT INTO ${sql.raw(KEYWORD_TABLE)} (term, doc_count, occurrences)
+          VALUES (${term}, ${k.doc}, ${k.occ})
+          ON CONFLICT(term) DO UPDATE SET
+            doc_count = doc_count + excluded.doc_count,
+            occurrences = occurrences + excluded.occurrences`);
+      }
     });
     ftsBuf = [];
     docBuf = [];
+    kwMap.clear();
   };
   for (const r of rowsIterable) {
     ftsBuf.push(r);
     docBuf.push(r);
+    // 热词统计：同一文档内去重，doc_count 只计一次
+    const seen = new Set();
+    for (const w of keywordTokens(r[KEYWORD_SOURCE])) {
+      if (filter.has(w)) continue;
+      const e = kwMap.get(w) ?? { doc: 0, occ: 0 };
+      e.occ += 1;
+      if (!seen.has(w)) {
+        seen.add(w);
+        e.doc += 1;
+      }
+      kwMap.set(w, e);
+    }
     if (docBuf.length >= REBUILD_BATCH) flush();
   }
   flush();
@@ -246,6 +295,13 @@ function fullRebuild(db, src) {
   )`);
   db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_fetchedAt`)} ON ${sql.raw(DOCS_TABLE)}(fetchedAt)`);
   db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`);
+  // 热词统计表：全量重建时清空重建，随 populate 重新统计
+  db.run(sql`DROP TABLE IF EXISTS ${sql.raw(KEYWORD_TABLE)}`);
+  db.run(sql`CREATE TABLE ${sql.raw(KEYWORD_TABLE)} (
+    term TEXT PRIMARY KEY,
+    doc_count INTEGER NOT NULL DEFAULT 0,
+    occurrences INTEGER NOT NULL DEFAULT 0
+  )`);
 
   const stmt = src.prepare(`SELECT ${DOCS_COLUMNS} FROM ${TABLE}`);
   populate(db, stmt.iterate());
@@ -316,6 +372,18 @@ export function createMagnetDb(options = {}) {
   // 同步水位表（drizzle 不自动建表，按你的选择由 raw DDL 维护）
   db.run(sql`CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT)`);
 
+  // 热词统计表（同样由 raw DDL 维护；fullRebuild 会 DROP 重建保证干净）
+  db.run(sql`CREATE TABLE IF NOT EXISTS ${sql.raw(KEYWORD_TABLE)} (
+    term TEXT PRIMARY KEY,
+    doc_count INTEGER NOT NULL DEFAULT 0,
+    occurrences INTEGER NOT NULL DEFAULT 0
+  )`);
+  // 热词过滤表（用户配置；reindex 不清除，仅启动时确保存在）
+  db.run(sql`CREATE TABLE IF NOT EXISTS ${sql.raw(KEYWORD_FILTER_TABLE)} (
+    term TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL DEFAULT 0
+  )`);
+
   // 源库只读打开（构建时读取），并校验表存在 / 提示 WAL 模式
   const src = openSourceRO(sourcePath);
   try {
@@ -346,6 +414,48 @@ export function createMagnetDb(options = {}) {
   }
 
   /**
+   * 热词榜：按文档频率降序返回 top N 关键词。
+   * @param {number} [limit=50] 返回条数，钳制 1..1000
+   * @returns {Array<{term: string, doc_count: number, occurrences: number}>}
+   */
+  function topKeywords(limit = 50) {
+    const lim = clampInt(limit, 50, 1, 1000);
+    return dbRO.all(sql`
+      SELECT term, doc_count, occurrences
+      FROM ${sql.raw(KEYWORD_TABLE)}
+      WHERE term NOT IN (SELECT term FROM ${sql.raw(KEYWORD_FILTER_TABLE)})
+      ORDER BY doc_count DESC, occurrences DESC
+      LIMIT ${lim}
+    `);
+  }
+
+  /** 列出当前热词过滤词（按 term 排序） */
+  function listKeywordFilters() {
+    return dbRO.all(sql`
+      SELECT term, created_at
+      FROM ${sql.raw(KEYWORD_FILTER_TABLE)}
+      ORDER BY term
+    `);
+  }
+
+  /** 添加热词过滤词（幂等，小写归一；增量统计与热词榜均立即生效） */
+  function addKeywordFilter(term) {
+    const t = String(term).trim().toLowerCase();
+    if (!t) throw new TypeError('addKeywordFilter: term 不能为空');
+    db.run(sql`INSERT OR IGNORE INTO ${sql.raw(KEYWORD_FILTER_TABLE)} (term, created_at)
+      VALUES (${t}, ${Date.now()})`);
+    return t;
+  }
+
+  /** 删除热词过滤词（删除后该词重新出现在热词榜） */
+  function removeKeywordFilter(term) {
+    const t = String(term).trim().toLowerCase();
+    if (!t) throw new TypeError('removeKeywordFilter: term 不能为空');
+    db.run(sql`DELETE FROM ${sql.raw(KEYWORD_FILTER_TABLE)} WHERE term = ${t}`);
+    return t;
+  }
+
+  /**
    * FTS5 模糊搜索（name + files 两列，files 按整个 JSON 字符串匹配）。
    *
    * @param {Object} options
@@ -367,7 +477,8 @@ export function createMagnetDb(options = {}) {
       throw new TypeError('searchByHash: 未提供有效的 infohash');
     }
     const direction = String(order).toLowerCase() === 'asc' ? 'asc' : 'desc';
-    const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : `id:${direction}`;
+    // 未传 sortBy 时走 '' 键（按 id 升序），order 仅对显式 sortBy 生效
+    const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : '';
     const orderSql = ORDER_SQL[sortKey];
     const lim =
       limit === undefined || limit === null || Number(limit) <= 0
@@ -407,7 +518,8 @@ export function createMagnetDb(options = {}) {
     }
 
     const direction = String(order).toLowerCase() === 'asc' ? 'asc' : 'desc';
-    const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : `id:${direction}`;
+    // 未传 sortBy 时走 '' 键（按 id 升序），order 仅对显式 sortBy 生效
+    const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : '';
     const orderSql = ORDER_SQL[sortKey];
 
     const limit =
@@ -453,7 +565,17 @@ export function createMagnetDb(options = {}) {
     if (wdb.open) wdb.close();
   }
 
-  return { db, countMagnets, searchMagnets, reindex, close };
+  return {
+    db,
+    countMagnets,
+    searchMagnets,
+    topKeywords,
+    listKeywordFilters,
+    addKeywordFilter,
+    removeKeywordFilter,
+    reindex,
+    close,
+  };
 }
 
 export default createMagnetDb;

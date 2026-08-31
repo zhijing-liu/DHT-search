@@ -50,6 +50,7 @@ app.get('/index.html', (_req, res) => {
 });
 
 app.use(express.static(PUBLIC_DIR));
+app.use(express.json());
 
 app.get('/api/search', (req, res) => {
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
@@ -105,6 +106,51 @@ app.get('/api/count', (_req, res) => {
     res.json({ count: api.countMagnets() });
   } catch (err) {
     res.status(500).json({ error: err.message || 'count failed' });
+  }
+});
+
+/** 热词榜（暂未接入页面，用于验证落库数据） */
+app.get('/api/hot', (req, res) => {
+  try {
+    const limit = Number(req.query.limit);
+    res.json({ items: api.topKeywords(Number.isFinite(limit) ? limit : 50) });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'hot failed' });
+  }
+});
+
+/** 热词过滤词列表 */
+app.get('/api/hot/filter', (_req, res) => {
+  try {
+    res.json({ items: api.listKeywordFilters() });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'list filter failed' });
+  }
+});
+
+/** 添加热词过滤词（body: { term }） */
+app.post('/api/hot/filter', (req, res) => {
+  try {
+    const term = String(req.body?.term ?? '').trim().toLowerCase();
+    if (!term || !/[\p{L}\p{N}]/u.test(term)) {
+      return res.status(400).json({ error: 'term 不能为空且需包含字母或数字' });
+    }
+    res.json({ ok: true, term: api.addKeywordFilter(term) });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'add filter failed' });
+  }
+});
+
+/** 删除热词过滤词（query: ?term=） */
+app.delete('/api/hot/filter', (req, res) => {
+  try {
+    const term = String(req.query.term ?? '').trim().toLowerCase();
+    if (!term) {
+      return res.status(400).json({ error: 'term 不能为空' });
+    }
+    res.json({ ok: true, term: api.removeKeywordFilter(term) });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'remove filter failed' });
   }
 });
 

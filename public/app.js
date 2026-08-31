@@ -12,6 +12,8 @@ const state = {
   tokens: [],
   /** 当前查询命中总数（仅用于计算总页数；数据每次从后端按页拉取） */
   total: 0,
+  /** 热词数据：null=未加载；数组=已加载（无搜索内容时展示在结果区） */
+  hotItems: null,
 };
 
 /** 请求序号：防止快速翻页时旧请求后到覆盖新结果 */
@@ -19,8 +21,8 @@ let reqSeq = 0;
 
 const el = {
   q: document.getElementById('q'),
+  clearBtn: document.getElementById('clearBtn'),
   sortGroup: document.getElementById('sortGroup'),
-  searchBtn: document.getElementById('searchBtn'),
   reindexBtn: document.getElementById('reindexBtn'),
   status: document.getElementById('status'),
   results: document.getElementById('results'),
@@ -85,6 +87,64 @@ function renderResults(items) {
   el.results.appendChild(frag);
 }
 
+/* ---------- 热词（无搜索内容时的默认视图） ---------- */
+
+/** 把热词渲染为横向排列的气泡按钮，点击即触发对应关键词搜索 */
+function renderHotWords(items) {
+  el.results.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = '暂无热词数据';
+    el.results.appendChild(empty);
+    return;
+  }
+  const wrap = document.createElement('div');
+  wrap.className = 'hot-words';
+  for (const it of items) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'hot-chip';
+    chip.textContent = it.term;
+    chip.title = `搜索「${it.term}」`;
+    chip.addEventListener('click', () => {
+      el.q.value = it.term;
+      doSearch();
+    });
+    wrap.appendChild(chip);
+  }
+  el.results.appendChild(wrap);
+}
+
+/** 无搜索内容时展示热词视图（数据未加载则先拉取） */
+function showHotWords() {
+  if (state.hotItems === null) {
+    loadHotWords();
+    return;
+  }
+  setLoading(false);
+  el.pager.hidden = true;
+  el.status.textContent = state.hotItems.length ? '热门关键词' : '';
+  renderHotWords(state.hotItems);
+}
+
+/** 拉取热词榜数据；完成后仅当当前无搜索内容时渲染，避免覆盖搜索结果 */
+async function loadHotWords() {
+  try {
+    const resp = await fetch('/api/hot?limit=200');
+    const data = await resp.json();
+    state.hotItems = resp.ok ? data.items || [] : [];
+  } catch {
+    state.hotItems = [];
+  }
+  if (!state.query) {
+    setLoading(false);
+    el.pager.hidden = true;
+    el.status.textContent = state.hotItems.length ? '热门关键词' : '';
+    renderHotWords(state.hotItems);
+  }
+}
+
 function renderPager(totalPages) {
   el.pager.innerHTML = '';
   if (totalPages <= 1) {
@@ -133,7 +193,6 @@ function renderPager(totalPages) {
 
 function setLoading(on) {
   el.status.classList.toggle('loading', on);
-  el.searchBtn.disabled = on;
   if (on) el.status.textContent = '加载中…';
 }
 
@@ -207,8 +266,10 @@ function updateUrl() {
 
 async function doSearch(resetPage = true) {
   state.query = el.q.value.trim();
+  syncClearBtn();
   if (!state.query) {
-    el.status.textContent = '请输入搜索关键词';
+    // 没有搜索内容时展示热词视图
+    showHotWords();
     return;
   }
   if (resetPage) state.page = 1;
@@ -221,7 +282,15 @@ async function doSearch(resetPage = true) {
   await fetchPage();
 }
 
-el.searchBtn.addEventListener('click', doSearch);
+// 输入框值变化（失焦触发 change）：去除前后空格后有值则搜索，空值则回到热词视图
+el.q.addEventListener('change', () => {
+  const q = el.q.value.trim();
+  if (q) {
+    doSearch();
+  } else {
+    handleInputCleared();
+  }
+});
 el.q.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') doSearch();
 });
@@ -291,6 +360,44 @@ function initFromUrl() {
   if (q) doSearch(false); // 保留 URL 中的页码，不重置为第 1 页
 }
 initFromUrl();
+
+/* ---------- 输入框清空：清空/删空后同步 URL 并回到热词视图 ---------- */
+
+/** 输入框已为空：重置搜索状态、移除 URL 中的全部搜索参数、回到热词视图 */
+function handleInputCleared() {
+  const hadSearch = !!state.query;
+  state.query = '';
+  state.page = 1;
+  state.tokens = [];
+  state.total = 0;
+  history.replaceState(null, '', location.pathname); // 移除全部 query 参数
+  if (hadSearch) showHotWords();
+}
+
+/** 根据输入框内容同步清空按钮的显隐 */
+function syncClearBtn() {
+  el.clearBtn.hidden = el.q.value.trim() === '';
+}
+
+el.clearBtn.addEventListener('click', () => {
+  el.q.value = '';
+  syncClearBtn();
+  handleInputCleared();
+  el.q.focus();
+});
+
+let prevInput = '';
+el.q.addEventListener('input', () => {
+  syncClearBtn();
+  const isEmpty = el.q.value.trim() === '';
+  if (isEmpty && prevInput.trim() !== '') handleInputCleared();
+  prevInput = el.q.value;
+});
+
+syncClearBtn();
+
+// 无搜索内容时的默认视图：加载热词榜
+loadHotWords();
 
 el.pageSize.addEventListener('change', () => {
   applyPageSize(el.pageSize.value);

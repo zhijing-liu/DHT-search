@@ -10,6 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
+import { sql } from 'drizzle-orm';
 import { createMagnetDb, MAX_LIMIT } from './db.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -332,6 +333,61 @@ console.log('\n[9] infohash 精确检索（by=hash）');
   });
   check('无匹配返回空', () => {
     assert.equal(api.searchMagnets({ query: 'deadbeef'.repeat(5), by: 'hash' }).total, 0);
+  });
+  api.close();
+}
+
+console.log('\n[10] 热词统计（keyword_stats / topKeywords）');
+{
+  const api = openApi();
+  check('topKeywords 返回热词且 doc_count 正确（brunette 出现在 2 个文档）', () => {
+    const kw = api.topKeywords();
+    assert.ok(Array.isArray(kw));
+    const brunette = kw.find((k) => k.term === 'brunette');
+    assert.ok(brunette, '热词表中应存在 brunette');
+    assert.equal(brunette.doc_count, 2);
+    assert.ok(brunette.occurrences >= 2);
+  });
+  check('热词不含单字符与纯数字噪声', () => {
+    const kw = api.topKeywords(1000);
+    assert.ok(!kw.some((k) => k.term.length < 2 || /^\d+$/.test(k.term)));
+  });
+  check('limit 生效（topKeywords(2) 返回 2 条）', () => {
+    assert.equal(api.topKeywords(2).length, 2);
+  });
+  check('limit 非法值回退默认且不抛错（数据不足 50 时返回全部）', () => {
+    assert.doesNotThrow(() => api.topKeywords('abc'));
+    assert.ok(api.topKeywords(99999).length <= 1000);
+  });
+  api.close();
+}
+
+console.log('\n[11] 热词过滤（keyword_filter）');
+{
+  const api = openApi();
+  check('默认热词包含 brunette', () => {
+    assert.ok(api.topKeywords().some((k) => k.term === 'brunette'));
+  });
+  check('添加过滤词后 topKeywords 立即排除该词', () => {
+    api.addKeywordFilter('brunette');
+    assert.ok(!api.topKeywords().some((k) => k.term === 'brunette'));
+    assert.ok(api.listKeywordFilters().some((f) => f.term === 'brunette'));
+  });
+  check('增量补录时过滤词不再累计（doc_count 保持 2）', () => {
+    writeSource((src) =>
+      src.prepare(
+        `INSERT INTO magnets (id, name, files, totalSize, fetchedAt)
+         VALUES (6, 'Brunette.Filtered.Probe', ?, 1, 1)`
+      ).run(JSON.stringify([{ path: 'Brunette.Filtered.Probe.bin', size: 1 }]))
+    );
+    const api2 = openApi(); // 触发增量补录
+    const row = api2.db.get(sql`SELECT doc_count FROM keyword_stats WHERE term = 'brunette'`);
+    assert.equal(Number(row?.doc_count ?? 0), 2); // 新行被过滤，仍是原 2 条
+    api2.close();
+  });
+  check('删除过滤词后热词恢复', () => {
+    api.removeKeywordFilter('brunette');
+    assert.ok(api.topKeywords().some((k) => k.term === 'brunette'));
   });
   api.close();
 }
