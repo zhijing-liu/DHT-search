@@ -115,6 +115,52 @@ body {
   filter: none;
 }
 .search-input-wrap .clear-btn[hidden] { display: none; }
+/* 输入框下拉提示（搜索引擎式自动补全） */
+.suggestions {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 360px;
+  overflow-y: auto;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  padding: 6px 0;
+}
+.suggestions[hidden] { display: none; }
+.suggestion-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 14px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text);
+}
+.suggestion-item:hover,
+.suggestion-item.active {
+  background: rgba(99, 102, 241, 0.16);
+}
+.sug-term {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sug-term mark {
+  background: transparent;
+  color: var(--primary-2);
+  font-weight: 600;
+}
+.sug-count {
+  flex: none;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
 .search-area button {
   display: inline-flex;
   align-items: center;

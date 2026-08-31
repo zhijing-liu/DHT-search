@@ -14,6 +14,8 @@ const state = {
   total: 0,
   /** 热词数据：null=未加载；数组=已加载（无搜索内容时展示在结果区） */
   hotItems: null,
+  /** 输入框下拉提示数据源：热词榜前 1000 个（供相似匹配） */
+  hotSuggestions: [],
 };
 
 /** 请求序号：防止快速翻页时旧请求后到覆盖新结果 */
@@ -29,6 +31,7 @@ const el = {
   pager: document.getElementById('pager'),
   pageSize: document.getElementById('pageSize'),
   countBadge: document.getElementById('countBadge'),
+  suggestions: document.getElementById('suggestions'),
 };
 
 /* ---------- 工具 ---------- */
@@ -142,6 +145,153 @@ async function loadHotWords() {
     el.pager.hidden = true;
     el.status.textContent = state.hotItems.length ? '热门关键词' : '';
     renderHotWords(state.hotItems);
+  }
+}
+
+/* ---------- 输入框下拉提示（搜索引擎式自动补全） ---------- */
+
+/** 当前下拉中可选的建议项（与渲染列表一一对应） */
+let currentSuggestions = [];
+/** 当前高亮的建议项索引（-1 表示无高亮） */
+let activeSuggestion = -1;
+
+/** Levenshtein 编辑距离，用于热词模糊相似匹配 */
+function editDistance(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+/** term 是否与 query 模糊相似：编辑距离阈值随长度放宽 */
+function isFuzzyMatch(term, query) {
+  if (Math.abs(term.length - query.length) > 2) return false;
+  const d = editDistance(term, query);
+  return d <= 1 || (query.length >= 4 && d <= 2);
+}
+
+/**
+ * 从热词中相似匹配：完全相等 > 前缀 > 包含 > 模糊，
+ * 各分组内按热度（doc_count 降序，次之 occurrences）排序。
+ */
+function matchSuggestions(q, max = 8) {
+  const query = String(q).trim().toLowerCase();
+  if (!query) return [];
+  const groups = { exact: [], prefix: [], include: [], fuzzy: [] };
+  for (const it of state.hotSuggestions) {
+    const term = String(it.term).toLowerCase();
+    if (term === query) groups.exact.push(it);
+    else if (term.startsWith(query)) groups.prefix.push(it);
+    else if (term.includes(query)) groups.include.push(it);
+    else if (isFuzzyMatch(term, query)) groups.fuzzy.push(it);
+  }
+  const byHot = (a, b) => b.doc_count - a.doc_count || b.occurrences - a.occurrences;
+  return [...groups.exact, ...groups.prefix, ...groups.include, ...groups.fuzzy]
+    .sort(byHot)
+    .slice(0, max);
+}
+
+/** 渲染提示下拉列表 */
+function renderSuggestions(items) {
+  const box = el.suggestions;
+  box.replaceChildren();
+  const query = el.q.value.trim().toLowerCase();
+  const frag = document.createDocumentFragment();
+  items.forEach((it, i) => {
+    const row = document.createElement('div');
+    row.className = 'suggestion-item';
+    const term = document.createElement('span');
+    term.className = 'sug-term';
+    const idx = String(it.term).toLowerCase().indexOf(query);
+    if (idx >= 0) {
+      const mark = document.createElement('mark');
+      mark.textContent = it.term.slice(idx, idx + query.length);
+      term.append(
+        document.createTextNode(it.term.slice(0, idx)),
+        mark,
+        document.createTextNode(it.term.slice(idx + query.length))
+      );
+    } else {
+      term.textContent = it.term;
+    }
+    const count = document.createElement('span');
+    count.className = 'sug-count';
+    count.textContent = `${formatCount(it.doc_count)} 条`;
+    row.append(term, count);
+    row.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // 阻止输入框失焦导致下拉先关闭
+      selectSuggestion(it.term);
+    });
+    row.addEventListener('mouseenter', () => {
+      activeSuggestion = i;
+      setActiveRow();
+    });
+    frag.appendChild(row);
+  });
+  box.appendChild(frag);
+  box.hidden = false;
+}
+
+/** 按 activeSuggestion 高亮当前建议项，并保证可见 */
+function setActiveRow() {
+  const rows = el.suggestions.querySelectorAll('.suggestion-item');
+  rows.forEach((row, i) => row.classList.toggle('active', i === activeSuggestion));
+  const cur = rows[activeSuggestion];
+  if (cur) cur.scrollIntoView({ block: 'nearest' });
+}
+
+/** 输入变化时刷新下拉提示 */
+function openSuggestions() {
+  const q = el.q.value;
+  if (!q.trim()) {
+    closeSuggestions();
+    return;
+  }
+  currentSuggestions = matchSuggestions(q);
+  activeSuggestion = -1;
+  if (!currentSuggestions.length) {
+    closeSuggestions();
+    return;
+  }
+  renderSuggestions(currentSuggestions);
+}
+
+/** 关闭并清空下拉提示 */
+function closeSuggestions() {
+  el.suggestions.hidden = true;
+  el.suggestions.replaceChildren();
+  currentSuggestions = [];
+  activeSuggestion = -1;
+}
+
+/** 选中某条建议：填入输入框并执行搜索 */
+function selectSuggestion(term) {
+  el.q.value = term;
+  doSearch();
+  el.q.focus();
+}
+
+/** 拉取输入框下拉提示数据源：热词榜前 1000 个 */
+async function loadSuggestions() {
+  try {
+    const resp = await fetch('/api/hot?limit=1000');
+    const data = await resp.json();
+    state.hotSuggestions = resp.ok ? data.items || [] : [];
+  } catch {
+    state.hotSuggestions = [];
   }
 }
 
@@ -265,6 +415,7 @@ function updateUrl() {
 /* ---------- 搜索 ---------- */
 
 async function doSearch(resetPage = true) {
+  closeSuggestions();
   state.query = el.q.value.trim();
   syncClearBtn();
   if (!state.query) {
@@ -292,8 +443,31 @@ el.q.addEventListener('change', () => {
   }
 });
 el.q.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') doSearch();
+  if (e.key === 'Enter') {
+    if (!el.suggestions.hidden && activeSuggestion >= 0) {
+      e.preventDefault();
+      selectSuggestion(currentSuggestions[activeSuggestion].term);
+      return;
+    }
+    closeSuggestions();
+    doSearch();
+    return;
+  }
+  if (!el.suggestions.hidden) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const dir = e.key === 'ArrowDown' ? 1 : -1;
+      const n = currentSuggestions.length;
+      activeSuggestion = Math.min(n - 1, Math.max(0, activeSuggestion + dir));
+      setActiveRow();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeSuggestions();
+    }
+  }
 });
+// 失焦后延迟关闭下拉，避免鼠标点击选择时下拉先被关闭
+el.q.addEventListener('blur', () => setTimeout(closeSuggestions, 150));
 
 /* ---------- 排序交互 ---------- */
 
@@ -389,15 +563,21 @@ el.clearBtn.addEventListener('click', () => {
 let prevInput = '';
 el.q.addEventListener('input', () => {
   syncClearBtn();
-  const isEmpty = el.q.value.trim() === '';
-  if (isEmpty && prevInput.trim() !== '') handleInputCleared();
+  const q = el.q.value.trim();
+  if (q) {
+    openSuggestions();
+  } else {
+    closeSuggestions();
+  }
+  if (q === '' && prevInput.trim() !== '') handleInputCleared();
   prevInput = el.q.value;
 });
 
 syncClearBtn();
 
-// 无搜索内容时的默认视图：加载热词榜
+// 无搜索内容时的默认视图：加载热词榜；同时加载输入框下拉提示数据源
 loadHotWords();
+loadSuggestions();
 
 el.pageSize.addEventListener('change', () => {
   applyPageSize(el.pageSize.value);
