@@ -187,27 +187,48 @@ function buildFts(db) {
 
 const DOCS_COLUMNS = 'id, name, infohash, magnet, files, totalSize, fetchedAt';
 
-/** 用源库行填充 FTS 与副本表 */
-function populate(db, src, rows) {
+/** 每批写入事务的行数上限；分批改写以限制全量重建时的内存峰值 */
+const REBUILD_BATCH = 5000;
+
+/**
+ * 用源库行填充 FTS 与副本表。
+ * @param {db} db                      可写连接（drizzle 实例）
+ * @param {Iterable<Object>} rowsIterable 源行迭代器（数组或 better-sqlite3 的 stmt.iterate()）。
+ *        传入迭代器可避免一次性把全表载入内存，内存峰值仅约等于一个批次的行数。
+ */
+function populate(db, rowsIterable) {
   const CHUNK = 1000;
-  db.transaction((tx) => {
-    for (const r of rows) {
-      tx.run(sql`INSERT INTO ${sql.raw(FTS_TABLE)} (rowid, name, files)
-        VALUES (${r.id}, ${r.name}, ${r.files})`);
-    }
-    for (let i = 0; i < rows.length; i += CHUNK) {
-      const slice = rows.slice(i, i + CHUNK).map((r) => ({
-        id: r.id,
-        name: r.name,
-        infohash: r.infohash,
-        magnet: r.magnet,
-        files: r.files,
-        totalSize: r.totalSize,
-        fetchedAt: r.fetchedAt,
-      }));
-      tx.insert(magnetsDocs).values(slice).run();
-    }
-  });
+  let ftsBuf = [];
+  let docBuf = [];
+  const flush = () => {
+    if (!docBuf.length) return;
+    db.transaction((tx) => {
+      for (const r of ftsBuf) {
+        tx.run(sql`INSERT INTO ${sql.raw(FTS_TABLE)} (rowid, name, files)
+          VALUES (${r.id}, ${r.name}, ${r.files})`);
+      }
+      for (let i = 0; i < docBuf.length; i += CHUNK) {
+        const slice = docBuf.slice(i, i + CHUNK).map((r) => ({
+          id: r.id,
+          name: r.name,
+          infohash: r.infohash,
+          magnet: r.magnet,
+          files: r.files,
+          totalSize: r.totalSize,
+          fetchedAt: r.fetchedAt,
+        }));
+        tx.insert(magnetsDocs).values(slice).run();
+      }
+    });
+    ftsBuf = [];
+    docBuf = [];
+  };
+  for (const r of rowsIterable) {
+    ftsBuf.push(r);
+    docBuf.push(r);
+    if (docBuf.length >= REBUILD_BATCH) flush();
+  }
+  flush();
 }
 
 /** 全量重建：从源库灌入所有行并合并索引段 */
@@ -226,8 +247,8 @@ function fullRebuild(db, src) {
   db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_fetchedAt`)} ON ${sql.raw(DOCS_TABLE)}(fetchedAt)`);
   db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`);
 
-  const rows = src.prepare(`SELECT ${DOCS_COLUMNS} FROM ${TABLE}`).all();
-  populate(db, src, rows);
+  const stmt = src.prepare(`SELECT ${DOCS_COLUMNS} FROM ${TABLE}`);
+  populate(db, stmt.iterate());
 
   setMeta(db, 'tokenizer', TOKENIZER);
   setMeta(db, 'last_rowid', String(maxSourceId(src)));
@@ -251,7 +272,7 @@ function syncIndex(db, src) {
   const max = maxSourceId(src);
   if (max > last) {
     const rows = src.prepare(`SELECT ${DOCS_COLUMNS} FROM ${TABLE} WHERE id > ?`).all(last);
-    populate(db, src, rows);
+    populate(db, rows);
     setMeta(db, 'last_rowid', String(max));
     db.run(sql`INSERT INTO ${sql.raw(FTS_TABLE)} (${sql.raw(FTS_TABLE)}) VALUES ('optimize')`);
   }
