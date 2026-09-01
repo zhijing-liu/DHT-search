@@ -16,11 +16,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+/** 项目根目录：config.json 与 data/ 都在此处（不在 src/ 下） */
+const ROOT_DIR = path.resolve(MODULE_DIR, '..');
 
 /** 读取 config.json（不存在或非法时返回空对象，不阻塞启动） */
 function loadConfig() {
   try {
-    return JSON.parse(fs.readFileSync(path.join(MODULE_DIR, 'config.json'), 'utf8'));
+    return JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'config.json'), 'utf8'));
   } catch {
     return {};
   }
@@ -29,16 +31,16 @@ function loadConfig() {
 /** 来自 config.json 的运行期配置 */
 export const CONFIG = loadConfig();
 
-/** 把配置里的库路径解析为绝对路径：绝对路径原样使用，相对路径基于模块目录 */
+/** 把配置里的库路径解析为绝对路径：绝对路径原样使用，相对路径基于项目根目录 */
 export function resolveDbPath(p) {
   if (!p) return p;
-  return path.isAbsolute(p) ? p : path.join(MODULE_DIR, p);
+  return path.isAbsolute(p) ? p : path.join(ROOT_DIR, p);
 }
 
 /** 源库（其他应用写入）默认路径 */
-export const DEFAULT_DB_PATH = path.join(MODULE_DIR, 'data', 'magnet.db');
+export const DEFAULT_DB_PATH = path.join(ROOT_DIR, 'data', 'magnet.db');
 /** 影子索引库默认路径 */
-export const DEFAULT_INDEX_DB_PATH = path.join(MODULE_DIR, 'data', 'dht.search.db');
+export const DEFAULT_INDEX_DB_PATH = path.join(ROOT_DIR, 'data', 'dht.search.db');
 
 /** 源库主表名 */
 export const TABLE = 'magnets';
