@@ -1,0 +1,7 @@
+[install]
+# Bun 运行时使用内置的 bun:sqlite，不需要 better-sqlite3 这个 Node 原生模块；
+# 而 bun install 默认会去编译它（缺构建链时直接报错）。
+# 关闭 optional 依赖安装即可跳过 better-sqlite3，不影响其它依赖。
+# Node 用户用 npm/pnpm 安装时仍会正常装入 better-sqlite3。
+# 临时想跳过也可显式执行：bun install --omit optional
+optional = false

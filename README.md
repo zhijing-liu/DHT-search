@@ -118,12 +118,19 @@ DHT-search/
 1. **源库前置**：`data/magnet.db` 必须存在且包含 `magnets` 表（由外部 DHT 爬虫写入）。不存在或表缺失时启动会报错。
 2. **运行时**（二选一）：
    - **Node**：需 `better-sqlite3`（C++ 原生模块，`npm install` 会自动尝试预编译/本地编译）。要求 Node ≥ 14.8（支持顶层 await）。
-   - **Bun**：`bun:sqlite` 内置，无需原生编译；`bun install` 即可。
+   - **Bun**：`bun:sqlite` 内置，无需原生编译。但 `bun install` 默认会去编译
+     `optionalDependencies` 里的 `better-sqlite3`（Node 原生模块），缺构建链时报错。
+     用 `bun install --omit optional` 即可跳过它；Node 用户用 `npm install` 不受影响，仍会正常装入。
+     *进阶*：若想让 `bun install` 默认就跳过，可在项目根新建 `bunfig.toml`：
+     ```toml
+     [install]
+     optional = false
+     ```
 3. 安装依赖：
    ```bash
-   npm install        # Node 路径
+   npm install                 # Node 路径（会正常安装 better-sqlite3）
    # 或
-   bun install        # Bun 路径
+   bun install --omit optional # Bun 路径（跳过 better-sqlite3）
    ```
 
 ## 七、启动
