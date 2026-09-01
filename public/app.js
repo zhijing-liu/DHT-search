@@ -1,5 +1,3 @@
-'use strict';
-
 /** 注册自定义元素（<magnet-card> / <magnet-files> / <result-list> / <dht-sort-group>） */
 import './components.js';
 
@@ -16,21 +14,28 @@ const state = {
   hotItems: null,
   /** 输入框下拉提示数据源：热词榜前 1000 个（供相似匹配） */
   hotSuggestions: [],
-  /** 当前查询模式：{ by, tokens }，查询变化时由 doSearch 计算一次，翻页/排序时复用 */
-  mode: { by: undefined, tokens: [] },
 };
 
 /** 请求序号：防止快速翻页时旧请求后到覆盖新结果 */
 let reqSeq = 0;
+/** 当前搜索的 AbortController：用于取消进行中的请求 */
+let abortController = null;
+/** 是否正在搜索（蒙层显示中）：用于阻止重复请求 */
+let isSearching = false;
 
 const el = {
   q: document.getElementById('q'),
   clearBtn: document.getElementById('clearBtn'),
   sortGroup: document.getElementById('sortGroup'),
+  settingsBtn: document.getElementById('settingsBtn'),
+  settingsDialog: document.getElementById('settingsDialog'),
   reindexBtn: document.getElementById('reindexBtn'),
   status: document.getElementById('status'),
   results: document.getElementById('results'),
+  loadingOverlay: document.getElementById('loadingOverlay'),
+  cancelSearchBtn: document.getElementById('cancelSearchBtn'),
   pager: document.getElementById('pager'),
+  pagerInfo: document.getElementById('pagerInfo'),
   pageSize: document.getElementById('pageSize'),
   countBadge: document.getElementById('countBadge'),
   suggestions: document.getElementById('suggestions'),
@@ -51,12 +56,6 @@ function isInfohash(q) {
   if (s.includes('urn:btih:')) return /^.*urn:btih:[a-f0-9]{40}$/.test(s);
   if (s.startsWith('hash')) return /^hash[a-f0-9]{40}$/.test(s);
   return /^[a-f0-9]{40}$/.test(s);
-}
-
-/** 判断当前查询模式：infohash 走精确检索（不高亮），否则 FTS 模糊检索并提取高亮 token */
-function detectMode(query) {
-  const hashMode = isInfohash(query);
-  return { by: hashMode ? 'hash' : undefined, tokens: hashMode ? [] : extractTokens(query) };
 }
 
 const numberFmt = new Intl.NumberFormat('zh-CN');
@@ -143,20 +142,23 @@ function renderHotWordsView() {
 /** 无搜索内容时展示热词视图（数据未加载则先拉取） */
 function showHotWords() {
   if (state.hotItems === null) {
-    loadHotWords();
+    loadHotData();
     return;
   }
   renderHotWordsView();
 }
 
-/** 拉取热词榜数据；完成后仅当当前无搜索内容时渲染，避免覆盖搜索结果 */
-async function loadHotWords() {
+/** 一次拉取热词榜：前 200 条作为默认视图，全部用于输入框下拉提示 */
+async function loadHotData() {
   try {
-    const resp = await fetch('/api/hot?limit=200');
+    const resp = await fetch('/api/hot?limit=1000');
     const data = await resp.json();
-    state.hotItems = resp.ok ? data.items || [] : [];
+    const items = resp.ok ? data.items || [] : [];
+    state.hotItems = items.slice(0, 200);
+    state.hotSuggestions = items;
   } catch {
     state.hotItems = [];
+    state.hotSuggestions = [];
   }
   if (!state.query) renderHotWordsView();
 }
@@ -297,17 +299,6 @@ function selectSuggestion(term) {
   el.q.focus();
 }
 
-/** 拉取输入框下拉提示数据源：热词榜前 1000 个 */
-async function loadSuggestions() {
-  try {
-    const resp = await fetch('/api/hot?limit=1000');
-    const data = await resp.json();
-    state.hotSuggestions = resp.ok ? data.items || [] : [];
-  } catch {
-    state.hotSuggestions = [];
-  }
-}
-
 function renderPager(totalPages) {
   el.pager.innerHTML = '';
   if (totalPages <= 1) {
@@ -335,8 +326,8 @@ function renderPager(totalPages) {
   el.pager.appendChild(mkBtn('上一页', state.page - 1, { disabled: state.page <= 1 }));
 
   // 页码窗口：显示首尾页 + 当前页附近
-  const window = new Set([1, totalPages, state.page - 1, state.page, state.page + 1]);
-  const pages = [...window].filter((p) => p >= 1 && p <= totalPages).sort((a, b) => a - b);
+  const pageSet = new Set([1, totalPages, state.page - 1, state.page, state.page + 1]);
+  const pages = [...pageSet].filter((p) => p >= 1 && p <= totalPages).sort((a, b) => a - b);
   let prev = 0;
   for (const p of pages) {
     if (p - prev > 1) {
@@ -352,11 +343,22 @@ function renderPager(totalPages) {
   el.pager.appendChild(mkBtn('下一页', state.page + 1, { disabled: state.page >= totalPages }));
 }
 
-/* ---------- loading 状态 ---------- */
+/* ---------- loading 状态（全屏蒙层） ---------- */
 
 function setLoading(on) {
-  el.status.classList.toggle('loading', on);
-  if (on) el.status.textContent = '加载中…';
+  isSearching = on;
+  el.loadingOverlay.hidden = !on;
+}
+
+/** 取消进行中的搜索：中断请求并收起蒙层 */
+function cancelSearch() {
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
+  isSearching = false;
+  el.loadingOverlay.hidden = true;
+  el.status.textContent = '已取消搜索';
 }
 
 /* ---------- 真服务端分页：每次查询/排序/翻页都从后端按页拉取 ---------- */
@@ -364,6 +366,11 @@ function setLoading(on) {
 async function fetchPage() {
   if (!state.query) return;
   const mySeq = ++reqSeq; // 丢弃过期响应，避免快速翻页时乱序覆盖
+
+  // 取消上一次仍在进行的请求，避免重复/叠加请求
+  if (abortController) abortController.abort();
+  abortController = new AbortController();
+  const signal = abortController.signal;
 
   const hashMode = isInfohash(state.query);
   const by = hashMode ? 'hash' : undefined;
@@ -381,7 +388,7 @@ async function fetchPage() {
 
   setLoading(true);
   try {
-    const resp = await fetch(`/api/search?${params}`);
+    const resp = await fetch(`/api/search?${params}`, { signal });
     const data = await resp.json();
     if (mySeq !== reqSeq) return; // 已有更新的请求，丢弃本次
     if (!resp.ok) {
@@ -400,14 +407,16 @@ async function fetchPage() {
     const from = total === 0 ? 0 : offset + 1;
     const to = Math.min(offset + pageSize, total);
     setLoading(false);
-    el.status.textContent = `共 ${total} 条结果，第 ${state.page}/${totalPages} 页（${from}-${to}）`;
+    el.pagerInfo.textContent = `共 ${total} 条结果，第 ${state.page}/${totalPages} 页（${from}-${to}）`;
+    el.status.textContent = '';
 
     renderPager(totalPages);
     updateUrl();
   } catch (err) {
     if (mySeq !== reqSeq) return;
     setLoading(false);
-    el.status.textContent = `请求出错：${err.message}`;
+    // 主动取消（AbortError）不视为错误
+    el.status.textContent = err.name === 'AbortError' ? '已取消搜索' : `请求出错：${err.message}`;
   }
 }
 
@@ -428,6 +437,8 @@ function updateUrl() {
 /* ---------- 搜索 ---------- */
 
 async function doSearch(resetPage = true) {
+  // 蒙层显示中（请求进行中）忽略新的搜索触发，防止重复请求
+  if (isSearching) return;
   closeSuggestions();
   state.query = el.q.value.trim();
   syncClearBtn();
@@ -448,12 +459,7 @@ async function doSearch(resetPage = true) {
 
 // 输入框值变化（失焦触发 change）：去除前后空格后有值则搜索，空值则回到热词视图
 el.q.addEventListener('change', () => {
-  const q = el.q.value.trim();
-  if (q) {
-    doSearch();
-  } else {
-    handleInputCleared();
-  }
+  if (el.q.value.trim()) doSearch();
 });
 el.q.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
@@ -518,7 +524,9 @@ async function doReindex() {
   }
 }
 
+el.settingsBtn.addEventListener('click', () => el.settingsDialog.showModal());
 el.reindexBtn.addEventListener('click', doReindex);
+el.cancelSearchBtn.addEventListener('click', cancelSearch);
 
 /* ---------- 每页数量控件（10-200，自由输入） ---------- */
 
@@ -573,7 +581,7 @@ el.clearBtn.addEventListener('click', () => {
   el.q.focus();
 });
 
-let prevInput = '';
+let lastValue = '';
 el.q.addEventListener('input', () => {
   syncClearBtn();
   const q = el.q.value.trim();
@@ -582,15 +590,15 @@ el.q.addEventListener('input', () => {
   } else {
     closeSuggestions();
   }
-  if (q === '' && prevInput.trim() !== '') handleInputCleared();
-  prevInput = el.q.value;
+  // 由"有内容"变为"空"的瞬间回到热词视图（仅跳变触发一次，无需 prevInput 之外的冗余分支）
+  if (q === '' && lastValue !== '') handleInputCleared();
+  lastValue = el.q.value;
 });
 
 syncClearBtn();
 
-// 无搜索内容时的默认视图：加载热词榜；同时加载输入框下拉提示数据源
-loadHotWords();
-loadSuggestions();
+// 无搜索内容时的默认视图：加载热词榜（默认视图 + 下拉提示共用一份）
+loadHotData();
 
 el.pageSize.addEventListener('change', () => {
   applyPageSize(el.pageSize.value);

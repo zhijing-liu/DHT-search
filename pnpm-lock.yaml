@@ -207,15 +207,19 @@ importers:
 
   .:
     dependencies:
-      better-sqlite3:
-        specifier: ^13.0.3
-        version: 13.0.3
       drizzle-orm:
         specifier: ^0.45.2
         version: 0.45.2(better-sqlite3@13.0.3)
       express:
         specifier: ^5.2.1
         version: 5.2.1
+      lru-cache:
+        specifier: ^11.5.2
+        version: 11.5.2
+    optionalDependencies:
+      better-sqlite3:
+        specifier: ^13.0.3
+        version: 13.0.3
 
 packages:
 
@@ -455,6 +459,10 @@ packages:
   is-promise@4.0.0:
     resolution: {integrity: sha512-hvpoI6korhJMnej285dSg6nu1+e6uxs7zG3BYAm5byqDsgJNWwxzM6z6iZiAgQR4TJ30JmBTOwqZUw3WlyH3AQ==}
 
+  lru-cache@11.5.2:
+    resolution: {integrity: sha512-4pfM1Ff0x50o0tQwb5ucw/RzNyD0/YJME6IVcStalZuMWxdt3sR3huStTtxz4PUmvZfRguvDejasvQ2kifR11g==}
+    engines: {node: 20 || >=22}
+
   math-intrinsics@1.1.0:
     resolution: {integrity: sha512-/IXtbwEk5HTPyEwyKX6hGkYXxM9nbj64B+ilVJnC/R6B0pH5G4V3b0pVbL7DBj4tkhBAppbQUlf6F6Xl9LHu1g==}
     engines: {node: '>= 0.4'}
@@ -587,6 +595,7 @@ snapshots:
   better-sqlite3@13.0.3:
     dependencies:
       node-addon-api: 8.9.2
+    optional: true
 
   body-parser@2.3.0:
     dependencies:
@@ -750,6 +759,8 @@ snapshots:
 
   is-promise@4.0.0: {}
 
+  lru-cache@11.5.2: {}
+
   math-intrinsics@1.1.0: {}
 
   media-typer@1.1.1: {}
@@ -768,7 +779,8 @@ snapshots:
     dependencies:
       content-type: 2.1.0
 
-  node-addon-api@8.9.2: {}
+  node-addon-api@8.9.2:
+    optional: true
 
   object-inspect@1.13.4: {}
 

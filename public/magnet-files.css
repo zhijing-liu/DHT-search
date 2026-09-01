@@ -1,0 +1,9 @@
+:host { display: block; margin: 0 0 8px; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { font-size: clamp(12px, calc(11px + 0.3vw), 13px); padding: 2px 0; display: flex; gap: 6px; align-items: baseline; }
+.name {
+  color: var(--text); word-break: break-all;
+  & mark { background: rgba(99, 102, 241, 0.35); color: #fff; border-radius: 3px; padding: 0 2px; }
+}
+.size { flex: none; color: var(--muted); white-space: nowrap; }
+.more { color: var(--muted); font-size: clamp(11px, calc(10px + 0.3vw), 12px); padding-top: 4px; }

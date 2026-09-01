@@ -1,0 +1,25 @@
+:host { display: inline-flex; gap: 8px; }
+.seg {
+  display: flex; align-items: stretch; height: clamp(38px, 5vw, 44px);
+  border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden; background: var(--card);
+
+  & .sb {
+    display: flex; align-items: center; justify-content: center;
+    width: clamp(34px, 4vw, 40px); height: 100%; padding: 0; border: none;
+    border-right: 1px solid var(--border);
+    background: transparent; color: var(--muted); cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+
+    &:hover { color: var(--text); }
+    &.active { background: rgba(99, 102, 241, 0.18); color: var(--primary-2); }
+    &:last-child { border-right: none; }
+  }
+}
+.ob {
+  display: flex; align-items: center; justify-content: center;
+  width: clamp(34px, 4vw, 40px); height: clamp(38px, 5vw, 44px); padding: 0; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--card);
+  color: var(--muted); cursor: pointer;
+  &:hover { color: var(--text); }
+}

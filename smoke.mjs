@@ -9,9 +9,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
-import Database from 'better-sqlite3';
 import { sql } from 'drizzle-orm';
 import { createMagnetDb, MAX_LIMIT } from './db.js';
+import { openDatabase, setPragma, execRaw, closeDb } from './db-driver.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SMOKE_DB = path.join(HERE, 'data', 'smoke.db');
@@ -19,7 +19,14 @@ const SMOKE_INDEX = path.join(HERE, 'data', 'smoke.search.db');
 
 const cleanup = () => {
   for (const f of [SMOKE_DB, SMOKE_INDEX]) {
-    for (const s of ['', '-wal', '-shm']) fs.rmSync(f + s, { force: true });
+    for (const s of ['', '-wal', '-shm']) {
+      // best-effort：Windows 上偶发文件锁未释放，忽略以免影响最终断言汇总
+      try {
+        fs.rmSync(f + s, { force: true });
+      } catch {
+        /* 文件可能被运行时短暂锁定，忽略 */
+      }
+    }
   }
 };
 cleanup();
@@ -75,39 +82,41 @@ const FIXTURES = [
   },
 ];
 
-const rowValues = (r) => ({
-  id: r.id,
-  name: r.name,
-  infohash: `hash${String(r.id).padStart(40, '0')}`,
-  magnet: `magnet:?xt=urn:btih:hash${String(r.id).padStart(40, '0')}`,
-  files: JSON.stringify(r.files),
-  totalSize: r.totalSize,
-  fetchedAt: r.fetchedAt,
-});
+/** 把 fixture 行推导成源库 INSERT 所需的位置参数数组（bun:sqlite 不支持 @name 命名对象绑定） */
+const rowParams = (r) => {
+  const infohash = `hash${String(r.id).padStart(40, '0')}`;
+  return [
+    r.id,
+    r.name,
+    infohash,
+    `magnet:?xt=urn:btih:${infohash}`,
+    JSON.stringify(r.files),
+    r.totalSize,
+    r.fetchedAt,
+  ];
+};
 
 /** 用独立可写连接写入“源库”，模拟另一应用的写入 */
 function writeSource(fn) {
-  const src = new Database(SMOKE_DB);
-  src.exec(
-    `CREATE TABLE IF NOT EXISTS magnets (
+  const src = openDatabase(SMOKE_DB);
+  execRaw(src, `CREATE TABLE IF NOT EXISTS magnets (
        id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', infohash TEXT,
        magnet TEXT, files TEXT, totalSize INTEGER NOT NULL DEFAULT 0,
        fetchedAt INTEGER NOT NULL DEFAULT 0
-     )`
-  );
-  src.pragma('journal_mode = WAL');
+     )`);
+  setPragma(src, 'journal_mode', 'WAL');
   fn(src);
-  src.close();
+  closeDb(src);
 }
 
 // 准备源库数据
 writeSource((src) => {
   const ins = src.prepare(
     `INSERT INTO magnets (id, name, infohash, magnet, files, totalSize, fetchedAt)
-     VALUES (@id, @name, @infohash, @magnet, @files, @totalSize, @fetchedAt)`
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
   );
   src.transaction((rows) => {
-    for (const r of rows) ins.run(rowValues(r));
+    for (const r of rows) ins.run(rowParams(r));
   })(FIXTURES);
 });
 
@@ -389,7 +398,7 @@ console.log('\n[11] 热词过滤（keyword_filter）');
       ).run(JSON.stringify([{ path: 'Brunette.Filtered.Probe.bin', size: 1 }]))
     );
     const api2 = openApi(); // 触发增量补录
-    const row = api2.db.get(sql`SELECT doc_count FROM keyword_stats WHERE term = 'brunette'`);
+    const row = api2.db.all(sql`SELECT doc_count FROM keyword_stats WHERE term = 'brunette'`)[0];
     assert.equal(Number(row?.doc_count ?? 0), 2); // 新行被过滤，仍是原 2 条
     api2.close();
   });

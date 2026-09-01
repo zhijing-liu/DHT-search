@@ -23,14 +23,35 @@
         <div id="suggestions" class="suggestions" role="listbox" aria-label="搜索建议" hidden></div>
       </div>
       <dht-sort-group id="sortGroup"></dht-sort-group>
-      <button id="reindexBtn" type="button" title="源库被改/删后，手动重建本地索引">重建索引</button>
+      <button id="settingsBtn" class="icon-btn" type="button" aria-label="设置" title="设置">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
     </section>
+
+    <dialog id="settingsDialog" class="settings-dialog">
+      <form method="dialog" class="settings-head">
+        <h2 class="settings-title">设置</h2>
+        <button class="settings-close" type="submit" value="close" aria-label="关闭" title="关闭">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </form>
+      <div class="settings-body">
+        <div class="settings-item">
+          <div class="settings-item-text">
+            <div class="settings-item-title">重建索引</div>
+            <div class="settings-item-desc">源库被改/删后，手动重建本地索引</div>
+          </div>
+          <button id="reindexBtn" type="button" class="settings-action">重建索引</button>
+        </div>
+      </div>
+    </dialog>
 
     <div id="status" class="status"></div>
 
     <result-list id="results"></result-list>
 
     <div class="pager-row">
+      <span id="pagerInfo" class="pager-info"></span>
       <nav id="pager" class="pager" hidden></nav>
       <label class="page-size">
         每页
@@ -39,6 +60,14 @@
       </label>
     </div>
   </main>
+
+  <div id="loadingOverlay" class="loading-overlay" hidden>
+    <div class="loading-box">
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="loading-text">搜索中…</div>
+      <button id="cancelSearchBtn" type="button" class="loading-cancel">取消搜索</button>
+    </div>
+  </div>
 
   <script type="module" src="/app.js"></script>
 </body>

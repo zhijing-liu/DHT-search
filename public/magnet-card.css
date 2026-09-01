@@ -1,0 +1,90 @@
+:host {
+  display: block; background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: clamp(12px, 2vw, 16px) clamp(14px, 2.5vw, 18px);
+  transition: transform 0.15s ease, border-color 0.15s ease;
+  &:hover { transform: translateY(-2px); border-color: var(--accent); }
+}
+.title {
+  margin: 0 0 8px; font-size: clamp(14px, calc(13px + 0.4vw), 16px); font-weight: 500; word-break: break-all;
+  & mark { background: rgba(99, 102, 241, 0.35); color: #fff; border-radius: 3px; padding: 0 2px; }
+}
+.magnet { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.magnet-text {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--primary-2); font-size: clamp(11px, calc(10px + 0.3vw), 12px);
+  text-decoration: none; cursor: pointer;
+  &:hover { text-decoration: underline; }
+}
+
+/* 复制 / 迅雷 / 关闭：统一图标按钮外观，消除三处重复 */
+.copy, .thunder, .close {
+  flex: none; width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0; border-radius: 8px;
+  border: 1px solid var(--border); background: transparent; color: var(--text);
+  text-decoration: none; cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  & svg { width: 15px; height: 15px; display: block; }
+  &:hover { background: rgba(255, 255, 255, 0.08); }
+}
+.copy.copied { color: #4ade80; border-color: #4ade80; }
+.thunder:hover { border-color: var(--accent); color: var(--accent); }
+
+.meta { color: var(--muted); font-size: clamp(11px, calc(10px + 0.3vw), 12px); }
+
+/* 文件列表行：左侧文件树 + 右侧"查看全部"按钮同行 */
+.files-row {
+  display: flex; align-items: flex-start; gap: 8px;
+}
+.files-row > magnet-files { flex: 1; min-width: 0; }
+.detail {
+  flex: none; align-self: center; padding: 5px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: transparent; color: var(--text);
+  cursor: pointer; font-size: clamp(12px, calc(11px + 0.3vw), 13px);
+  white-space: nowrap;
+  transition: background 0.15s ease;
+  &:hover { background: rgba(255, 255, 255, 0.08); }
+}
+
+dialog {
+  width: min(720px, 96vw); height: 86vh; padding: 0;
+  border: 1px solid var(--border); border-radius: 14px; color: var(--text); background: var(--bg-2);
+  &::backdrop { background: rgba(0, 0, 0, 0.6); }
+  &[open] { display: flex; flex-direction: column; }
+}
+.dlg-head {
+  flex: none; display: flex; align-items: flex-start; gap: 10px;
+  padding: clamp(12px, 2vw, 16px) clamp(14px, 2.5vw, 18px); border-bottom: 1px solid var(--border);
+
+  & .dlg-title {
+    margin: 0; flex: 1; font-size: clamp(14px, calc(13px + 0.4vw), 16px); font-weight: 600; word-break: break-all;
+    & mark { background: rgba(99, 102, 241, 0.35); color: #fff; border-radius: 3px; padding: 0 2px; }
+  }
+}
+.dlg-body {
+  flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden;
+  padding: clamp(12px, 2vw, 16px) clamp(14px, 2.5vw, 18px);
+}
+.dlg-row {
+  display: flex; gap: 8px; margin-bottom: 6px; font-size: clamp(12px, calc(11px + 0.3vw), 13px);
+  & .k { flex: none; width: 64px; color: var(--muted); }
+  & .v { word-break: break-all; }
+  & a.v-link { text-decoration: none; cursor: pointer; &:hover { text-decoration: underline; } }
+}
+.dlg-meta { flex: none; }
+.dlg-files {
+  flex: 1 1 auto; overflow: auto; min-height: 0; list-style: none; margin: 12px 0 0; padding: 0;
+
+  & .row { display: flex; align-items: center; gap: 6px; }
+  & .toggle {
+    flex: none; width: 14px; text-align: center; color: var(--muted); cursor: pointer; user-select: none;
+    &.empty { visibility: hidden; }
+  }
+  & .name {
+    color: var(--text); word-break: break-all;
+    & mark { background: rgba(99, 102, 241, 0.35); color: #fff; border-radius: 3px; padding: 0 2px; }
+  }
+  & .size { flex: none; color: var(--muted); margin-left: 4px; }
+  & ul.children { list-style: none; margin: 0; padding: 0 0 0 14px; border-left: 1px solid var(--border); }
+  & li.collapsed > ul.children { display: none; }
+}

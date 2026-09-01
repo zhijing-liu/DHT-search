@@ -20,6 +20,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { createMagnetDb, CONFIG } from './db.js';
+import { LRUCache } from 'lru-cache';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -33,6 +34,35 @@ const SORT_WHITELIST = new Set(['fetchedAt', 'totalSize', 'relevance']);
 const PORT = Number(CONFIG.port) || Number(process.env.PORT) || 3000;
 
 const api = createMagnetDb();
+
+/* ------------------------------------------------------------------ */
+/* 搜索结果内存缓存                                                    */
+/* ------------------------------------------------------------------ */
+/**
+ * 进程内搜索缓存：以「最大内存占用 + 每条 TTL」双约束淘汰。
+ *  - maxSize + sizeCalculation：按序列化后字节数限制总内存（空间约束）；
+ *  - ttl + updateAgeOnGet：每条缓存独立计时，被访问即刷新 TTL；
+ *    默认 1 小时，经 config.json 的 searchCacheTtlMs 覆盖；
+ *  - ttlAutopurge + 定时 purgeStale：超时且未被访问的条目会被真正释放（定期释放）。
+ */
+const SEARCH_CACHE_MAX_SIZE =
+  (Number(CONFIG.searchCacheMaxSizeMb) > 0 ? Number(CONFIG.searchCacheMaxSizeMb) : 256) * 1024 * 1024;
+const SEARCH_CACHE_TTL_MS =
+  Number.isFinite(Number(CONFIG.searchCacheTtlMs)) && Number(CONFIG.searchCacheTtlMs) > 0
+    ? Number(CONFIG.searchCacheTtlMs)
+    : 3600_000;
+
+const searchCache = new LRUCache({
+  maxSize: SEARCH_CACHE_MAX_SIZE,
+  sizeCalculation: (value) => Buffer.byteLength(JSON.stringify(value)),
+  ttl: SEARCH_CACHE_TTL_MS,
+  updateAgeOnGet: true,
+  ttlAutopurge: true,
+});
+
+// 后台定时清扫：即使条目从不被访问，超时后也能在下一轮被真正释放
+const searchCacheSweep = setInterval(() => searchCache.purgeStale(), 60_000);
+if (typeof searchCacheSweep.unref === 'function') searchCacheSweep.unref();
 
 const app = express();
 
@@ -81,6 +111,13 @@ app.get('/', (_req, res) => res.redirect('/index.html'));
 app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
 
+/** 构造搜索缓存键：覆盖所有影响结果的参数，保证命中结果一致 */
+function searchCacheKey(q, by, sortBy, order, limitParam, offsetParam) {
+  const whole = isWholeSet(limitParam);
+  const page = whole ? 'all' : `${limitParam ?? ''}:${offsetParam ?? ''}`;
+  return [q, by ?? '', sortBy ?? '', order, page].join('|');
+}
+
 app.get('/api/search', apiHandler((req, res) => {
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   if (!q) {
@@ -92,28 +129,37 @@ app.get('/api/search', apiHandler((req, res) => {
   // 仅当显式传 by=hash 时走 infohash 精确检索，其余走 FTS5 模糊检索
   const by = req.query.by === 'hash' ? 'hash' : undefined;
 
-  console.log(`[USER] 检索请求: q="${q}" 模式=${by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${sortBy ?? 'id'}/${order}`);
+  const key = searchCacheKey(q, by, sortBy, order, req.query.limit, req.query.offset);
+  const cached = searchCache.get(key);
+  if (cached) {
+    console.log(`[cache] HIT  q="${q}" 模式=${by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${sortBy ?? 'id'}/${order}`);
+    return res.json(cached);
+  }
+  console.log(`[cache] MISS q="${q}" 模式=${by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${sortBy ?? 'id'}/${order}`);
 
+  let result;
   if (isWholeSet(req.query.limit)) {
-    // 整集拉取：一次查询取回全部匹配，前端据此做本地分页缓存
-    const result = api.searchMagnets({ query: q, sortBy, order, limit: -1, by });
-    let items = result.items;
+    // 整集拉取：一次查询取回全部匹配
+    const raw = api.searchMagnets({ query: q, sortBy, order, limit: -1, by });
+    let items = raw.items;
     const truncated = items.length > MAX_RESULTS;
     if (truncated) items = items.slice(0, MAX_RESULTS);
-    return res.json({ total: result.total, limit: 'all', offset: 0, items, truncated });
+    result = { total: raw.total, limit: 'all', offset: 0, items, truncated };
+  } else {
+    // 普通分页
+    const limitParam = Number(req.query.limit);
+    const offsetParam = Number(req.query.offset);
+    result = api.searchMagnets({
+      query: q,
+      sortBy,
+      order,
+      by,
+      limit: Number.isFinite(limitParam) ? limitParam : undefined,
+      offset: Number.isFinite(offsetParam) ? offsetParam : undefined,
+    });
   }
 
-  // 普通分页
-  const limitParam = Number(req.query.limit);
-  const offsetParam = Number(req.query.offset);
-  const result = api.searchMagnets({
-    query: q,
-    sortBy,
-    order,
-    by,
-    limit: Number.isFinite(limitParam) ? limitParam : undefined,
-    offset: Number.isFinite(offsetParam) ? offsetParam : undefined,
-  });
+  searchCache.set(key, result);
   return res.json(result);
 }, 400, 'search failed'));
 
@@ -123,7 +169,9 @@ app.post('/api/reindex', apiHandler(async (_req, res) => {
   const indexed = await api.reindex(({ done, total }) => {
     console.log(`[SYSTEM][reindex] 重建进度 ${done}/${total}`);
   });
-  console.log(`[SYSTEM] 索引重建完成，累计 ${indexed} 条`);
+  // 索引内容已变更，清空搜索缓存避免返回旧结果
+  searchCache.clear();
+  console.log(`[SYSTEM] 索引重建完成，累计 ${indexed} 条，已清空搜索缓存`);
   res.json({ ok: true, indexed });
 }, 500, 'reindex failed'));
 
@@ -190,6 +238,8 @@ server.on('error', (err) => {
 
 process.on('SIGINT', () => {
   console.log('\n[SYSTEM] 收到 SIGINT，正在关闭服务并释放数据库...');
+  clearInterval(searchCacheSweep);
+  searchCache.clear();
   api.close();
   console.log('[SYSTEM] 服务已关闭');
   process.exit(0);

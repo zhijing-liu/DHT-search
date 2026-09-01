@@ -1,233 +1,18 @@
-'use strict';
+/* 组件样式以原生 CSS Module 形式引入（浏览器需支持 import attributes / CSS modules），
+   通过 shadowRoot.adoptedStyleSheets 注入，避免把 CSS 写进 JS 文本 */
+import magnetCardCss from './magnet-card.css' with { type: 'css' };
+import magnetFilesCss from './magnet-files.css' with { type: 'css' };
+import resultListCss from './result-list.css' with { type: 'css' };
+import sortGroupCss from './dht-sort-group.css' with { type: 'css' };
 
-/* ------------------------------------------------------------------ */
-/* 共享工具                                                            */
-/* ------------------------------------------------------------------ */
-
-export function formatBytes(n) {
-  if (!Number.isFinite(n) || n < 0) return '-';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i += 1;
-  }
-  return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
-}
-
-export function formatDate(ts) {
-  if (!Number.isFinite(Number(ts))) return '-';
-  const d = new Date(Number(ts));
-  if (Number.isNaN(d.getTime())) return '-';
-  const p = (x) => String(x).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
-/** 把 files 字段规范为 [{ path, size }] 数组 */
-function normalizeFiles(files) {
-  if (Array.isArray(files)) return files;
-  if (files && typeof files === 'object') return [files];
-  return [];
-}
-
-async function copyText(text, btn) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-  }
-  const old = btn.title;
-  btn.classList.add('copied');
-  btn.title = '已复制';
-  setTimeout(() => { btn.classList.remove('copied'); btn.title = old; }, 1200);
-  showToast('已复制到剪贴板');
-}
-
-/** 把 magnet 链接编码成迅雷 thunder:// 协议链接 */
-function toThunder(magnet) {
-  if (!magnet) return '';
-  const raw = 'AA' + magnet + 'ZZ';
-  const b64 = btoa(unescape(encodeURIComponent(raw)));
-  return 'thunder://' + b64;
-}
-
-/** 页面顶部居中的轻量通知（toast），全局单例容器挂在 document 顶层 */
-let _toastHost = null;
-function showToast(msg) {
-  if (!_toastHost) {
-    _toastHost = document.createElement('div');
-    _toastHost.className = 'app-toast-host';
-    document.body.appendChild(_toastHost);
-    const style = document.createElement('style');
-    style.textContent = `
-      .app-toast-host {
-        position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
-        z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none;
-      }
-      .app-toast {
-        background: rgba(17, 24, 39, 0.95); color: #fff;
-        border: 1px solid rgba(255, 255, 255, 0.14);
-        padding: 10px 18px; border-radius: 10px; font-size: 14px; line-height: 1.4;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-        opacity: 0; transform: translateY(-8px);
-        transition: opacity 0.2s ease, transform 0.2s ease;
-      }
-      .app-toast.show { opacity: 1; transform: translateY(0); }`;
-    document.head.appendChild(style);
-  }
-  const t = document.createElement('div');
-  t.className = 'app-toast';
-  t.textContent = msg;
-  _toastHost.appendChild(t);
-  requestAnimationFrame(() => t.classList.add('show'));
-  setTimeout(() => {
-    t.classList.remove('show');
-    setTimeout(() => t.remove(), 220);
-  }, 1600);
-}
+import { formatBytes, formatDate, normalizeFiles, copyText, toThunder, highlightInto } from './util.js';
+import { buildFileTree, computeTreeSizes, renderTreeNode, fileMatchScore, PREVIEW_LIMIT } from './file-tree.js';
 
 const SVG = 'viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
-
-/** 转义正则元字符，避免 token 破坏构造出的正则 */
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/**
- * 把 text 中命中 tokens 的片段用 <mark> 高亮写入 container。
- * 全程用 DOM API 拼接，不使用 innerHTML，杜绝 XSS。
- * tokens 为空或为空串时退化为纯 textContent。
- */
-function highlightInto(container, text, tokens) {
-  container.replaceChildren();
-  if (!tokens || tokens.length === 0 || !text) {
-    container.textContent = text || '';
-    return;
-  }
-  const re = new RegExp(`(${tokens.map(escapeRegExp).join('|')})`, 'gi');
-  let last = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) container.appendChild(document.createTextNode(text.slice(last, m.index)));
-    const mark = document.createElement('mark');
-    mark.textContent = m[0];
-    container.appendChild(mark);
-    last = m.index + m[0].length;
-    if (m.index === re.lastIndex) re.lastIndex++; // 防止零宽匹配死循环
-  }
-  if (last < text.length) container.appendChild(document.createTextNode(text.slice(last)));
-}
 
 /* ------------------------------------------------------------------ */
 /* <magnet-files>  文件树（可折叠，默认展开第一级）                    */
 /* ------------------------------------------------------------------ */
-
-/**
- * 把扁平的 [{ path, size }] 列表按 path 中的 '/' 拆分成目录树。
- * 目录节点聚合字节大小，文件节点保留自身 size。
- */
-function buildFileTree(files) {
-  const root = { name: '', isDir: true, children: new Map(), size: 0 };
-  for (const f of files) {
-    const parts = String((f && f.path) || '').split('/');
-    let cur = root;
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      if (part === '') continue;
-      const isLeaf = i === parts.length - 1;
-      let child = cur.children.get(part);
-      if (!child) {
-        child = { name: part, isDir: !isLeaf, children: new Map(), size: 0 };
-        cur.children.set(part, child);
-      }
-      if (isLeaf) {
-        child.isDir = false;
-        child.size = Number(f.size) || 0;
-      }
-      cur = child;
-    }
-  }
-  return root;
-}
-
-/** 递归累加目录节点的字节大小（所有子孙叶子之和） */
-function computeTreeSizes(node) {
-  if (!node.isDir) return Number(node.size) || 0;
-  let total = 0;
-  for (const c of node.children.values()) total += computeTreeSizes(c);
-  node.size = total;
-  return total;
-}
-
-/** 递归渲染树节点；depth 为父节点深度，child 实际深度 = depth + 1 */
-function renderTreeNode(node, depth, tokens) {
-  const frag = document.createDocumentFragment();
-  const arr = [...node.children.values()].sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1; // 目录优先
-    const sa = fileMatchScore(a.name, tokens);
-    const sb = fileMatchScore(b.name, tokens);
-    if (sa !== sb) return sb - sa; // 命中关键词优先
-    return a.name.localeCompare(b.name, 'en', { numeric: true });
-  });
-  for (const child of arr) {
-    const li = document.createElement('li');
-    const row = document.createElement('div');
-    row.className = 'row';
-    const toggle = document.createElement('span');
-    const name = document.createElement('span');
-    name.className = 'name';
-
-    if (child.isDir) {
-      const size = document.createElement('span');
-      size.className = 'size';
-      size.textContent = `· ${formatBytes(Number(child.size))}`;
-      highlightInto(name, child.name, tokens);
-      row.append(toggle, name, size);
-
-      const sub = document.createElement('ul');
-      sub.className = 'children';
-      sub.appendChild(renderTreeNode(child, depth + 1, tokens));
-      li.append(row, sub);
-
-      // 默认仅展开第一级（顶层目录显示其直接子，更深层级折叠）
-      const expanded = depth === 0;
-      if (!expanded) li.classList.add('collapsed');
-      toggle.textContent = expanded ? '▾' : '▸';
-      toggle.addEventListener('click', () => {
-        const collapsed = li.classList.toggle('collapsed');
-        toggle.textContent = collapsed ? '▸' : '▾';
-      });
-    } else {
-      toggle.className = 'toggle empty';
-      highlightInto(name, child.name, tokens);
-      const size = document.createElement('span');
-      size.className = 'size';
-      size.textContent = formatBytes(Number(child.size));
-      row.append(toggle, name, size);
-      li.append(row);
-    }
-    frag.appendChild(li);
-  }
-  return frag;
-}
-
-/** 卡片预览最多展示的文件条数（性能：列表不渲染全部） */
-const PREVIEW_LIMIT = 5;
-
-/** 文件命中查询 token 的数量评分，用于「匹配关键词优先」排序 */
-function fileMatchScore(name, tokens) {
-  if (!tokens || !tokens.length) return 0;
-  const lower = String(name).toLowerCase();
-  let s = 0;
-  for (const t of tokens) if (lower.includes(t)) s++;
-  return s;
-}
 
 class MagnetFiles extends HTMLElement {
   set files(value) {
@@ -238,20 +23,18 @@ class MagnetFiles extends HTMLElement {
     this._highlight = value;
     if (this.shadowRoot) this._render();
   }
+  /** 一次性设置文件与高亮，避免两个 setter 各自触发一次渲染 */
+  setData(files, highlight) {
+    this._files = files;
+    this._highlight = highlight;
+    if (this.shadowRoot) this._render();
+  }
 
   connectedCallback() {
     if (!this.shadowRoot) {
-      this.attachShadow({ mode: 'open' }).innerHTML = `
-        <style>
-          :host { display: block; margin: 0 0 10px; }
-          ul { list-style: none; margin: 0; padding: 0; }
-          li { font-size: 13px; padding: 3px 0; display: flex; gap: 6px; align-items: baseline; }
-          .name { color: var(--text); word-break: break-all; }
-          .name mark { background: rgba(99, 102, 241, 0.35); color: #fff; border-radius: 3px; padding: 0 2px; }
-          .size { flex: none; color: var(--muted); white-space: nowrap; }
-          .more { color: var(--muted); font-size: 12px; padding-top: 4px; }
-        </style>
-        <ul class="files"></ul>`;
+      const root = this.attachShadow({ mode: 'open' });
+      root.adoptedStyleSheets = [magnetFilesCss];
+      root.innerHTML = `<ul class="files"></ul>`;
     }
     if (this._files !== undefined) this._render();
   }
@@ -311,87 +94,25 @@ class MagnetCard extends HTMLElement {
 
   connectedCallback() {
     if (!this.shadowRoot) {
-      this.attachShadow({ mode: 'open' }).innerHTML = `
-        <style>
-          :host {
-            display: block; background: var(--card); border: 1px solid var(--border);
-            border-radius: 12px; padding: 16px 18px;
-            transition: transform 0.15s ease, border-color 0.15s ease;
-          }
-          :host(:hover) { transform: translateY(-2px); border-color: var(--accent); }
-          .title { margin: 0 0 10px; font-size: 16px; font-weight: 500; word-break: break-all; }
-          .title mark { background: rgba(99, 102, 241, 0.35); color: #fff; border-radius: 3px; padding: 0 2px; }
-          .magnet { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-          .magnet-text {
-            flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-            color: var(--primary-2); font-size: 12px;
-            text-decoration: none; cursor: pointer;
-          }
-          .magnet-text:hover { text-decoration: underline; }
-          .copy {
-            flex: none; width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
-            padding: 0; border-radius: 8px;
-            border: 1px solid var(--border); background: transparent; color: var(--text);
-            cursor: pointer; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-          }
-          .copy:hover { background: rgba(255, 255, 255, 0.08); }
-          .copy.copied { color: #4ade80; border-color: #4ade80; }
-          .copy svg { width: 16px; height: 16px; display: block; }
-          .thunder {
-            flex: none; width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
-            padding: 0; border-radius: 8px;
-            border: 1px solid var(--border); background: transparent; color: var(--text);
-            cursor: pointer; text-decoration: none; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-          }
-          .thunder:hover { background: rgba(255, 255, 255, 0.08); border-color: var(--accent); color: var(--accent); }
-          .thunder svg { width: 16px; height: 16px; display: block; }
-          .meta { color: var(--muted); font-size: 12px; }
-          .detail {
-            margin-top: 10px; padding: 6px 12px; border-radius: 8px;
-            border: 1px solid var(--border); background: transparent; color: var(--text);
-            cursor: pointer; transition: background 0.15s ease;
-          }
-          .detail:hover { background: rgba(255, 255, 255, 0.08); }
-          dialog { width: min(720px, 92vw); height: 86vh; padding: 0; border: 1px solid var(--border); border-radius: 14px; color: var(--text); background: var(--bg-2); }
-          dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
-          dialog[open] { display: flex; flex-direction: column; }
-          .dlg-head { flex: none; display: flex; align-items: flex-start; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--border); }
-          .dlg-title { margin: 0; flex: 1; font-size: 16px; font-weight: 600; word-break: break-all; }
-          .dlg-title mark { background: rgba(99, 102, 241, 0.35); color: #fff; border-radius: 3px; padding: 0 2px; }
-          .close { flex: none; width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; }
-          .close:hover { background: rgba(255, 255, 255, 0.08); }
-          .close svg { width: 16px; height: 16px; display: block; }
-          .dlg-body { flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; padding: 16px 18px; }
-          .dlg-row { display: flex; gap: 10px; margin-bottom: 8px; font-size: 13px; }
-          .dlg-row .k { flex: none; width: 64px; color: var(--muted); }
-          .dlg-row .v { word-break: break-all; }
-          .dlg-row a.v-link { text-decoration: none; cursor: pointer; }
-          .dlg-row a.v-link:hover { text-decoration: underline; }
-          .dlg-meta { flex: none; }
-          .dlg-files { flex: 1 1 auto; overflow: auto; min-height: 0; list-style: none; margin: 12px 0 0; padding: 0; }
-          .dlg-files .row { display: flex; align-items: center; gap: 6px; }
-          .dlg-files .toggle { flex: none; width: 14px; text-align: center; color: var(--muted); cursor: pointer; user-select: none; }
-          .dlg-files .toggle.empty { visibility: hidden; }
-          .dlg-files .name { color: var(--text); word-break: break-all; }
-          .dlg-files .name mark { background: rgba(99, 102, 241, 0.35); color: #fff; border-radius: 3px; padding: 0 2px; }
-          .dlg-files .size { flex: none; color: var(--muted); margin-left: 4px; }
-          .dlg-files ul.children { list-style: none; margin: 0; padding: 0 0 0 14px; border-left: 1px solid var(--border); }
-          .dlg-files li.collapsed > ul.children { display: none; }
-        </style>
+      const root = this.attachShadow({ mode: 'open' });
+      root.adoptedStyleSheets = [magnetCardCss];
+      root.innerHTML = `
         <h2 class="title"></h2>
         <div class="magnet">
           <a class="magnet-text" href=""></a>
           <button class="copy" type="button" aria-label="复制磁力链接" title="复制磁力链接"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
           <a class="thunder" aria-label="迅雷下载" title="迅雷下载" href=""><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg></a>
         </div>
-        <magnet-files></magnet-files>
+        <div class="files-row">
+          <magnet-files></magnet-files>
+          <button class="detail" type="button" hidden>查看全部文件</button>
+        </div>
         <div class="meta"></div>
-        <button class="detail" type="button" hidden>查看全部文件</button>
         <dialog></dialog>`;
-      this.shadowRoot.querySelector('.copy').addEventListener('click', (e) => {
+      root.querySelector('.copy').addEventListener('click', (e) => {
         copyText(this._item?.magnet || '', e.currentTarget);
       });
-      this.shadowRoot.querySelector('.detail').addEventListener('click', () => this._openDetail());
+      root.querySelector('.detail').addEventListener('click', () => this._openDetail());
     }
     if (this._item !== undefined) this._render();
   }
@@ -409,8 +130,7 @@ class MagnetCard extends HTMLElement {
     th.href = tUrl;
     th.hidden = !tUrl;
     const mf = sr.querySelector('magnet-files');
-    mf.files = it.files;
-    mf.highlight = this._highlight;
+    mf.setData(it.files, this._highlight);
     sr.querySelector('.meta').textContent =
       `大小 ${formatBytes(Number(it.totalSize))} · 抓取于 ${formatDate(Number(it.fetchedAt))}`;
     sr.querySelector('.detail').hidden = normalizeFiles(it.files).length <= PREVIEW_LIMIT;
@@ -467,17 +187,9 @@ customElements.define('magnet-card', MagnetCard);
 class ResultList extends HTMLElement {
   connectedCallback() {
     if (this.shadowRoot) return;
-    this.attachShadow({ mode: 'open' }).innerHTML = `
-      <style>
-        :host {
-          flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
-          gap: 14px; padding: 6px 0; overflow-y: auto;
-          scrollbar-width: thin; scrollbar-color: var(--border) transparent;
-        }
-        :host::-webkit-scrollbar { width: 8px; }
-        :host::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-      </style>
-      <slot></slot>`;
+    const root = this.attachShadow({ mode: 'open' });
+    root.adoptedStyleSheets = [resultListCss];
+    root.innerHTML = `<slot></slot>`;
   }
 }
 customElements.define('result-list', ResultList);
@@ -522,32 +234,9 @@ class DhtSortGroup extends HTMLElement {
 
   connectedCallback() {
     if (!this.shadowRoot) {
-      this.attachShadow({ mode: 'open' }).innerHTML = `
-        <style>
-          :host { display: inline-flex; gap: 10px; }
-          .seg {
-            display: flex; align-items: stretch; height: 44px;
-            border: 1px solid var(--border); border-radius: 10px;
-            overflow: hidden; background: var(--card);
-          }
-          .sb {
-            display: flex; align-items: center; justify-content: center;
-            width: 40px; height: 100%; padding: 0; border: none;
-            border-right: 1px solid var(--border);
-            background: transparent; color: var(--muted); cursor: pointer;
-            transition: background 0.15s ease, color 0.15s ease;
-          }
-          .seg .sb:last-child { border-right: none; }
-          .sb:hover { color: var(--text); }
-          .sb.active { background: rgba(99, 102, 241, 0.18); color: var(--primary-2); }
-          .ob {
-            display: flex; align-items: center; justify-content: center;
-            width: 40px; height: 44px; padding: 0; border-radius: 10px;
-            border: 1px solid var(--border); background: var(--card);
-            color: var(--muted); cursor: pointer; transition: color 0.15s ease;
-          }
-          .ob:hover { color: var(--text); }
-        </style>
+      const root = this.attachShadow({ mode: 'open' });
+      root.adoptedStyleSheets = [sortGroupCss];
+      root.innerHTML = `
         <div class="seg">
           <button type="button" class="sb" data-sort="" title="默认排序">${SORT_ICONS['']}</button>
           <button type="button" class="sb" data-sort="fetchedAt" title="按抓取时间排序">${SORT_ICONS.fetchedAt}</button>
@@ -555,10 +244,10 @@ class DhtSortGroup extends HTMLElement {
           <button type="button" class="sb" data-sort="relevance" title="按相关度排序">${SORT_ICONS.relevance}</button>
         </div>
         <button type="button" class="ob" title="切换升序/降序"></button>`;
-      this.shadowRoot.querySelectorAll('.sb').forEach((b) =>
+      root.querySelectorAll('.sb').forEach((b) =>
         b.addEventListener('click', () => this._onSort(b.dataset.sort))
       );
-      this.shadowRoot.querySelector('.ob').addEventListener('click', () => this._onOrder());
+      root.querySelector('.ob').addEventListener('click', () => this._onOrder());
     }
     this._render();
   }

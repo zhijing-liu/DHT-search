@@ -15,8 +15,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import Database from 'better-sqlite3';
 import { KEYWORD_FILTER_TABLE, DEFAULT_INDEX_DB_PATH } from '../db.js';
+import { openDatabase, setPragma, execRaw, prepareStmt, runStmt, transaction, closeDb, getRow } from '../db-driver.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORDS_FILE = path.join(HERE, 'hot-filter-words.txt');
@@ -43,31 +43,27 @@ if (!words.length) {
   process.exit(0);
 }
 
-const db = new Database(indexPath);
-db.pragma('busy_timeout = 5000');
+const db = openDatabase(indexPath);
+setPragma(db, 'busy_timeout', 5000);
 // 表不存在则创建（与 db.js 的 DDL 保持一致）
-db.exec(`CREATE TABLE IF NOT EXISTS ${KEYWORD_FILTER_TABLE} (
+execRaw(db, `CREATE TABLE IF NOT EXISTS ${KEYWORD_FILTER_TABLE} (
   term TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL DEFAULT 0
 )`);
 
-const ins = db.prepare(
-  `INSERT OR IGNORE INTO ${KEYWORD_FILTER_TABLE} (term, created_at) VALUES (?, ?)`
-);
+const ins = prepareStmt(db, `INSERT OR IGNORE INTO ${KEYWORD_FILTER_TABLE} (term, created_at) VALUES (?, ?)`);
 const now = Date.now();
 let added = 0;
-db.transaction((list) => {
+transaction(db, (list) => {
   for (const w of list) {
     // 小写归一（与热词统计的 token 折叠行为一致），并剔除不含字母数字的行
     const term = w.toLowerCase();
     if (!term || !/[\p{L}\p{N}]/u.test(term)) continue;
-    const info = ins.run(term, now);
+    const info = runStmt(ins, [term, now]);
     if (info.changes > 0) added += 1;
   }
 })(words);
 
-const total = db
-  .prepare(`SELECT count(*) AS c FROM ${KEYWORD_FILTER_TABLE}`)
-  .get().c;
+const total = getRow(db, `SELECT count(*) AS c FROM ${KEYWORD_FILTER_TABLE}`).c;
 console.log(`写入完成：本次新增 ${added} 条（文件 ${words.length} 行），过滤表现有 ${total} 条`);
-db.close();
+closeDb(db);

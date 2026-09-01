@@ -4,5 +4,7 @@
   "port": 3000,
   "maxResults": 20000,
   "reindexMaxOldSpaceMb": 2048,
-  "reindexTimeoutMs": 0
+  "reindexTimeoutMs": 0,
+  "searchCacheMaxSizeMb": 256,
+  "searchCacheTtlMs": 3600000
 }
