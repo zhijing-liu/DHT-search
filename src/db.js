@@ -446,7 +446,7 @@ function syncIndex(db, src, onFlush) {
  */
 export function createMagnetDb(options = {}) {
   const opts = typeof options === 'string' ? { source: options } : options;
-  // 优先级：调用方显式传入 > config.json > 环境变量 > 模块内默认值
+  // 优先级：调用方显式传入 > config.js > 环境变量 > 模块内默认值
   const sourcePath = resolveDbPath(
     opts.source ?? CONFIG.sourceDbPath ?? process.env.DHT_DB_PATH ?? DEFAULT_DB_PATH
   );

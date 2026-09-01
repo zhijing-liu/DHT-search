@@ -2,7 +2,7 @@
  * 全局配置与共享约定（store）
  * ------------------------------------------------------------------
  * 集中存放跨模块共享的「配置 + 约定常量」，与 db.js 的查询实现解耦：
- *   - CONFIG              来自 config.json 的运行期配置（缺失/非法回退 {}）
+ *   - CONFIG              来自 config.js 的运行期配置（具名 export const 聚合）
  *   - 库路径约定         DEFAULT_DB_PATH / DEFAULT_INDEX_DB_PATH / resolveDbPath
  *   - 表名约定           TABLE / FTS_TABLE / DOCS_TABLE / KEYWORD_TABLE / KEYWORD_FILTER_TABLE
  *   - 索引与排序约定     TOKENIZER / DEFAULT_LIMIT / MAX_LIMIT / SORT_COLUMNS
@@ -11,25 +11,41 @@
  * SELECT_COLUMNS / TOKEN_PATTERN 等）仍留在 db.js。
  */
 
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  SOURCE_DB_PATH,
+  INDEX_DB_PATH,
+  PORT,
+  MAX_RESULTS,
+  REINDEX_MAX_OLD_SPACE_MB,
+  REINDEX_TIMEOUT_MS,
+  SEARCH_CACHE_MAX_SIZE_MB,
+  SEARCH_CACHE_TTL_MS,
+  SYNC_INTERVAL_MS,
+} from '../config.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-/** 项目根目录：config.json 与 data/ 都在此处（不在 src/ 下） */
+/** 项目根目录：config.js 与 data/ 都在此处（不在 src/ 下） */
 const ROOT_DIR = path.resolve(MODULE_DIR, '..');
 
-/** 读取 config.json（不存在或非法时返回空对象，不阻塞启动） */
-function loadConfig() {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'config.json'), 'utf8'));
-  } catch {
-    return {};
-  }
-}
-
-/** 来自 config.json 的运行期配置 */
-export const CONFIG = loadConfig();
+/**
+ * 来自 config.js 的运行期配置。
+ * 这里把 config.js 里「独立 export const 变量」重新聚合成 CONFIG.xxx 形式，
+ * 仅为向上兼容 db.js / index.js 既有的 CONFIG.xxx 访问方式；
+ * 新代码建议直接 `import { PORT } from '../config.js'` 引用具名常量。
+ */
+export const CONFIG = {
+  sourceDbPath: SOURCE_DB_PATH,
+  indexDbPath: INDEX_DB_PATH,
+  port: PORT,
+  maxResults: MAX_RESULTS,
+  reindexMaxOldSpaceMb: REINDEX_MAX_OLD_SPACE_MB,
+  reindexTimeoutMs: REINDEX_TIMEOUT_MS,
+  searchCacheMaxSizeMb: SEARCH_CACHE_MAX_SIZE_MB,
+  searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
+  syncIntervalMs: SYNC_INTERVAL_MS,
+};
 
 /** 把配置里的库路径解析为绝对路径：绝对路径原样使用，相对路径基于项目根目录 */
 export function resolveDbPath(p) {

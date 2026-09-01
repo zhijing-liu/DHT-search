@@ -26,7 +26,7 @@ import { LRUCache } from 'lru-cache';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-/** 整集拉取的安全上限：单次请求最多返回这么多条，超出则 truncated=true；可由 config.json 的 maxResults 覆盖 */
+/** 整集拉取的安全上限：单次请求最多返回这么多条，超出则 truncated=true；可由 config.js 的 MAX_RESULTS 覆盖 */
 const maxResults = Number(CONFIG.maxResults);
 const MAX_RESULTS = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 20000;
 
@@ -41,7 +41,7 @@ const api = createMagnetDb();
  * 进程内搜索缓存：以「最大内存占用 + 每条 TTL」双约束淘汰。
  *  - maxSize + sizeCalculation：按序列化后字节数限制总内存（空间约束）；
  *  - ttl + updateAgeOnGet：每条缓存独立计时，被访问即刷新 TTL；
- *    默认 1 小时，经 config.json 的 searchCacheTtlMs 覆盖；
+ *    默认 1 小时，经 config.js 的 SEARCH_CACHE_TTL_MS 覆盖；
  *  - ttlAutopurge + 定时 purgeStale：超时且未被访问的条目会被真正释放（定期释放）。
  */
 const SEARCH_CACHE_MAX_SIZE =
@@ -262,7 +262,7 @@ const server = app.listen(PORT, () => {
 });
 
 // 运行期自动增量同步：默认每小时按 last_rowid 补录一次源库新增行
-// （config.json 的 syncIntervalMs 配 0 可关闭）；重建期间 syncIncremental 自动跳过本轮
+// （config.js 的 SYNC_INTERVAL_MS 配 0 可关闭）；重建期间 syncIncremental 自动跳过本轮
 const SYNC_INTERVAL_MS = (() => {
   const v = Number(CONFIG.syncIntervalMs);
   return Number.isFinite(v) && v > 0 ? v : 3600000;

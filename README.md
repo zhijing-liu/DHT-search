@@ -50,7 +50,7 @@ DHT Search 把一个由外部程序（如 DHT 爬虫）持续写入的「源库�
 ```
 DHT-search/
 ├── index.js                  # Express 入口：HTTP API + 静态资源 + 缓存/定时同步
-├── config.json               # 运行期配置（缺失/非法不阻塞启动，回退默认）
+├── config.js                 # 运行期配置（ESM 模块，支持注释；每项独立 export const）
 ├── ecosystem.config.node.json # pm2 配置：Node 运行时
 ├── ecosystem.config.bun.json  # pm2 配置：Bun 运行时
 ├── package.json
@@ -99,9 +99,9 @@ DHT-search/
 - **零前端构建**：纯原生 ES Module + 自定义元素 + Shadow DOM，直接用浏览器加载。
 - **RPC 推送**：结果卡片「推送」按钮可将磁力链接经 JSON-RPC 2.0（`aria2.addUri`）推送到 aria2 / Motrix 下载器；地址与密钥在「设置」中配置，密钥按 aria2 约定以 `token:` 前缀发送。
 
-## 五、配置项（`config.json`）
+## 五、配置项（`config.js`）
 
-所有项均可选；缺失或非法时回退默认值，不阻塞启动。路径类配置支持相对路径（基于项目根）或绝对路径。
+所有项均已在 `config.js` 中给出默认值并附注释；直接修改对应 `export const` 即可，重启服务生效。路径类配置支持相对路径（基于项目根）或绝对路径。
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
@@ -115,7 +115,7 @@ DHT-search/
 | `searchCacheTtlMs` | `3600000` | 搜索缓存 TTL（ms，默认 1 小时） |
 | `syncIntervalMs` | `3600000` | 运行期自动增量同步间隔（ms，默认 1 小时；`0` 关闭） |
 
-路径解析优先级：**显式参数 > config.json > 环境变量（`DHT_DB_PATH` / `DHT_INDEX_DB_PATH`）> 模块默认值**。
+路径解析优先级：**显式参数 > config.js > 环境变量（`DHT_DB_PATH` / `DHT_INDEX_DB_PATH`）> 模块默认值**。
 
 ## 六、安装与前置条件
 
@@ -164,9 +164,9 @@ pm2 start ecosystem.config.bun.json
 npm run start:pm2:bun
 ```
 
-两份配置都不在 pm2 中硬编码端口，统一读取 `config.json` 的 `port`（默认 3000）。
+两份配置都不在 pm2 中硬编码端口，统一读取 `config.js` 的 `PORT`（默认 3000）。
 若想同机并存做回归对比，需让两个实例监听不同端口——可在启动前用环境变量区分，例如：
-`PORT=3001 pm2 start ecosystem.config.bun.json`，或各自指向不同的 `config.json`。
+`PORT=3001 pm2 start ecosystem.config.bun.json`，或各自指向不同的 `config.js`。
 
 常用 pm2 命令：
 ```bash
