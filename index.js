@@ -267,10 +267,17 @@ const SYNC_INTERVAL_MS = (() => {
   const v = Number(CONFIG.syncIntervalMs);
   return Number.isFinite(v) && v > 0 ? v : 3600000;
 })();
-const syncTimer = setInterval(() => {
-  api.syncIncremental().catch((err) => {
+const syncTimer = setInterval(async () => {
+  try {
+    // syncIncremental 是同步函数（重建期间直接 return undefined 跳过本轮），
+    // 这里统一 await + try/catch：既兼容同步返回值，也能拦住同步抛错，
+    // 避免回调内未捕获异常直接终止进程
+    await api.syncIncremental();
+    // 索引内容可能已变更，清空搜索缓存，避免继续返回旧结果
+    searchCache.clear();
+  } catch (err) {
     console.error(`[SYSTEM][sync] 增量同步失败: ${err?.message || err}`);
-  });
+  }
 }, SYNC_INTERVAL_MS);
 if (typeof syncTimer.unref === 'function') syncTimer.unref();
 
