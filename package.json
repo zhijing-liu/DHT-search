@@ -8,7 +8,11 @@
     "smoke": "node test/smoke.mjs",
     "test": "node test/smoke.mjs",
     "seed:filter": "node src/seed-filter.mjs",
-    "verify:driver": "node test/verify-driver.mjs"
+    "verify:driver": "node test/verify-driver.mjs",
+    "start:pm2:node": "pm2 start ecosystem.config.node.cjs",
+    "start:pm2:bun": "pm2 start ecosystem.config.bun.cjs",
+    "stop:pm2": "pm2 stop dht-search-node dht-search-bun",
+    "logs:pm2": "pm2 logs"
   },
   "keywords": [],
   "author": "",
