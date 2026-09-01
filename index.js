@@ -174,6 +174,16 @@ app.post('/api/reindex', apiHandler(async (_req, res) => {
   res.json({ ok: true, indexed });
 }, 500, 'reindex failed'));
 
+/** 增量同步最新索引（按 last_rowid 仅补录源库新增行，秒级；与重建互斥） */
+app.post('/api/sync', apiHandler((_req, res) => {
+  console.log('[USER] 手动触发增量同步');
+  api.syncIncremental();
+  // 索引内容已变更，清空搜索缓存避免返回旧结果
+  searchCache.clear();
+  console.log('[SYSTEM] 增量同步完成，已清空搜索缓存');
+  res.json({ ok: true });
+}, 500, 'sync failed'));
+
 /** 当前已索引的 magnet 总数 */
 app.get('/api/count', apiHandler((_req, res) => {
   res.json({ count: api.countMagnets() });

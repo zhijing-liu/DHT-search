@@ -49,6 +49,13 @@
       <div class="settings-body">
         <div class="settings-item">
           <div class="settings-item-text">
+            <div class="settings-item-title">同步最新索引</div>
+            <div class="settings-item-desc">按 last_rowid 仅补录源库新增行（增量，秒级）</div>
+          </div>
+          <button id="syncBtn" type="button" class="settings-action">同步索引</button>
+        </div>
+        <div class="settings-item">
+          <div class="settings-item-text">
             <div class="settings-item-title">重建索引</div>
             <div class="settings-item-desc">源库被改/删后，手动重建本地索引</div>
           </div>

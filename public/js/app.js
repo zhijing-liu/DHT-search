@@ -30,6 +30,7 @@ const el = {
   settingsBtn: document.getElementById('settingsBtn'),
   settingsDialog: document.getElementById('settingsDialog'),
   reindexBtn: document.getElementById('reindexBtn'),
+  syncBtn: document.getElementById('syncBtn'),
   status: document.getElementById('status'),
   results: document.getElementById('results'),
   loadingOverlay: document.getElementById('loadingOverlay'),
@@ -549,8 +550,37 @@ async function doReindex() {
   }
 }
 
+/* ---------- 增量同步最新索引 ---------- */
+
+async function doSync() {
+  const label = el.syncBtn.textContent;
+  el.syncBtn.disabled = true;
+  el.syncBtn.textContent = '同步中…';
+  el.status.textContent = '正在同步最新索引…';
+  try {
+    const resp = await fetch('/api/sync', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) {
+      el.status.textContent = `同步失败：${data.error || resp.status}`;
+      return;
+    }
+    if (state.query) {
+      await doSearch();
+    } else {
+      await loadCount();
+    }
+    el.status.textContent = '索引已同步最新';
+  } catch (err) {
+    el.status.textContent = `同步出错：${err.message}`;
+  } finally {
+    el.syncBtn.disabled = false;
+    el.syncBtn.textContent = label;
+  }
+}
+
 el.settingsBtn.addEventListener('click', () => el.settingsDialog.showModal());
 el.reindexBtn.addEventListener('click', doReindex);
+el.syncBtn.addEventListener('click', doSync);
 el.cancelSearchBtn.addEventListener('click', cancelSearch);
 
 /* ---------- 每页数量控件（10-200，自由输入） ---------- */
