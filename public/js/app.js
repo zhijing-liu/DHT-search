@@ -37,11 +37,29 @@ const el = {
   pager: document.getElementById('pager'),
   pagerInfo: document.getElementById('pagerInfo'),
   pageSize: document.getElementById('pageSize'),
-  minSize: document.getElementById('minSize'),
-  maxSize: document.getElementById('maxSize'),
+  sizeRange: document.getElementById('sizeRange'),
   countBadge: document.getElementById('countBadge'),
   suggestions: document.getElementById('suggestions'),
 };
+
+/** 大小范围固定档位（字节边界） */
+const SIZE_RANGES = [
+  { value: 'all', label: '全部' },
+  { value: 'lt100mb', label: '<100MB', maxBytes: 100 * 1024 * 1024 },
+  { value: '100mb-1gb', label: '100MB-1GB', minBytes: 100 * 1024 * 1024, maxBytes: 1 * 1024 * 1024 * 1024 },
+  { value: '1gb-10gb', label: '1GB-10GB', minBytes: 1 * 1024 * 1024 * 1024, maxBytes: 10 * 1024 * 1024 * 1024 },
+  { value: '10gb-100gb', label: '10GB-100GB', minBytes: 10 * 1024 * 1024 * 1024, maxBytes: 100 * 1024 * 1024 * 1024 },
+  { value: 'gt100gb', label: '>100GB', minBytes: 100 * 1024 * 1024 * 1024 },
+];
+
+/** 根据当前选中的大小范围档位，返回对应的字节边界 */
+function getSizeRangeBytes() {
+  const range = SIZE_RANGES.find((r) => r.value === el.sizeRange.value) || SIZE_RANGES[0];
+  return {
+    minBytes: Number.isFinite(range.minBytes) ? range.minBytes : undefined,
+    maxBytes: Number.isFinite(range.maxBytes) ? range.maxBytes : undefined,
+  };
+}
 
 /* ---------- 工具 ---------- */
 
@@ -387,11 +405,10 @@ async function fetchPage() {
     offset: String(offset),
   });
   if (by) params.set('by', by);
-  // 大小范围筛选：前端单位 MB，转为字节传给后端；0/空不参与
-  const minMB = parseFloat(el.minSize.value);
-  const maxMB = parseFloat(el.maxSize.value);
-  if (Number.isFinite(minMB) && minMB > 0) params.set('minSize', String(Math.floor(minMB * 1024 * 1024)));
-  if (Number.isFinite(maxMB) && maxMB > 0) params.set('maxSize', String(Math.floor(maxMB * 1024 * 1024)));
+  // 大小范围筛选：下拉框固定档位，转换为字节传给后端
+  const { minBytes, maxBytes } = getSizeRangeBytes();
+  if (Number.isFinite(minBytes)) params.set('minSize', String(minBytes));
+  if (Number.isFinite(maxBytes)) params.set('maxSize', String(maxBytes));
 
   setLoading(true);
   try {
@@ -437,8 +454,7 @@ function updateUrl() {
   if (el.sortGroup.order !== 'desc') params.set('order', el.sortGroup.order);
   if (state.page > 1) params.set('page', String(state.page));
   if (state.pageSize !== 20) params.set('pageSize', String(state.pageSize));
-  if (el.minSize.value) params.set('minSize', el.minSize.value);
-  if (el.maxSize.value) params.set('maxSize', el.maxSize.value);
+  if (el.sizeRange.value !== 'all') params.set('sizeRange', el.sizeRange.value);
   const qs = params.toString();
   history.replaceState(null, '', qs ? `?${qs}` : location.pathname);
 }
@@ -561,10 +577,10 @@ function initFromUrl() {
   if (page) state.page = Math.max(1, parseInt(page, 10) || 1);
   const ps = params.get('pageSize');
   if (ps) applyPageSize(ps);
-  const minSize = params.get('minSize');
-  const maxSize = params.get('maxSize');
-  if (minSize) el.minSize.value = minSize;
-  if (maxSize) el.maxSize.value = maxSize;
+  const sizeRange = params.get('sizeRange');
+  if (sizeRange && SIZE_RANGES.some((r) => r.value === sizeRange)) {
+    el.sizeRange.value = sizeRange;
+  }
   if (q) doSearch(false); // 保留 URL 中的页码，不重置为第 1 页
 }
 initFromUrl();
@@ -619,7 +635,6 @@ el.pageSize.addEventListener('change', () => {
   fetchPage();
 });
 // 大小范围变化后重新搜索（仅在有查询词时；空查询回到热词视图）
-el.minSize.addEventListener('change', () => { if (state.query) doSearch(); });
-el.maxSize.addEventListener('change', () => { if (state.query) doSearch(); });
+el.sizeRange.addEventListener('change', () => { if (state.query) doSearch(); });
 
 loadCount();

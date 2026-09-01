@@ -23,10 +23,16 @@
         <div id="suggestions" class="suggestions" role="listbox" aria-label="搜索建议" hidden></div>
       </div>
       <dht-sort-group id="sortGroup"></dht-sort-group>
-      <div class="size-filter" style="display:flex;align-items:center;gap:4px;">
-        <input id="minSize" type="number" min="0" inputmode="decimal" placeholder="最小 MB" style="width:84px" aria-label="最小大小(MB)" />
-        <span class="size-sep">–</span>
-        <input id="maxSize" type="number" min="0" inputmode="decimal" placeholder="最大 MB" style="width:84px" aria-label="最大大小(MB)" />
+      <div class="size-filter">
+        <label for="sizeRange" class="sr-only">大小范围</label>
+        <select id="sizeRange" aria-label="大小范围">
+          <option value="all">全部</option>
+          <option value="lt100mb">&lt;100MB</option>
+          <option value="100mb-1gb">100MB-1GB</option>
+          <option value="1gb-10gb">1GB-10GB</option>
+          <option value="10gb-100gb">10GB-100GB</option>
+          <option value="gt100gb">&gt;100GB</option>
+        </select>
       </div>
       <button id="settingsBtn" class="icon-btn" type="button" aria-label="设置" title="设置">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>

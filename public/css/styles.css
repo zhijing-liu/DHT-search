@@ -156,6 +156,45 @@
     }
   }
 
+  .size-filter {
+    display: flex;
+    align-items: center;
+
+    & select {
+      height: 44px;
+      padding: 0 28px 0 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--text);
+      font-size: 15px;
+      outline: none;
+      cursor: pointer;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='4 6 8 10 12 6'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      background-size: 16px;
+
+      &:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+      }
+    }
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   .pager-row {
     flex: none;
     display: flex;
@@ -338,6 +377,7 @@
       gap: 8px;
       & > button { height: 40px; padding: 0 16px; font-size: 14px; }
     }
+    .size-filter select { height: 40px; font-size: 14px; }
     .pager-row { margin-top: 14px; gap: 10px; }
     .hot-words .hot-chip { padding: 6px 12px; font-size: 13px; }
   }
@@ -354,8 +394,8 @@
         flex: 1 1 auto;
         & input { font-size: 15px; padding: 11px 38px 11px 12px; }
       }
-      /* 排序组 + 重建按钮横排对齐到右侧 */
-      & > dht-sort-group, & > button { width: auto; align-self: flex-end; }
+      /* 排序组、大小筛选、重建按钮横排对齐到右侧 */
+      & > dht-sort-group, & > .size-filter, & > button { width: auto; align-self: flex-end; }
     }
 
     .pager-row {

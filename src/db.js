@@ -634,12 +634,16 @@ export function createMagnetDb(options = {}) {
    * 返回 null 表示不加大小过滤。
    */
   function sizeFilterSql(minSize, maxSize) {
-    const parts = [];
+    const conds = [];
     const mn = Number(minSize);
     const mx = Number(maxSize);
-    if (Number.isFinite(mn) && mn >= 0) parts.push(sql`m.totalSize >= ${mn}`);
-    if (Number.isFinite(mx) && mx >= 0) parts.push(sql`m.totalSize <= ${mx}`);
-    return parts.length ? sql.join(parts, ' AND ') : null;
+    if (Number.isFinite(mn) && mn >= 0) conds.push(sql`m.totalSize >= ${mn}`);
+    if (Number.isFinite(mx) && mx >= 0) conds.push(sql`m.totalSize <= ${mx}`);
+    // 注意：bun 下 drizzle-orm/bun-sqlite 会把 sql.join 的字符串分隔符参数化成
+    // 一个 `?`，导致 `>= ? AND <= ?` 错拼成 `>= ?? <= ?`。故改为显式拼接 SQL 片段。
+    if (conds.length === 0) return null;
+    if (conds.length === 1) return conds[0];
+    return sql`${conds[0]} AND ${conds[1]}`;
   }
 
   /** 按 infohash 精确检索（大小写不敏感，支持前缀匹配） */
@@ -686,6 +690,10 @@ export function createMagnetDb(options = {}) {
     }
 
     const match = buildMatchExpression(query);
+    // FTS5 MATCH 必须接收「SQL 字符串字面量」形式的查询表达式（单引号包裹），
+    // 否则 SQLite 会把双引号短语误当标识符、或把参数化占位符 ? 在 prepare 阶段
+    // 抛 fts5: near "?"。match 已白名单化（仅字母数字/双引号/星号/AND），安全。
+    const matchLit = `'${match}'`;
     if (!match) {
       throw new TypeError('searchMagnets: options.query 不能为空，且需包含至少一个字母或数字');
     }
@@ -704,7 +712,7 @@ export function createMagnetDb(options = {}) {
     const total = Number(dbRO.all(sql`
       SELECT count(*) AS total FROM ${sql.raw(FTS_TABLE)} f
       JOIN ${sql.raw(DOCS_TABLE)} m ON m.id = f.rowid
-      WHERE ${sql.raw(FTS_TABLE)} MATCH ${match}${sizeCond}
+      WHERE ${sql.raw(FTS_TABLE)} MATCH ${sql.raw(matchLit)}${sizeCond}
     `)[0]?.total ?? 0);
 
     return {
@@ -714,7 +722,7 @@ export function createMagnetDb(options = {}) {
       items: dbRO.all(sql`
         SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(FTS_TABLE)} f
         JOIN ${sql.raw(DOCS_TABLE)} m ON m.id = f.rowid
-        WHERE ${sql.raw(FTS_TABLE)} MATCH ${match}${sizeCond}
+        WHERE ${sql.raw(FTS_TABLE)} MATCH ${sql.raw(matchLit)}${sizeCond}
         ${sql.raw(orderSql)}
         LIMIT ${limit} OFFSET ${offset}
       `).map(mapRow),
