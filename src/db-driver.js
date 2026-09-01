@@ -62,11 +62,9 @@ export function setPragma(rawDb, name, value) {
   rawDb.exec(`PRAGMA ${name} = ${value}`);
 }
 
-/** 读 PRAGMA 当前值，返回含 name 列的行对象（两种驱动都支持 .journal_mode 等列名访问） */
+/** 读 PRAGMA 当前值；直接复用 getRow 抹平两种驱动的差异 */
 export function getPragma(rawDb, name) {
-  return isBun
-    ? rawDb.query(`PRAGMA ${name}`).get()
-    : rawDb.prepare(`PRAGMA ${name}`).get();
+  return getRow(rawDb, `PRAGMA ${name}`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -101,12 +99,6 @@ export function prepareStmt(rawDb, sql) {
 /** 执行预编译语句（写），返回 { lastInsertRowid, changes } */
 export function runStmt(stmt, params = []) {
   return stmt.run(params);
-}
-export function getStmt(stmt, params = []) {
-  return stmt.get(params);
-}
-export function allStmt(stmt, params = []) {
-  return stmt.all(params);
 }
 
 /** 事务：两种驱动都是 db.transaction(fn) 返回可调用包装 */

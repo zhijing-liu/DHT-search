@@ -30,7 +30,6 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import {
   isBun,
@@ -45,46 +44,24 @@ import {
   runStmt,
   transaction,
   closeDb,
-  isOpen,
 } from './db-driver.js';
 import { sql, eq, count } from 'drizzle-orm';
 import { magnetsDocs, syncMeta } from './schema.js';
-
-const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-
-export const DEFAULT_DB_PATH = path.join(MODULE_DIR, 'data', 'magnet.db');
-export const DEFAULT_INDEX_DB_PATH = path.join(MODULE_DIR, 'data', 'dht.search.db');
-
-/** 把配置里的库路径解析为绝对路径：绝对路径原样使用，相对路径基于模块目录 */
-export function resolveDbPath(p) {
-  if (!p) return p;
-  return path.isAbsolute(p) ? p : path.join(MODULE_DIR, p);
-}
-
-/** 读取 config.json（不存在或非法时返回空对象，不阻塞启动） */
-function loadConfig() {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(MODULE_DIR, 'config.json'), 'utf8'));
-  } catch {
-    return {};
-  }
-}
-export const CONFIG = loadConfig();
-
-/** 源库主表名 */
-export const TABLE = 'magnets';
-/** 影子索引库中的 contentless FTS5 表名 */
-export const FTS_TABLE = 'magnets_fts';
-/** 影子索引库中的去规范化副本表名（展示/排序用） */
-export const DOCS_TABLE = 'magnets_docs';
-
-export const TOKENIZER = 'unicode61 remove_diacritics 2';
-
-export const DEFAULT_LIMIT = 20;
-export const MAX_LIMIT = 200;
-
-/** 允许参与排序的列白名单（relevance 走 bm25，其余走副本表列） */
-export const SORT_COLUMNS = Object.freeze(['fetchedAt', 'totalSize', 'relevance']);
+import {
+  CONFIG,
+  resolveDbPath,
+  DEFAULT_DB_PATH,
+  DEFAULT_INDEX_DB_PATH,
+  TABLE,
+  FTS_TABLE,
+  DOCS_TABLE,
+  KEYWORD_TABLE,
+  KEYWORD_FILTER_TABLE,
+  TOKENIZER,
+  DEFAULT_LIMIT,
+  MAX_LIMIT,
+  SORT_COLUMNS,
+} from './store.js';
 
 /**
  * 排序 SQL 白名单。ORDER BY 的列名与方向无法参数化，故写死为常量按需取用，
@@ -107,10 +84,6 @@ const SELECT_COLUMNS = 'm.id, m.name, m.infohash, m.magnet, m.files, m.totalSize
 /** 只保留字母与数字，用于从用户输入中提取安全 token */
 const TOKEN_PATTERN = /[\p{L}\p{N}]+/gu;
 
-/** 热词统计表名（构建索引时随 populate 统计写入） */
-export const KEYWORD_TABLE = 'keyword_stats';
-/** 热词过滤表名（用户配置的噪声词；reindex 不清除） */
-export const KEYWORD_FILTER_TABLE = 'keyword_filter';
 /** 热词统计来源列：只统计 name，避开 files JSON 键名（path/size）噪声 */
 const KEYWORD_SOURCE = 'name';
 /** 热词过滤：低于此长度的 token 丢弃（去单字符噪声） */
@@ -189,13 +162,9 @@ function mapRow(row) {
 
 /** 从文本提取合格的热词 token（与 unicode61 折叠行为对齐：小写 + 去噪） */
 function keywordTokens(text) {
-  const out = [];
-  for (const t of String(text ?? '').match(TOKEN_PATTERN) ?? []) {
-    const w = t.toLowerCase();
-    if (w.length < MIN_KEYWORD_LEN || NUMERIC_ONLY.test(w)) continue;
-    out.push(w);
-  }
-  return out;
+  return String(text ?? '').match(TOKEN_PATTERN)
+    ?.map((t) => t.toLowerCase())
+    .filter((w) => w.length >= MIN_KEYWORD_LEN && !NUMERIC_ONLY.test(w)) ?? [];
 }
 
 /* ------------------------------------------------------------------ */
@@ -371,29 +340,14 @@ function populate(db, rowsIterable, onFlush) {
 }
 
 /**
- * 增量合并 FTS5 segment，替代 'optimize'。
- *
- * 'optimize' 会把全部 b-tree 一次性合并成单个大 segment，内存峰值与索引规模成正比。
- * 这里用官方推荐的等价分步写法：先以 -N 触发一次（把多层 segment 拉平到同一层），
- * 再以 +N 反复合并，直到 total_changes() 增量 < 2（表示本轮无可合并内容）。
- *
- * @param {number} [pages=4096]     每轮合并的页数预算（FTS5 pgsz 默认 4050 字节/页）
- * @param {number} [maxRounds=512]  轮数上限，兜底防死循环
- * @returns {number} 实际执行的 +N 合并轮数
+ * 合并 FTS5 segment（等价于 'optimize'）。
+ * 注：'optimize' 会一次性把所有 b-tree 合并成单个 segment，内存峰值与索引规模成正比；
+ * 若索引规模可控（数百 MB 以内）这种一次性写法足够清晰，超大索引需改回分步合并。
+ * @param {number} [level=4] 合并等级，4 为 FTS5 推荐的默认值
  */
-function mergeFts(db, { pages = 4096, maxRounds = 512 } = {}) {
-  // db.get() 在 Bun 下返回行数组，故用 db.all(...)[0]
-  const changes = () => Number(db.all(sql`SELECT total_changes() AS c`)[0]?.c ?? 0);
-  const merge = (n) =>
-    db.run(sql`INSERT INTO ${sql.raw(FTS_TABLE)} (${sql.raw(FTS_TABLE)}, rank)
-      VALUES ('merge', ${n})`);
-  merge(-pages);
-  for (let i = 0; i < maxRounds; i += 1) {
-    const before = changes();
-    merge(pages);
-    if (changes() - before < 2) return i + 1;
-  }
-  return maxRounds;
+function optimizeFts(db, level = 4) {
+  db.run(sql`INSERT INTO ${sql.raw(FTS_TABLE)} (${sql.raw(FTS_TABLE)}, rank)
+    VALUES ('optimize', ${level})`);
 }
 
 /**
@@ -447,7 +401,7 @@ function fullRebuild(db, src, onFlush) {
 
   setMeta(db, 'tokenizer', TOKENIZER);
   setMeta(db, 'last_rowid', String(maxSourceId(src)));
-  mergeFts(db);
+  optimizeFts(db);
 }
 
 /**
@@ -469,7 +423,7 @@ function syncIndex(db, src, onFlush) {
     // keyset 分段 + 流式迭代，避免 .all() 把数百万行一次性物化进堆
     populate(db, scanById(src, { from: last, size: REBUILD_BATCH }), onFlush);
     setMeta(db, 'last_rowid', String(max));
-    mergeFts(db);
+    optimizeFts(db);
   }
 }
 
@@ -567,7 +521,6 @@ export function createMagnetDb(options = {}) {
   const dbRO = createDrizzle(rdb);
 
   // reindex worker 的堆上限与超时；超时传 0 表示不限时
-  const REINDEX_MAX_OLD_SPACE_MB = clampInt(CONFIG.reindexMaxOldSpaceMb, 2048, 256, 65536);
   const REINDEX_TIMEOUT_MS = clampInt(CONFIG.reindexTimeoutMs, 0, 0, Number.MAX_SAFE_INTEGER);
 
   let reindexWorker = null;
@@ -579,7 +532,7 @@ export function createMagnetDb(options = {}) {
       const worker = new Worker(REINDEX_WORKER_URL, {
         workerData: { sourcePath, indexPath },
         // 堆触顶时 worker 会以 ERR_WORKER_OUT_OF_MEMORY 退出，只杀 worker，主进程不受影响
-        resourceLimits: { maxOldGenerationSizeMb: REINDEX_MAX_OLD_SPACE_MB },
+        resourceLimits: { maxOldGenerationSizeMb: clampInt(CONFIG.reindexMaxOldSpaceMb, 2048, 256, 65536) },
         stdout: true,
         stderr: true,
       });
@@ -619,8 +572,7 @@ export function createMagnetDb(options = {}) {
 
   /** 已索引条数（与检索结果一致） */
   function countMagnets() {
-    const row = dbRO.select({ total: count() }).from(magnetsDocs).get();
-    return Number(row?.total ?? 0);
+    return Number(dbRO.select({ total: count() }).from(magnetsDocs).get()?.total ?? 0);
   }
 
   /**
@@ -629,7 +581,6 @@ export function createMagnetDb(options = {}) {
    * @returns {Array<{term: string, doc_count: number, occurrences: number}>}
    */
   function topKeywords(limit = 50) {
-    const lim = clampInt(limit, 50, 1, 1000);
     return dbRO.all(sql`
       SELECT term, doc_count, occurrences
       FROM ${sql.raw(KEYWORD_TABLE)} k
@@ -637,7 +588,7 @@ export function createMagnetDb(options = {}) {
         SELECT 1 FROM ${sql.raw(KEYWORD_FILTER_TABLE)} f WHERE f.term = k.term
       )
       ORDER BY doc_count DESC, occurrences DESC
-      LIMIT ${lim}
+      LIMIT ${clampInt(limit, 50, 1, 1000)}
     `);
   }
 
@@ -678,8 +629,21 @@ export function createMagnetDb(options = {}) {
    * @param {number} [options.offset=0]               偏移量，钳制至 >= 0
    * @returns {{ total: number, limit: number, offset: number, items: Array<Object> }}
    */
+  /**
+   * 把 minSize / maxSize（字节）构造为 SQL 过滤片段（数值已校验为有限非负）。
+   * 返回 null 表示不加大小过滤。
+   */
+  function sizeFilterSql(minSize, maxSize) {
+    const parts = [];
+    const mn = Number(minSize);
+    const mx = Number(maxSize);
+    if (Number.isFinite(mn) && mn >= 0) parts.push(sql`m.totalSize >= ${mn}`);
+    if (Number.isFinite(mx) && mx >= 0) parts.push(sql`m.totalSize <= ${mx}`);
+    return parts.length ? sql.join(parts, ' AND ') : null;
+  }
+
   /** 按 infohash 精确检索（大小写不敏感，支持前缀匹配） */
-  function searchByHash({ query, sortBy, order = 'desc', limit, offset }) {
+  function searchByHash({ query, sortBy, order = 'desc', limit, offset, minSize, maxSize }) {
     // 归一化：剥离 magnet 链接里的 urn:btih: 前缀，并去除所有非字母数字字符
     const raw = String(query)
       .replace(/^.*urn:btih:/i, '')
@@ -689,31 +653,36 @@ export function createMagnetDb(options = {}) {
       throw new TypeError('searchByHash: 未提供有效的 infohash');
     }
     const { orderSql, limit: lim, offset: off } = normalizeQueryOptions({ sortBy, order, limit, offset });
+    const sf = sizeFilterSql(minSize, maxSize);
+    const sizeCond = sf ? sql` AND ${sf}` : sql``;
 
     // 归一化匹配：兼容「带/不带 hash 前缀」两种 infohash 存储，并支持前缀检索
     const cond = sql`lower(m.infohash) = lower(${raw})
       OR lower(m.infohash) = lower(${'hash' + raw})
       OR lower(m.infohash) LIKE lower(${raw + '%'})`;
-    const totalRow = dbRO.all(sql`
-      SELECT count(*) AS total FROM ${sql.raw(DOCS_TABLE)} m WHERE ${cond}
-    `)[0];
-    const total = Number(totalRow?.total ?? 0);
+    const total = Number(dbRO.all(sql`
+      SELECT count(*) AS total FROM ${sql.raw(DOCS_TABLE)} m WHERE ${cond}${sizeCond}
+    `)[0]?.total ?? 0);
 
-    const rows = dbRO.all(sql`
-      SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m
-      WHERE ${cond}
-      ${sql.raw(orderSql)}
-      LIMIT ${lim} OFFSET ${off}
-    `);
-    return { total, limit: lim, offset: off, items: rows.map(mapRow) };
+    return {
+      total,
+      limit: lim,
+      offset: off,
+      items: dbRO.all(sql`
+        SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m
+        WHERE ${cond}${sizeCond}
+        ${sql.raw(orderSql)}
+        LIMIT ${lim} OFFSET ${off}
+      `).map(mapRow),
+    };
   }
 
   function searchMagnets(options = {}) {
-    const { query, sortBy, order = 'desc', by } = options;
+    const { query, sortBy, order = 'desc', by, minSize, maxSize } = options;
 
     // infohash 未进入 FTS 索引，按 hash 检索时单独走副本表
     if (by === 'hash') {
-      return searchByHash({ query, sortBy, order, limit: options.limit, offset: options.offset });
+      return searchByHash({ query, sortBy, order, limit: options.limit, offset: options.offset, minSize, maxSize });
     }
 
     const match = buildMatchExpression(query);
@@ -728,23 +697,28 @@ export function createMagnetDb(options = {}) {
       offset: options.offset,
     });
 
+    const sf = sizeFilterSql(minSize, maxSize);
+    const sizeCond = sf ? sql` AND ${sf}` : sql``;
+
     // total 走 JOIN：源中已删除的残留索引行会被自动剔除，保证 total 与返回数一致
-    const totalRow = dbRO.all(sql`
+    const total = Number(dbRO.all(sql`
       SELECT count(*) AS total FROM ${sql.raw(FTS_TABLE)} f
       JOIN ${sql.raw(DOCS_TABLE)} m ON m.id = f.rowid
-      WHERE ${sql.raw(FTS_TABLE)} MATCH ${match}
-    `)[0];
-    const total = Number(totalRow?.total ?? 0);
+      WHERE ${sql.raw(FTS_TABLE)} MATCH ${match}${sizeCond}
+    `)[0]?.total ?? 0);
 
-    const rows = dbRO.all(sql`
-      SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(FTS_TABLE)} f
-      JOIN ${sql.raw(DOCS_TABLE)} m ON m.id = f.rowid
-      WHERE ${sql.raw(FTS_TABLE)} MATCH ${match}
-      ${sql.raw(orderSql)}
-      LIMIT ${limit} OFFSET ${offset}
-    `);
-
-    return { total, limit, offset, items: rows.map(mapRow) };
+    return {
+      total,
+      limit,
+      offset,
+      items: dbRO.all(sql`
+        SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(FTS_TABLE)} f
+        JOIN ${sql.raw(DOCS_TABLE)} m ON m.id = f.rowid
+        WHERE ${sql.raw(FTS_TABLE)} MATCH ${match}${sizeCond}
+        ${sql.raw(orderSql)}
+        LIMIT ${limit} OFFSET ${offset}
+      `).map(mapRow),
+    };
   }
 
   /**
@@ -756,17 +730,15 @@ export function createMagnetDb(options = {}) {
   function rebuildSync(onProgress) {
     const s = openSourceRO(sourcePath);
     try {
-      const total = Number(getRow(s, `SELECT count(*) AS c FROM ${TABLE}`)?.c ?? 0);
       let done = 0;
       fullRebuild(db, s, ({ rows }) => {
         done += rows;
-        onProgress?.({ done, total });
+        onProgress?.({ done, total: Number(getRow(s, `SELECT count(*) AS c FROM ${TABLE}`)?.c ?? 0) });
       });
     } finally {
       s.close();
     }
-    const row = dbRO.all(sql`SELECT count(*) AS c FROM ${sql.raw(FTS_TABLE)}`)[0];
-    return Number(row?.c ?? 0);
+    return Number(dbRO.all(sql`SELECT count(*) AS c FROM ${sql.raw(FTS_TABLE)}`)[0]?.c ?? 0);
   }
 
   /**
@@ -795,14 +767,37 @@ export function createMagnetDb(options = {}) {
     return reindexPromise;
   }
 
+  /**
+   * 运行期增量补录：按 last_rowid 把源库新增行灌入索引（由 index.js 定时调用，默认每小时一次）。
+   * 与 reindex() 互斥（reindexPromise 非空）：重建期间跳过本轮，下一周期再试。
+   * 不触发全量重建——tokenizer 变更等结构性变更交由重启或手动 reindex 处理。
+   * @param {(p: { done: number, total: number }) => void} [onProgress]
+   */
+  function syncIncremental(onProgress) {
+    // 重建进行中（reindexPromise 非空）则跳过本轮，与 reindex 互斥
+    if (reindexPromise) return;
+    const src = openSourceRO(sourcePath);
+    try {
+      const last = Number(getMeta(db, 'last_rowid') ?? '0');
+      const max = maxSourceId(src);
+      if (max > last) {
+        populate(db, scanById(src, { from: last, size: REBUILD_BATCH }), onProgress);
+        setMeta(db, 'last_rowid', String(max));
+        optimizeFts(db);
+      }
+    } finally {
+      src.close();
+    }
+  }
+
   /** 关闭连接 */
   function close() {
     if (reindexWorker) {
       reindexWorker.terminate();
       reindexWorker = null;
     }
-    if (isOpen(rdb)) closeDb(rdb);
-    if (isOpen(wdb)) closeDb(wdb);
+    closeDb(rdb);
+    closeDb(wdb);
   }
 
   return {
@@ -814,6 +809,7 @@ export function createMagnetDb(options = {}) {
     addKeywordFilter,
     removeKeywordFilter,
     reindex,
+    syncIncremental,
     rebuildSync,
     close,
   };

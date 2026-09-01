@@ -6,5 +6,6 @@
   "reindexMaxOldSpaceMb": 2048,
   "reindexTimeoutMs": 0,
   "searchCacheMaxSizeMb": 256,
-  "searchCacheTtlMs": 3600000
+  "searchCacheTtlMs": 3600000,
+  "syncIntervalMs": 3600000
 }

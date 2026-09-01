@@ -31,7 +31,7 @@ import {
   transaction,
   closeDb,
   isOpen,
-} from './db-driver.js';
+} from '../src/db-driver.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TMP = path.join(HERE, 'data', 'verify-driver.tmp.db');
@@ -57,6 +57,9 @@ const check = (label, fn) => {
 };
 
 console.log(`\n[环境] ${isBun ? 'Bun (bun:sqlite)' : 'Node (better-sqlite3)'}\n`);
+
+// 确保测试库所在目录存在（better-sqlite3 不会自动创建父目录）
+fs.mkdirSync(path.dirname(TMP), { recursive: true });
 
 const wdb = openDatabase(TMP);
 
@@ -200,7 +203,7 @@ check('$client 路径 getRow 可取 count', () => {
 
 // 查询构造器（db.select / db.insert）是否可用（db.js 用于 sync_meta / count）
 execRaw(raw, 'CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT)');
-const { syncMeta } = await import('./schema.js');
+const { syncMeta } = await import('../src/schema.js');
 check('drizzle db.insert().values().run()', () => {
   db.insert(syncMeta).values({ key: 'k', value: '1' }).run();
 });

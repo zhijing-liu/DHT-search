@@ -10,8 +10,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { sql } from 'drizzle-orm';
-import { createMagnetDb, MAX_LIMIT } from './db.js';
-import { openDatabase, setPragma, execRaw, closeDb } from './db-driver.js';
+import { createMagnetDb } from '../src/db.js';
+import { MAX_LIMIT } from '../src/store.js';
+import { openDatabase, setPragma, execRaw, closeDb } from '../src/db-driver.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SMOKE_DB = path.join(HERE, 'data', 'smoke.db');

@@ -5,9 +5,10 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "smoke": "node smoke.mjs",
-    "test": "node smoke.mjs",
-    "seed:filter": "node script/seed-filter.mjs"
+    "smoke": "node test/smoke.mjs",
+    "test": "node test/smoke.mjs",
+    "seed:filter": "node src/seed-filter.mjs",
+    "verify:driver": "node test/verify-driver.mjs"
   },
   "keywords": [],
   "author": "",

@@ -1,9 +1,9 @@
 /* 组件样式以原生 CSS Module 形式引入（浏览器需支持 import attributes / CSS modules），
    通过 shadowRoot.adoptedStyleSheets 注入，避免把 CSS 写进 JS 文本 */
-import magnetCardCss from './magnet-card.css' with { type: 'css' };
-import magnetFilesCss from './magnet-files.css' with { type: 'css' };
-import resultListCss from './result-list.css' with { type: 'css' };
-import sortGroupCss from './dht-sort-group.css' with { type: 'css' };
+import magnetCardCss from '../css/magnet-card.css' with { type: 'css' };
+import magnetFilesCss from '../css/magnet-files.css' with { type: 'css' };
+import resultListCss from '../css/result-list.css' with { type: 'css' };
+import sortGroupCss from '../css/dht-sort-group.css' with { type: 'css' };
 
 import { formatBytes, formatDate, normalizeFiles, copyText, toThunder, highlightInto } from './util.js';
 import { buildFileTree, computeTreeSizes, renderTreeNode, fileMatchScore, PREVIEW_LIMIT } from './file-tree.js';

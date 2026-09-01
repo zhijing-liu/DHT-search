@@ -19,7 +19,8 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { createMagnetDb, CONFIG } from './db.js';
+import { createMagnetDb } from './src/db.js';
+import { CONFIG, SORT_COLUMNS } from './src/store.js';
 import { LRUCache } from 'lru-cache';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -28,8 +29,6 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 /** 整集拉取的安全上限：单次请求最多返回这么多条，超出则 truncated=true；可由 config.json 的 maxResults 覆盖 */
 const maxResults = Number(CONFIG.maxResults);
 const MAX_RESULTS = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 20000;
-
-const SORT_WHITELIST = new Set(['fetchedAt', 'totalSize', 'relevance']);
 
 const PORT = Number(CONFIG.port) || Number(process.env.PORT) || 3000;
 
@@ -92,17 +91,11 @@ function isWholeSet(limitParam) {
 /** 统一包装 API 处理器：同步或异步执行，异常时按指定状态码返回 { error } */
 function apiHandler(fn, status = 500, fallback = 'internal error') {
   return (req, res) => {
-    try {
-      const r = fn(req, res);
-      // 异步处理器：try/catch 抓不到 Promise 的拒绝，这里自己兜住
-      if (r && typeof r.then === 'function') {
-        r.catch((err) => {
-          if (!res.headersSent) res.status(status).json({ error: err?.message || fallback });
-        });
-      }
-    } catch (err) {
-      res.status(status).json({ error: err.message || fallback });
-    }
+    Promise.resolve()
+      .then(() => fn(req, res))
+      .catch((err) => {
+        if (!res.headersSent) res.status(status).json({ error: err?.message || fallback });
+      });
   };
 }
 
@@ -112,10 +105,10 @@ app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
 
 /** 构造搜索缓存键：覆盖所有影响结果的参数，保证命中结果一致 */
-function searchCacheKey(q, by, sortBy, order, limitParam, offsetParam) {
+function searchCacheKey(q, by, sortBy, order, limitParam, offsetParam, minSize, maxSize) {
   const whole = isWholeSet(limitParam);
   const page = whole ? 'all' : `${limitParam ?? ''}:${offsetParam ?? ''}`;
-  return [q, by ?? '', sortBy ?? '', order, page].join('|');
+  return [q, by ?? '', sortBy ?? '', order, page, minSize ?? '', maxSize ?? ''].join('|');
 }
 
 app.get('/api/search', apiHandler((req, res) => {
@@ -124,12 +117,16 @@ app.get('/api/search', apiHandler((req, res) => {
     return res.status(400).json({ error: 'query 不能为空' });
   }
 
-  const sortBy = SORT_WHITELIST.has(req.query.sortBy) ? req.query.sortBy : undefined;
+  const sortBy = SORT_COLUMNS.includes(req.query.sortBy) ? req.query.sortBy : undefined;
   const order = req.query.order === 'asc' ? 'asc' : 'desc';
   // 仅当显式传 by=hash 时走 infohash 精确检索，其余走 FTS5 模糊检索
   const by = req.query.by === 'hash' ? 'hash' : undefined;
+  // 大小范围筛选（字节）；非有限值视为不限制
+  const minSize = Number(req.query.minSize);
+  const maxSize = Number(req.query.maxSize);
 
-  const key = searchCacheKey(q, by, sortBy, order, req.query.limit, req.query.offset);
+  const key = searchCacheKey(q, by, sortBy, order, req.query.limit, req.query.offset,
+    Number.isFinite(minSize) ? minSize : '', Number.isFinite(maxSize) ? maxSize : '');
   const cached = searchCache.get(key);
   if (cached) {
     console.log(`[cache] HIT  q="${q}" 模式=${by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${sortBy ?? 'id'}/${order}`);
@@ -140,7 +137,7 @@ app.get('/api/search', apiHandler((req, res) => {
   let result;
   if (isWholeSet(req.query.limit)) {
     // 整集拉取：一次查询取回全部匹配
-    const raw = api.searchMagnets({ query: q, sortBy, order, limit: -1, by });
+    const raw = api.searchMagnets({ query: q, sortBy, order, limit: -1, by, minSize, maxSize });
     let items = raw.items;
     const truncated = items.length > MAX_RESULTS;
     if (truncated) items = items.slice(0, MAX_RESULTS);
@@ -154,6 +151,8 @@ app.get('/api/search', apiHandler((req, res) => {
       sortBy,
       order,
       by,
+      minSize,
+      maxSize,
       limit: Number.isFinite(limitParam) ? limitParam : undefined,
       offset: Number.isFinite(offsetParam) ? offsetParam : undefined,
     });
@@ -225,6 +224,19 @@ const server = app.listen(PORT, () => {
   console.log('[SYSTEM] ==========================================');
 });
 
+// 运行期自动增量同步：默认每小时按 last_rowid 补录一次源库新增行
+// （config.json 的 syncIntervalMs 配 0 可关闭）；重建期间 syncIncremental 自动跳过本轮
+const SYNC_INTERVAL_MS = (() => {
+  const v = Number(CONFIG.syncIntervalMs);
+  return Number.isFinite(v) && v > 0 ? v : 3600000;
+})();
+const syncTimer = setInterval(() => {
+  api.syncIncremental().catch((err) => {
+    console.error(`[SYSTEM][sync] 增量同步失败: ${err?.message || err}`);
+  });
+}, SYNC_INTERVAL_MS);
+if (typeof syncTimer.unref === 'function') syncTimer.unref();
+
 // 重建索引（reindex）可能耗时较长且同步执行，关闭服务端超时避免请求被中断
 server.timeout = 0;
 if ('requestTimeout' in server) server.requestTimeout = 0;
@@ -239,6 +251,7 @@ server.on('error', (err) => {
 process.on('SIGINT', () => {
   console.log('\n[SYSTEM] 收到 SIGINT，正在关闭服务并释放数据库...');
   clearInterval(searchCacheSweep);
+  clearInterval(syncTimer);
   searchCache.clear();
   api.close();
   console.log('[SYSTEM] 服务已关闭');
