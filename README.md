@@ -51,8 +51,8 @@ DHT Search 把一个由外部程序（如 DHT 爬虫）持续写入的「源库�
 DHT-search/
 ├── index.js                  # Express 入口：HTTP API + 静态资源 + 缓存/定时同步
 ├── config.json               # 运行期配置（缺失/非法不阻塞启动，回退默认）
-├── ecosystem.config.node.cjs # pm2 配置：Node 运行时
-├── ecosystem.config.bun.cjs  # pm2 配置：Bun 运行时
+├── ecosystem.config.node.json # pm2 配置：Node 运行时
+├── ecosystem.config.bun.json  # pm2 配置：Bun 运行时
 ├── package.json
 ├── src/
 │   ├── db.js                 # 数据访问核心：索引维护、搜索、热词、重建（对外主入口）
@@ -147,18 +147,20 @@ bun index.js         # Bun
 项目提供两份独立 pm2 配置，可分别调用（避免写在一起）：
 
 ```bash
-# Node 实例（端口 3000）
-pm2 start ecosystem.config.node.cjs
+# Node 实例
+pm2 start ecosystem.config.node.json
 # 或
 npm run start:pm2:node
 
-# Bun 实例（端口 3001，需 bun 在 PATH 中）
-pm2 start ecosystem.config.bun.cjs
+# Bun 实例（需 bun 在 PATH 中）
+pm2 start ecosystem.config.bun.json
 # 或
 npm run start:pm2:bun
 ```
 
-两个实例端口不同，可同机并存做回归对比；只跑一个时端口可随意（或用 `config.json` 的 `port` / 环境变量 `PORT` 覆盖）。
+两份配置都不在 pm2 中硬编码端口，统一读取 `config.json` 的 `port`（默认 3000）。
+若想同机并存做回归对比，需让两个实例监听不同端口——可在启动前用环境变量区分，例如：
+`PORT=3001 pm2 start ecosystem.config.bun.json`，或各自指向不同的 `config.json`。
 
 常用 pm2 命令：
 ```bash

@@ -1,0 +1,10 @@
+{
+  "apps": [
+    {
+      "name": "dht-search-node",
+      "script": "app-entry.cjs",
+      "cwd": ".",
+      "interpreter": "node"
+    }
+  ]
+}

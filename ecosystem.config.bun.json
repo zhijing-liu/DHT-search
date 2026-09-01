@@ -1,0 +1,10 @@
+{
+  "apps": [
+    {
+      "name": "dht-search-bun",
+      "script": "app-entry.cjs",
+      "cwd": ".",
+      "interpreter": "bun"
+    }
+  ]
+}
