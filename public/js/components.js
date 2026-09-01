@@ -5,7 +5,7 @@ import magnetFilesCss from '../css/magnet-files.css' with { type: 'css' };
 import resultListCss from '../css/result-list.css' with { type: 'css' };
 import sortGroupCss from '../css/dht-sort-group.css' with { type: 'css' };
 
-import { formatBytes, formatDate, normalizeFiles, copyText, toThunder, highlightInto } from './util.js';
+import { formatBytes, formatDate, normalizeFiles, copyText, toThunder, highlightInto, pushToAria2 } from './util.js';
 import { buildFileTree, computeTreeSizes, renderTreeNode, fileMatchScore, PREVIEW_LIMIT } from './file-tree.js';
 
 const SVG = 'viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
@@ -102,6 +102,7 @@ class MagnetCard extends HTMLElement {
           <a class="magnet-text" href=""></a>
           <button class="copy" type="button" aria-label="复制磁力链接" title="复制磁力链接"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
           <a class="thunder" aria-label="迅雷下载" title="迅雷下载" href=""><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg></a>
+          <button class="rpc" type="button" aria-label="RPC 推送" title="推送到下载器（aria2 / Motrix）"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
         </div>
         <div class="files-row">
           <magnet-files></magnet-files>
@@ -111,6 +112,9 @@ class MagnetCard extends HTMLElement {
         <dialog></dialog>`;
       root.querySelector('.copy').addEventListener('click', (e) => {
         copyText(this._item?.magnet || '', e.currentTarget);
+      });
+      root.querySelector('.rpc').addEventListener('click', () => {
+        pushToAria2(this._item?.magnet || '');
       });
       root.querySelector('.detail').addEventListener('click', () => this._openDetail());
     }

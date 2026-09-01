@@ -74,7 +74,6 @@
 
   .search-area {
     flex: none;
-    width: 100%;
     display: flex;
     gap: 10px;
     flex-wrap: wrap;
@@ -112,7 +111,8 @@
 
   .search-input-wrap {
     position: relative;
-    flex: 1 1 320px;
+    flex: 0 0 auto;
+    width: 40vw;
     min-width: 0;
 
     & input {
@@ -183,6 +183,19 @@
     }
   }
 
+  /* 统一所有下拉选项面板的配色，覆盖浏览器默认蓝底白字 */
+  select option {
+    background: var(--card);
+    color: var(--text);
+    padding: 8px 12px;
+    font-size: 14px;
+  }
+  select option:checked,
+  select option:hover {
+    background: var(--accent);
+    color: #fff;
+  }
+
   .sr-only {
     position: absolute;
     width: 1px;
@@ -216,16 +229,6 @@
 }
 
 @layer components {
-  .status {
-    margin: 18px 0 10px;
-    color: var(--muted);
-    font-size: 13px;
-    display: flex;
-    align-items: center;
-    min-height: 16px;
-
-    &:empty { display: none; }
-  }
   @keyframes spin { to { transform: rotate(360deg); } }
 
   .suggestions {
@@ -541,7 +544,8 @@
 
     & input, & select {
       width: 64px;
-      padding: 6px 8px;
+      height: 36px;
+      padding: 0 8px;
       border-radius: 8px;
       border: 1px solid var(--border);
       background: var(--card);
@@ -549,6 +553,7 @@
       font-size: 14px;
       text-align: center;
       outline: none;
+      box-sizing: border-box;
 
       &:focus {
         border-color: var(--accent);
@@ -590,6 +595,18 @@
       color: #fff;
     }
     &:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* 上一页/下一页图标按钮：固定为正方形，图标绝对居中 */
+    &.page-nav {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    &.page-nav svg { display: block; }
   }
   .dots { color: var(--muted); padding: 8px 6px; }
 
@@ -637,6 +654,7 @@
 
       & .search-input-wrap {
         flex: 1 1 auto;
+        width: 100%;
         & input { font-size: 15px; padding: 11px 38px 11px 12px; }
       }
       /* 排序组、大小筛选、重建按钮横排对齐到右侧 */
@@ -671,7 +689,7 @@
   color: var(--text);
   background: var(--bg-2, var(--card));
   &::backdrop { background: rgba(0, 0, 0, 0.6); }
-  &[open] { display: block; }
+  &[open] { display: flex; flex-direction: column; }
 
   .settings-head {
     display: flex;
@@ -697,23 +715,44 @@
     &:hover { background: rgba(255, 255, 255, 0.08); }
   }
 
-  .settings-body { padding: 8px 18px 18px; }
+  .settings-body { padding: 14px 18px; }
 
-  .settings-item {
-    display: flex;
-    align-items: center;
-    gap: 12px;
+  .settings-section {
     padding: 14px 0;
     border-bottom: 1px solid var(--border);
-    &:last-child { border-bottom: none; }
+    &:first-child { padding-top: 0; }
+    &:last-child { border-bottom: none; padding-bottom: 0; }
   }
-  .settings-item-text { flex: 1; min-width: 0; }
+  .settings-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    & + .settings-item { margin-top: 14px; }
+  }
   .settings-item-title { font-size: 14px; font-weight: 500; }
-  .settings-item-desc { margin-top: 2px; color: var(--muted); font-size: 12px; }
+  .settings-item-desc { color: var(--muted); font-size: 12px; line-height: 1.45; }
 
+  .rpc-config { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+  .rpc-field {
+    display: flex; flex-direction: column; gap: 6px;
+    font-size: 12px; color: var(--muted);
+    & span { font-size: 12px; color: var(--muted); }
+    & input {
+      width: 100%; box-sizing: border-box;
+      background: var(--bg); border: 1px solid var(--border); color: var(--text);
+      border-radius: 8px; padding: 8px 10px; font-size: 13px;
+      &:focus { outline: none; border-color: var(--accent); }
+    }
+  }
+
+  .settings-actions {
+    display: flex; gap: 10px;
+    padding: 14px 18px 18px;
+    border-top: 1px solid var(--border);
+  }
   .settings-action {
-    flex: none;
-    padding: 8px 16px;
+    flex: 1;
+    padding: 9px 16px;
     border-radius: 8px;
     border: 1px solid var(--border);
     background: linear-gradient(135deg, var(--primary), var(--accent));
@@ -724,6 +763,76 @@
     transition: filter 0.15s ease;
     &:hover { filter: brightness(1.1); }
     &:disabled { opacity: 0.6; cursor: default; filter: none; }
+  }
+  .settings-action--danger {
+    background: linear-gradient(135deg, #ef4444, #dc2626);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 结果列表右侧悬浮刷新按钮                                             */
+/* ------------------------------------------------------------------ */
+
+.result-refresh {
+  position: fixed;
+  right: 18px;
+  bottom: 10vh;
+  z-index: 50;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-2, var(--card));
+  color: var(--text);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  transition: transform 0.15s ease, filter 0.15s ease;
+  &:hover { filter: brightness(1.1); transform: rotate(40deg); }
+  &:active { transform: rotate(180deg); }
+}
+
+/* ------------------------------------------------------------------ */
+/* 二次确认弹窗（DOM 原生 dialog，替代浏览器 confirm）                  */
+/* ------------------------------------------------------------------ */
+
+.confirm-dialog {
+  width: min(340px, 92vw);
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  color: var(--text);
+  background: var(--bg-2, var(--card));
+  &::backdrop { background: rgba(0, 0, 0, 0.6); }
+  &[open] { display: block; }
+
+  .confirm-msg { margin: 0 0 18px; font-size: 14px; line-height: 1.55; }
+
+  .confirm-actions { display: flex; justify-content: flex-end; gap: 10px; }
+  .confirm-btn {
+    padding: 8px 18px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: filter 0.15s ease, background 0.15s ease;
+  }
+  .confirm-cancel {
+    background: transparent;
+    color: var(--text);
+    &:hover { background: rgba(255, 255, 255, 0.08); }
+  }
+  .confirm-ok {
+    border-color: transparent;
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    color: #fff;
+    &:hover { filter: brightness(1.1); }
+    &.danger { background: linear-gradient(135deg, #ef4444, #dc2626); }
   }
 }
 

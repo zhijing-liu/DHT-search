@@ -65,11 +65,13 @@ import {
 
 /**
  * 排序 SQL 白名单。ORDER BY 的列名与方向无法参数化，故写死为常量按需取用，
- * 杜绝注入。未传 sortBy 时走 '' 键（按 id 排序）；带次排序键 id 保证分页稳定。
- * relevance 用 bm25(fts) —— 值越小越相关，故 relevance:desc 取 ASC。
+ * 杜绝注入。未传 sortBy 时回退为 id 列排序，且方向跟随 order（默认 desc=倒序）；
+ * 带次排序键 id 保证分页稳定。relevance 用 bm25(fts) —— 值越小越相关，
+ * 故 relevance:desc 取 ASC。
  */
 const ORDER_SQL = Object.freeze({
-  '': `ORDER BY m.id ASC`,
+  'id:asc': `ORDER BY m.id ASC`,
+  'id:desc': `ORDER BY m.id DESC`,
   'fetchedAt:asc': 'ORDER BY m.fetchedAt ASC, m.id ASC',
   'fetchedAt:desc': 'ORDER BY m.fetchedAt DESC, m.id DESC',
   'totalSize:asc': 'ORDER BY m.totalSize ASC, m.id ASC',
@@ -134,7 +136,9 @@ function clampInt(value, fallback, min, max) {
  */
 function normalizeQueryOptions({ sortBy, order, limit, offset }) {
   const direction = String(order).toLowerCase() === 'asc' ? 'asc' : 'desc';
-  const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : '';
+  // 未传 sortBy 时回退到 id 列，但方向仍跟随 order（默认 desc=倒序），
+  // 这样默认视图下点「正序/倒序」也能立即改变结果，而不会忽略方向
+  const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : `id:${direction}`;
   return {
     orderSql: ORDER_SQL[sortKey],
     limit:

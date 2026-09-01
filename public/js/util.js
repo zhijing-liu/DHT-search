@@ -56,6 +56,58 @@ export function toThunder(magnet) {
   return 'thunder://' + b64;
 }
 
+/* ------------------------------------------------------------------ */
+/* RPC 推送（aria2 / Motrix JSON-RPC 2.0）                              */
+/* ------------------------------------------------------------------ */
+
+const RPC_URL_KEY = 'dht_rpc_url';
+const RPC_SECRET_KEY = 'dht_rpc_secret';
+const DEFAULT_RPC_URL = 'http://localhost:16800/jsonrpc';
+
+/** 读取 RPC 推送配置（地址默认 localhost:16800，密钥默认空） */
+export function getRpcConfig() {
+  const url = (localStorage.getItem(RPC_URL_KEY) || DEFAULT_RPC_URL).trim();
+  const secret = (localStorage.getItem(RPC_SECRET_KEY) || '').trim();
+  return { url, secret };
+}
+
+/** 保存 RPC 推送配置到 localStorage（空值则清除对应键，回退默认） */
+export function saveRpcConfig({ url, secret } = {}) {
+  if (url && url.trim()) localStorage.setItem(RPC_URL_KEY, url.trim());
+  else localStorage.removeItem(RPC_URL_KEY);
+  if (secret) localStorage.setItem(RPC_SECRET_KEY, secret);
+  else localStorage.removeItem(RPC_SECRET_KEY);
+}
+
+/**
+ * 把磁力链接推送到 aria2 / Motrix 下载器（JSON-RPC 2.0 的 aria2.addUri）。
+ * 设了密钥时按 aria2 约定在 params 头部加 `token:<secret>`；结果用 toast 反馈。
+ */
+export async function pushToAria2(magnet) {
+  if (!magnet) { showToast('没有可推送的磁力链接'); return; }
+  const { url, secret } = getRpcConfig();
+  const params = [[magnet]];
+  if (secret) params.unshift(`token:${secret}`);
+  const payload = {
+    jsonrpc: '2.0',
+    id: Date.now(),
+    method: 'aria2.addUri',
+    params,
+  };
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (data.error) showToast(`推送失败：${data.error.message}`);
+    else showToast(`已推送到下载器，GID: ${data.result}`);
+  } catch (err) {
+    showToast(`推送出错：${err.message}`);
+  }
+}
+
 /** 页面顶部居中的轻量通知（toast），全局单例容器挂在 document 顶层 */
 let _toastHost = null;
 export function showToast(msg) {

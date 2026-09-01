@@ -196,9 +196,9 @@ console.log('\n[3] files 解析失败时保留原始字符串');
 console.log('\n[4] 排序');
 {
   const api = openApi();
-  check('不传 sortBy 时按 id 升序', () => {
+  check('不传 sortBy 时默认按 id 倒序（方向跟随 order，默认 desc）', () => {
     const r = api.searchMagnets({ query: 'brunette' });
-    assert.deepEqual(r.items.map((i) => i.id), [1, 4]);
+    assert.deepEqual(r.items.map((i) => i.id), [4, 1]);
   });
   check('sortBy=fetchedAt desc（最新在前）', () => {
     const r = api.searchMagnets({ query: 'brunette', sortBy: 'fetchedAt', order: 'desc' });

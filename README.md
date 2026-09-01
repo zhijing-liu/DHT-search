@@ -97,6 +97,7 @@ DHT-search/
 - **搜索缓存**：进程内 LRU 缓存，按序列化字节数限内存、按 TTL 过期（默认 256MB / 1h）。
 - **在线重建**：`reindex()` 全量重建在 worker 线程（Node）或同进程（Bun）执行，重建期间检索仍可用；运行期按 `syncIntervalMs` 自动增量补录。
 - **零前端构建**：纯原生 ES Module + 自定义元素 + Shadow DOM，直接用浏览器加载。
+- **RPC 推送**：结果卡片「推送」按钮可将磁力链接经 JSON-RPC 2.0（`aria2.addUri`）推送到 aria2 / Motrix 下载器；地址与密钥在「设置」中配置，密钥按 aria2 约定以 `token:` 前缀发送。
 
 ## 五、配置项（`config.json`）
 
@@ -257,3 +258,21 @@ npm run smoke            # 同 test（别名）
 - **手动重建**：Web 端「设置 → 重建索引」，或 `POST /api/reindex`。重建期间检索不受影响（Node 走 worker 线程）。
 - **增量同步**：默认每小时按 `last_rowid` 补录源库新增行（`syncIntervalMs` 配 `0` 可关闭）。
 - **性能调优**：重建/查询期的 SQLite PRAGMA（WAL、cache_size、mmap_size、temp_store 等）已在 `db.js` 中按场景预设，一般无需改动；超大索引如需降低 `optimize` 内存峰值，可在 `optimizeFts()` 处改回分步合并。
+
+## 十二、RPC 推送（aria2 / Motrix）
+
+结果卡片在「迅雷下载」按钮右侧提供一个 **推送** 图标按钮，点击即把当前磁力链接经 JSON-RPC 2.0 的 `aria2.addUri` 推送到本地下载器。地址与密钥在 **设置** 弹窗中配置：
+
+- **地址**：默认 `http://localhost:16800/jsonrpc`
+- **密钥**：可选；填写后按 aria2 约定在请求 `params` 头部加 `token:<密钥>`（留空表示无密钥）
+
+配置存于浏览器 `localStorage`，刷新后保留。推送结果以页面 toast 提示（成功显示任务 GID，失败显示错误信息）。
+
+### 前置条件：下载器需开启 JSON-RPC 并允许跨域
+浏览器从搜索站点（如 `localhost:3000`）跨域 `fetch` 下载器的 RPC 端口会受 CORS 限制，下载器启动需允许跨域：
+
+```bash
+aria2c --enable-rpc --rpc-listen-all --rpc-allow-origin-all
+```
+
+Motrix 在设置中勾选「允许来自所有来源的请求」即可。未开启跨域时推送会报网络错误。

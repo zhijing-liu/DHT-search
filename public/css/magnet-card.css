@@ -16,8 +16,8 @@
   &:hover { text-decoration: underline; }
 }
 
-/* 复制 / 迅雷 / 关闭：统一图标按钮外观，消除三处重复 */
-.copy, .thunder, .close {
+/* 复制 / 迅雷 / 推送 / 关闭：统一图标按钮外观，消除重复 */
+.copy, .thunder, .rpc, .close {
   flex: none; width: 30px; height: 30px;
   display: inline-flex; align-items: center; justify-content: center;
   padding: 0; border-radius: 8px;
@@ -29,6 +29,7 @@
 }
 .copy.copied { color: #4ade80; border-color: #4ade80; }
 .thunder:hover { border-color: var(--accent); color: var(--accent); }
+.rpc:hover { border-color: #4ade80; color: #4ade80; }
 
 .meta { color: var(--muted); font-size: clamp(11px, calc(10px + 0.3vw), 12px); }
 

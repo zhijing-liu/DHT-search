@@ -1,5 +1,6 @@
 /** 注册自定义元素（<magnet-card> / <magnet-files> / <result-list> / <dht-sort-group>） */
 import './components.js';
+import { getRpcConfig, saveRpcConfig, showToast } from './util.js';
 
 const state = {
   query: '',
@@ -37,10 +38,16 @@ const el = {
   sortGroup: document.getElementById('sortGroup'),
   settingsBtn: document.getElementById('settingsBtn'),
   settingsDialog: document.getElementById('settingsDialog'),
+  rpcUrl: document.getElementById('rpcUrl'),
+  rpcSecret: document.getElementById('rpcSecret'),
   reindexBtn: document.getElementById('reindexBtn'),
   syncBtn: document.getElementById('syncBtn'),
-  status: document.getElementById('status'),
+  confirmDialog: document.getElementById('confirmDialog'),
+  confirmMsg: document.getElementById('confirmMsg'),
+  confirmOk: document.getElementById('confirmOk'),
+  confirmCancel: document.getElementById('confirmCancel'),
   results: document.getElementById('results'),
+  refreshBtn: document.getElementById('refreshBtn'),
   loadingOverlay: document.getElementById('loadingOverlay'),
   cancelSearchBtn: document.getElementById('cancelSearchBtn'),
   pager: document.getElementById('pager'),
@@ -138,6 +145,7 @@ function renderEmpty(message) {
 function renderResults(items) {
   el.hotView.hidden = true;
   el.results.hidden = false;
+  el.refreshBtn.hidden = false;
   el.results.replaceChildren();
   if (!items.length) {
     renderEmpty('没有找到匹配的结果');
@@ -197,9 +205,9 @@ function renderHotWordsView() {
   el.pager.hidden = true;
   el.pagerInfo.textContent = '';
   el.results.hidden = true;
+  el.refreshBtn.hidden = true;
   el.hotView.hidden = false;
   el.blacklistPanel.hidden = !state.editMode;
-  el.status.textContent = '';
   renderHotWords(state.hotItems || []);
 }
 
@@ -450,10 +458,19 @@ function renderPager(totalPages) {
   }
   el.pager.hidden = false;
 
+  const ICON_PREV = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>';
+  const ICON_NEXT = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>';
+
   const mkBtn = (label, page, opts = {}) => {
     const b = document.createElement('button');
-    b.textContent = label;
+    if (opts.icon) {
+      b.innerHTML = opts.icon;
+      b.classList.add('page-nav');
+    } else {
+      b.textContent = label;
+    }
     b.className = 'page-btn';
+    b.setAttribute('aria-label', opts.ariaLabel || label);
     if (opts.active) b.classList.add('active');
     if (opts.disabled) {
       b.disabled = true;
@@ -466,7 +483,7 @@ function renderPager(totalPages) {
     return b;
   };
 
-  el.pager.appendChild(mkBtn('上一页', state.page - 1, { disabled: state.page <= 1 }));
+  el.pager.appendChild(mkBtn('上一页', state.page - 1, { disabled: state.page <= 1, icon: ICON_PREV, ariaLabel: '上一页' }));
 
   // 页码窗口：显示首尾两页 + 当前页前后各两页
   const pageSet = new Set([
@@ -487,7 +504,7 @@ function renderPager(totalPages) {
     prev = p;
   }
 
-  el.pager.appendChild(mkBtn('下一页', state.page + 1, { disabled: state.page >= totalPages }));
+  el.pager.appendChild(mkBtn('下一页', state.page + 1, { disabled: state.page >= totalPages, icon: ICON_NEXT, ariaLabel: '下一页' }));
 }
 
 /* ---------- loading 状态（全屏蒙层） ---------- */
@@ -505,7 +522,7 @@ function cancelSearch() {
   }
   isSearching = false;
   el.loadingOverlay.hidden = true;
-  el.status.textContent = '已取消搜索';
+  showToast('已取消搜索');
 }
 
 /* ---------- 真服务端分页：每次查询/排序/翻页都从后端按页拉取 ---------- */
@@ -544,7 +561,7 @@ async function fetchPage() {
     if (mySeq !== reqSeq) return; // 已有更新的请求，丢弃本次
     if (!resp.ok) {
       setLoading(false);
-      el.status.textContent = `查询失败：${data.error || resp.status}`;
+      showToast(`查询失败：${data.error || resp.status}`);
       return;
     }
 
@@ -559,8 +576,7 @@ async function fetchPage() {
     const to = Math.min(offset + pageSize, total);
     setLoading(false);
     el.pagerRow.hidden = false;
-    el.pagerInfo.textContent = `共 ${total} 条结果，第 ${state.page}/${totalPages} 页（${from}-${to}）`;
-    el.status.textContent = '';
+    el.pagerInfo.textContent = `共 ${total} 条结果`;
 
     renderPager(totalPages);
     updateUrl();
@@ -568,7 +584,7 @@ async function fetchPage() {
     if (mySeq !== reqSeq) return;
     setLoading(false);
     // 主动取消（AbortError）不视为错误
-    el.status.textContent = err.name === 'AbortError' ? '已取消搜索' : `请求出错：${err.message}`;
+    showToast(err.name === 'AbortError' ? '已取消搜索' : `请求出错：${err.message}`);
   }
 }
 
@@ -597,6 +613,7 @@ async function doSearch(resetPage = true) {
   syncClearBtn();
   if (!state.query) {
     // 没有搜索内容时展示热词视图
+    showToast('请输入搜索关键词');
     showHotWords();
     return;
   }
@@ -613,6 +630,7 @@ async function doSearch(resetPage = true) {
 // 输入框值变化（失焦触发 change）：去除前后空格后有值则搜索，空值则回到热词视图
 el.q.addEventListener('change', () => {
   if (el.q.value.trim()) doSearch();
+  else handleInputCleared();
 });
 el.q.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
@@ -653,12 +671,11 @@ async function doReindex() {
   const label = el.reindexBtn.textContent;
   el.reindexBtn.disabled = true;
   el.reindexBtn.textContent = '重建中…';
-  el.status.textContent = '正在重建索引…';
   try {
     const resp = await fetch('/api/reindex', { method: 'POST' });
     const data = await resp.json();
     if (!resp.ok) {
-      el.status.textContent = `重建失败：${data.error || resp.status}`;
+      showToast(`重建失败：${data.error || resp.status}`);
       return;
     }
     // 索引已更新，沿用当前关键词重搜（无关键词则仅提示）
@@ -666,11 +683,11 @@ async function doReindex() {
     if (state.query) {
       await doSearch();
     } else {
-      el.status.textContent = `索引已重建，共索引 ${data.indexed} 条`;
+      showToast(`索引已重建，共索引 ${data.indexed} 条`);
     }
     await loadCount();
   } catch (err) {
-    el.status.textContent = `重建出错：${err.message}`;
+    showToast(`重建出错：${err.message}`);
   } finally {
     el.reindexBtn.disabled = false;
     el.reindexBtn.textContent = label;
@@ -683,12 +700,11 @@ async function doSync() {
   const label = el.syncBtn.textContent;
   el.syncBtn.disabled = true;
   el.syncBtn.textContent = '同步中…';
-  el.status.textContent = '正在同步最新索引…';
   try {
     const resp = await fetch('/api/sync', { method: 'POST' });
     const data = await resp.json();
     if (!resp.ok) {
-      el.status.textContent = `同步失败：${data.error || resp.status}`;
+      showToast(`同步失败：${data.error || resp.status}`);
       return;
     }
     if (state.query) {
@@ -696,9 +712,9 @@ async function doSync() {
     } else {
       await loadCount();
     }
-    el.status.textContent = '索引已同步最新';
+    showToast('索引已同步最新');
   } catch (err) {
-    el.status.textContent = `同步出错：${err.message}`;
+    showToast(`同步出错：${err.message}`);
   } finally {
     el.syncBtn.disabled = false;
     el.syncBtn.textContent = label;
@@ -706,9 +722,66 @@ async function doSync() {
 }
 
 el.settingsBtn.addEventListener('click', () => el.settingsDialog.showModal());
-el.reindexBtn.addEventListener('click', doReindex);
-el.syncBtn.addEventListener('click', doSync);
+
+/* ---------- RPC 推送配置（aria2 / Motrix）持久化 ---------- */
+function initRpcSettings() {
+  const { url, secret } = getRpcConfig();
+  el.rpcUrl.value = url;
+  el.rpcSecret.value = secret;
+  // 配置项写入 localStorage（键名见 util.js 的 RPC_URL_KEY / RPC_SECRET_KEY）
+  const save = () => saveRpcConfig({ url: el.rpcUrl.value, secret: el.rpcSecret.value });
+  el.rpcUrl.addEventListener('change', save);
+  el.rpcSecret.addEventListener('change', save);
+  // 关闭弹窗时兜底保存，避免只在输入框内输入但未失焦就关闭导致丢值
+  el.settingsDialog.addEventListener('close', save);
+}
+initRpcSettings();
+
+el.reindexBtn.addEventListener('click', async () => {
+  if (!(await confirmAction('重建索引会重新构建本地 FTS 索引，可能需要较长时间，是否继续？', { danger: true }))) return;
+  await doReindex();
+});
+el.syncBtn.addEventListener('click', async () => {
+  if (!(await confirmAction('同步索引将从源库补录新增行，是否继续？'))) return;
+  await doSync();
+});
 el.cancelSearchBtn.addEventListener('click', cancelSearch);
+
+/* ---------- 悬浮刷新按钮：重新发起当前搜索请求（保留页码） ---------- */
+el.refreshBtn.addEventListener('click', () => doSearch(false));
+
+/* ---------- DOM 二次确认弹窗（替代浏览器原生 confirm） ---------- */
+let confirmResolve = null;
+
+function finishConfirm(result) {
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  if (resolve) resolve(result);
+}
+
+function initConfirmDialog() {
+  el.confirmCancel.addEventListener('click', () => {
+    el.confirmDialog.close();
+    finishConfirm(false);
+  });
+  el.confirmOk.addEventListener('click', () => {
+    el.confirmDialog.close();
+    finishConfirm(true);
+  });
+  // ESC 关闭视为取消（dialog 默认会触发 cancel 事件并自动关闭）
+  el.confirmDialog.addEventListener('cancel', () => finishConfirm(false));
+}
+
+/** 弹出确认框，返回 Promise<boolean>；danger 为 true 时「确定」按钮呈红色 */
+function confirmAction(message, { danger = false } = {}) {
+  el.confirmMsg.textContent = message;
+  el.confirmOk.classList.toggle('danger', danger);
+  return new Promise((resolve) => {
+    confirmResolve = resolve;
+    el.confirmDialog.showModal();
+  });
+}
+initConfirmDialog();
 
 /* ---------- 关键词编辑模式开关 ---------- */
 
@@ -734,7 +807,7 @@ el.blExportBtn.addEventListener('click', async () => {
   try {
     const resp = await fetch('/api/hot/filter/export');
     if (!resp.ok) {
-      el.status.textContent = '导出失败';
+      showToast('导出失败');
       return;
     }
     const text = await resp.text();
@@ -747,9 +820,9 @@ el.blExportBtn.addEventListener('click', async () => {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    el.status.textContent = '黑名单已导出';
+    showToast('黑名单已导出');
   } catch {
-    el.status.textContent = '导出出错';
+    showToast('导出出错');
   }
 });
 
@@ -773,16 +846,16 @@ el.blImportFile.addEventListener('change', async () => {
     });
     const data = await resp.json();
     if (!resp.ok) {
-      el.status.textContent = `导入失败：${data.error || resp.status}`;
+      showToast(`导入失败：${data.error || resp.status}`);
       return;
     }
-    el.status.textContent = `已导入 ${data.accepted} 条（黑名单共 ${data.total} 条）`;
+    showToast(`已导入 ${data.accepted} 条（黑名单共 ${data.total} 条）`);
     await fetchBlacklist();
     // 重新拉取热词，使新过滤词立即生效
     state.hotItems = null;
     await loadHotData();
   } catch (err) {
-    el.status.textContent = `导入出错：${err.message}`;
+    showToast(`导入出错：${err.message}`);
   } finally {
     el.blImportBtn.disabled = false;
   }
@@ -856,7 +929,6 @@ el.clearBtn.addEventListener('click', () => {
   el.q.focus();
 });
 
-let lastValue = '';
 el.q.addEventListener('input', () => {
   syncClearBtn();
   const q = el.q.value.trim();
@@ -865,9 +937,6 @@ el.q.addEventListener('input', () => {
   } else {
     closeSuggestions();
   }
-  // 由"有内容"变为"空"的瞬间回到热词视图（仅跳变触发一次，无需 prevInput 之外的冗余分支）
-  if (q === '' && lastValue !== '') handleInputCleared();
-  lastValue = el.q.value;
 });
 
 syncClearBtn();
