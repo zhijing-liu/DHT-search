@@ -25,7 +25,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 /** 整集拉取的安全上限：单次请求最多返回这么多条，超出则 truncated=true；可由 config.json 的 maxResults 覆盖 */
-const MAX_RESULTS = CONFIG.maxResults ? Number(CONFIG.maxResults) : 20000;
+const maxResults = Number(CONFIG.maxResults);
+const MAX_RESULTS = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 20000;
 
 const SORT_WHITELIST = new Set(['fetchedAt', 'totalSize', 'relevance']);
 
@@ -35,24 +36,52 @@ const api = createMagnetDb();
 
 const app = express();
 
+/**
+ * 请求日志中间件：所有来自用户（或前端）主动发起的操作统一标记为 [USER]。
+ * 仅记录页面入口与 /api 接口，忽略 /public 下的静态资源噪音（app.js / styles.css 等），
+ * 让控制台输出聚焦于「用户做了什么」。
+ */
+app.use((req, res, next) => {
+  if (req.path === '/' || req.path === '/index.html' || req.path.startsWith('/api/')) {
+    const start = Date.now();
+    res.on('finish', () => {
+      console.log(`[USER] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms)`);
+    });
+  }
+  next();
+});
+
 /** 是否请求整集拉取（返回全部匹配，而非分页） */
 function isWholeSet(limitParam) {
   if (limitParam === undefined) return false;
-  if (limitParam === '0' || limitParam === 'all') return true;
+  if (limitParam === 'all') return true;
   const n = Number(limitParam);
   return Number.isFinite(n) && n <= 0;
 }
 
-app.get('/', (_req, res) => res.redirect('/index.html'));
+/** 统一包装 API 处理器：同步或异步执行，异常时按指定状态码返回 { error } */
+function apiHandler(fn, status = 500, fallback = 'internal error') {
+  return (req, res) => {
+    try {
+      const r = fn(req, res);
+      // 异步处理器：try/catch 抓不到 Promise 的拒绝，这里自己兜住
+      if (r && typeof r.then === 'function') {
+        r.catch((err) => {
+          if (!res.headersSent) res.status(status).json({ error: err?.message || fallback });
+        });
+      }
+    } catch (err) {
+      res.status(status).json({ error: err.message || fallback });
+    }
+  };
+}
 
-app.get('/index.html', (_req, res) => {
-  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
-});
+app.get('/', (_req, res) => res.redirect('/index.html'));
 
 app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
 
-app.get('/api/search', (req, res) => {
+app.get('/api/search', apiHandler((req, res) => {
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   if (!q) {
     return res.status(400).json({ error: 'query 不能为空' });
@@ -63,105 +92,89 @@ app.get('/api/search', (req, res) => {
   // 仅当显式传 by=hash 时走 infohash 精确检索，其余走 FTS5 模糊检索
   const by = req.query.by === 'hash' ? 'hash' : undefined;
 
-  try {
-    if (isWholeSet(req.query.limit)) {
-      // 整集拉取：一次查询取回全部匹配，前端据此做本地分页缓存
-      const result = api.searchMagnets({ query: q, sortBy, order, limit: -1, by });
-      let items = result.items;
-      const truncated = items.length > MAX_RESULTS;
-      if (truncated) items = items.slice(0, MAX_RESULTS);
-      return res.json({ total: result.total, limit: 'all', offset: 0, items, truncated });
-    }
+  console.log(`[USER] 检索请求: q="${q}" 模式=${by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${sortBy ?? 'id'}/${order}`);
 
-    // 普通分页
-    const limitParam = Number(req.query.limit);
-    const offsetParam = Number(req.query.offset);
-    const result = api.searchMagnets({
-      query: q,
-      sortBy,
-      order,
-      by,
-      limit: Number.isFinite(limitParam) ? limitParam : undefined,
-      offset: Number.isFinite(offsetParam) ? offsetParam : undefined,
-    });
-    return res.json(result);
-  } catch (err) {
-    return res.status(400).json({ error: err.message || 'search failed' });
+  if (isWholeSet(req.query.limit)) {
+    // 整集拉取：一次查询取回全部匹配，前端据此做本地分页缓存
+    const result = api.searchMagnets({ query: q, sortBy, order, limit: -1, by });
+    let items = result.items;
+    const truncated = items.length > MAX_RESULTS;
+    if (truncated) items = items.slice(0, MAX_RESULTS);
+    return res.json({ total: result.total, limit: 'all', offset: 0, items, truncated });
   }
-});
 
-/** 手动全量重建影子索引（源被改/删后用于同步） */
-app.post('/api/reindex', (_req, res) => {
-  try {
-    const indexed = api.reindex();
-    res.json({ ok: true, indexed });
-  } catch (err) {
-    res.status(500).json({ error: err.message || 'reindex failed' });
-  }
-});
+  // 普通分页
+  const limitParam = Number(req.query.limit);
+  const offsetParam = Number(req.query.offset);
+  const result = api.searchMagnets({
+    query: q,
+    sortBy,
+    order,
+    by,
+    limit: Number.isFinite(limitParam) ? limitParam : undefined,
+    offset: Number.isFinite(offsetParam) ? offsetParam : undefined,
+  });
+  return res.json(result);
+}, 400, 'search failed'));
+
+/** 手动全量重建影子索引（在 worker 线程中执行，重建期间检索仍可用） */
+app.post('/api/reindex', apiHandler(async (_req, res) => {
+  console.log('[USER] 手动触发全量索引重建');
+  const indexed = await api.reindex(({ done, total }) => {
+    console.log(`[SYSTEM][reindex] 重建进度 ${done}/${total}`);
+  });
+  console.log(`[SYSTEM] 索引重建完成，累计 ${indexed} 条`);
+  res.json({ ok: true, indexed });
+}, 500, 'reindex failed'));
 
 /** 当前已索引的 magnet 总数 */
-app.get('/api/count', (_req, res) => {
-  try {
-    res.json({ count: api.countMagnets() });
-  } catch (err) {
-    res.status(500).json({ error: err.message || 'count failed' });
-  }
-});
+app.get('/api/count', apiHandler((_req, res) => {
+  res.json({ count: api.countMagnets() });
+}, 500, 'count failed'));
 
 /** 热词榜（暂未接入页面，用于验证落库数据） */
-app.get('/api/hot', (req, res) => {
-  try {
-    const limit = Number(req.query.limit);
-    res.json({ items: api.topKeywords(Number.isFinite(limit) ? limit : 50) });
-  } catch (err) {
-    res.status(500).json({ error: err.message || 'hot failed' });
-  }
-});
+app.get('/api/hot', apiHandler((req, res) => {
+  const limit = Number(req.query.limit);
+  res.json({ items: api.topKeywords(Number.isFinite(limit) ? limit : 50) });
+}, 500, 'hot failed'));
 
 /** 热词过滤词列表 */
-app.get('/api/hot/filter', (_req, res) => {
-  try {
-    res.json({ items: api.listKeywordFilters() });
-  } catch (err) {
-    res.status(500).json({ error: err.message || 'list filter failed' });
-  }
-});
+app.get('/api/hot/filter', apiHandler((_req, res) => {
+  res.json({ items: api.listKeywordFilters() });
+}, 500, 'list filter failed'));
 
 /** 添加热词过滤词（body: { term }） */
-app.post('/api/hot/filter', (req, res) => {
-  try {
-    const term = String(req.body?.term ?? '').trim().toLowerCase();
-    if (!term || !/[\p{L}\p{N}]/u.test(term)) {
-      return res.status(400).json({ error: 'term 不能为空且需包含字母或数字' });
-    }
-    res.json({ ok: true, term: api.addKeywordFilter(term) });
-  } catch (err) {
-    res.status(500).json({ error: err.message || 'add filter failed' });
+app.post('/api/hot/filter', apiHandler((req, res) => {
+  const term = String(req.body?.term ?? '').trim().toLowerCase();
+  if (!term || !/[\p{L}\p{N}]/u.test(term)) {
+    return res.status(400).json({ error: 'term 不能为空且需包含字母或数字' });
   }
-});
+  res.json({ ok: true, term: api.addKeywordFilter(term) });
+  console.log(`[USER] 添加热词过滤词: "${term}"`);
+}, 500, 'add filter failed'));
 
 /** 删除热词过滤词（query: ?term=） */
-app.delete('/api/hot/filter', (req, res) => {
-  try {
-    const term = String(req.query.term ?? '').trim().toLowerCase();
-    if (!term) {
-      return res.status(400).json({ error: 'term 不能为空' });
-    }
-    res.json({ ok: true, term: api.removeKeywordFilter(term) });
-  } catch (err) {
-    res.status(500).json({ error: err.message || 'remove filter failed' });
+app.delete('/api/hot/filter', apiHandler((req, res) => {
+  const term = String(req.query.term ?? '').trim().toLowerCase();
+  if (!term) {
+    return res.status(400).json({ error: 'term 不能为空' });
   }
-});
+  res.json({ ok: true, term: api.removeKeywordFilter(term) });
+  console.log(`[USER] 删除热词过滤词: "${term}"`);
+}, 500, 'remove filter failed'));
 
 // 兜底错误处理，避免进程崩溃
 app.use((err, _req, res, _next) => {
-  console.error(err);
+  console.error(`[SYSTEM][error] 未捕获异常: ${err?.stack || err?.message || err}`);
   res.status(500).json({ error: 'internal error' });
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`DHT Search 服务已启动: http://localhost:${PORT}`);
+  console.log('[SYSTEM] ==========================================');
+  console.log(`[SYSTEM] DHT Search 服务已启动: http://localhost:${PORT}`);
+  console.log(`[SYSTEM] 配置: port=${PORT} maxResults=${MAX_RESULTS}`);
+  console.log('[SYSTEM] 等待用户请求...');
+  console.log('[SYSTEM] ==========================================');
 });
 
 // 重建索引（reindex）可能耗时较长且同步执行，关闭服务端超时避免请求被中断
@@ -170,12 +183,14 @@ if ('requestTimeout' in server) server.requestTimeout = 0;
 if ('headersTimeout' in server) server.headersTimeout = 0;
 
 server.on('error', (err) => {
-  console.error(`服务启动失败: ${err.message}`);
+  console.error(`[SYSTEM][error] 服务启动失败: ${err.message}`);
   api.close();
   process.exit(1);
 });
 
 process.on('SIGINT', () => {
+  console.log('\n[SYSTEM] 收到 SIGINT，正在关闭服务并释放数据库...');
   api.close();
+  console.log('[SYSTEM] 服务已关闭');
   process.exit(0);
 });

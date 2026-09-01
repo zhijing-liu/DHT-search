@@ -2,5 +2,7 @@
   "sourceDbPath": "data/magnet.db",
   "indexDbPath": "data/dht.search.db",
   "port": 3000,
-  "maxResults": 20000
+  "maxResults": 20000,
+  "reindexMaxOldSpaceMb": 2048,
+  "reindexTimeoutMs": 0
 }

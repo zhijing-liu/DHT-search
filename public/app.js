@@ -16,6 +16,8 @@ const state = {
   hotItems: null,
   /** 输入框下拉提示数据源：热词榜前 1000 个（供相似匹配） */
   hotSuggestions: [],
+  /** 当前查询模式：{ by, tokens }，查询变化时由 doSearch 计算一次，翻页/排序时复用 */
+  mode: { by: undefined, tokens: [] },
 };
 
 /** 请求序号：防止快速翻页时旧请求后到覆盖新结果 */
@@ -43,16 +45,25 @@ function extractTokens(q) {
   return [...new Set(m.map((t) => t.toLowerCase()))];
 }
 
-/** 判断输入是否为 infohash：40 位十六进制，或含 urn:btih:/hash 前缀 */
+/** 判断输入是否为 infohash：连续 40 位十六进制，或带 urn:btih: / hash 前缀（不做字符剥离，避免普通搜索词被误判） */
 function isInfohash(q) {
   const s = String(q).trim().toLowerCase();
-  const h = s.replace(/^.*urn:btih:/, '').replace(/[^a-f0-9]/g, '').replace(/^hash/, '');
-  return h.length === 40;
+  if (s.includes('urn:btih:')) return /^.*urn:btih:[a-f0-9]{40}$/.test(s);
+  if (s.startsWith('hash')) return /^hash[a-f0-9]{40}$/.test(s);
+  return /^[a-f0-9]{40}$/.test(s);
 }
+
+/** 判断当前查询模式：infohash 走精确检索（不高亮），否则 FTS 模糊检索并提取高亮 token */
+function detectMode(query) {
+  const hashMode = isInfohash(query);
+  return { by: hashMode ? 'hash' : undefined, tokens: hashMode ? [] : extractTokens(query) };
+}
+
+const numberFmt = new Intl.NumberFormat('zh-CN');
 
 /** 格式化计数 */
 function formatCount(n) {
-  return new Intl.NumberFormat('zh-CN').format(Number(n) || 0);
+  return numberFmt.format(Number(n) || 0);
 }
 
 /** 拉取并刷新右上角种子数量 */
@@ -76,13 +87,18 @@ function renderItem(item) {
   return card;
 }
 
+/** 渲染空状态提示 */
+function renderEmpty(message) {
+  const empty = document.createElement('p');
+  empty.className = 'empty';
+  empty.textContent = message;
+  el.results.appendChild(empty);
+}
+
 function renderResults(items) {
   el.results.replaceChildren();
   if (!items.length) {
-    const empty = document.createElement('p');
-    empty.className = 'empty';
-    empty.textContent = '没有找到匹配的结果';
-    el.results.appendChild(empty);
+    renderEmpty('没有找到匹配的结果');
     return;
   }
   const frag = document.createDocumentFragment();
@@ -96,10 +112,7 @@ function renderResults(items) {
 function renderHotWords(items) {
   el.results.replaceChildren();
   if (!items.length) {
-    const empty = document.createElement('p');
-    empty.className = 'empty';
-    empty.textContent = '暂无热词数据';
-    el.results.appendChild(empty);
+    renderEmpty('暂无热词数据');
     return;
   }
   const wrap = document.createElement('div');
@@ -119,16 +132,21 @@ function renderHotWords(items) {
   el.results.appendChild(wrap);
 }
 
+/** 渲染热词视图（无搜索内容时的默认视图，数据已就绪时调用） */
+function renderHotWordsView() {
+  setLoading(false);
+  el.pager.hidden = true;
+  el.status.textContent = state.hotItems.length ? '热门关键词' : '';
+  renderHotWords(state.hotItems);
+}
+
 /** 无搜索内容时展示热词视图（数据未加载则先拉取） */
 function showHotWords() {
   if (state.hotItems === null) {
     loadHotWords();
     return;
   }
-  setLoading(false);
-  el.pager.hidden = true;
-  el.status.textContent = state.hotItems.length ? '热门关键词' : '';
-  renderHotWords(state.hotItems);
+  renderHotWordsView();
 }
 
 /** 拉取热词榜数据；完成后仅当当前无搜索内容时渲染，避免覆盖搜索结果 */
@@ -140,12 +158,7 @@ async function loadHotWords() {
   } catch {
     state.hotItems = [];
   }
-  if (!state.query) {
-    setLoading(false);
-    el.pager.hidden = true;
-    el.status.textContent = state.hotItems.length ? '热门关键词' : '';
-    renderHotWords(state.hotItems);
-  }
+  if (!state.query) renderHotWordsView();
 }
 
 /* ---------- 输入框下拉提示（搜索引擎式自动补全） ---------- */

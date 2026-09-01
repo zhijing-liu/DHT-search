@@ -25,10 +25,18 @@ const cleanup = () => {
 cleanup();
 
 let passed = 0;
+/**
+ * 执行一条断言并打印。同步回调直接计分；异步回调返回 Promise，调用方需 await
+ * （reindex() 走 worker 线程，是异步的）。现有同步调用点无需改动。
+ */
 const check = (label, fn) => {
-  fn();
-  passed += 1;
-  console.log(`  PASS  ${label}`);
+  const done = () => {
+    passed += 1;
+    console.log(`  PASS  ${label}`);
+  };
+  const r = fn();
+  if (r && typeof r.then === 'function') return r.then(done);
+  done();
 };
 
 const BASE = 'Britney.Dutch.Tiny.Brunette.Dutch.Girl.Wants.Cock.FULL.HD.sxyprn.Hardcore.Amateur.Pussy.Horny.Sex.Lingerie.Brunette.More.Deleted.Content.on.PRNLEAKS.COM.mp4';
@@ -166,7 +174,7 @@ console.log('\n[3] files 解析失败时保留原始字符串');
   // 改的是已有行，增量同步不会捕获 UPDATE，需 reindex 全量重建后才会反映
   writeSource((src) => src.prepare('UPDATE magnets SET files = ? WHERE id = 3').run('not-a-json'));
   const api = openApi();
-  api.reindex();
+  await api.reindex();
   const r = api.searchMagnets({ query: 'ubuntu' });
   assert.equal(r.items[0].files, 'not-a-json');
   api.close();
@@ -295,8 +303,8 @@ console.log('\n[8] reindex 反映对已有行的改名 / 删除');
     assert.equal(api.searchMagnets({ query: 'Trigger.Sync' }).total, 1);
     assert.equal(api.searchMagnets({ query: 'Renamed.Entry' }).total, 0);
   });
-  check('reindex() 全量重建后改名生效', () => {
-    const indexed = api.reindex();
+  await check('reindex() 全量重建后改名生效', async () => {
+    const indexed = await api.reindex();
     assert.equal(indexed, 5);
     assert.equal(api.searchMagnets({ query: 'Renamed.Entry' }).items[0].id, 5);
     assert.equal(api.searchMagnets({ query: 'Trigger.Sync' }).total, 0);
@@ -306,7 +314,7 @@ console.log('\n[8] reindex 反映对已有行的改名 / 删除');
   // 删 id=5：增量同步只追加，删除需 reindex 全量重建才反映
   writeSource((src) => src.prepare('DELETE FROM magnets WHERE id = 5').run());
   const api2 = openApi();
-  api2.reindex();
+  await api2.reindex();
   check('reindex 后源中已删除的行不再返回', () => {
     assert.equal(api2.searchMagnets({ query: 'Renamed.Entry' }).total, 0);
     assert.equal(api2.countMagnets(), 4);

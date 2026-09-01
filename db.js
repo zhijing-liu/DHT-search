@@ -14,7 +14,8 @@
  *   countMagnets()   —— 已索引条数
  *   searchMagnets()  —— 对 name / files 两列做 FTS5 模糊搜索，支持分页与
  *                       可选排序（不传 sortBy 按 id；relevance 按 bm25）
- *   reindex()        —— 全量重建影子索引（源被改/删后手动同步用）
+ *   reindex()        —— 全量重建影子索引（异步，在 worker 线程执行，不阻塞检索）
+ *   rebuildSync()    —— 同上但在当前进程内同步执行（供 worker / 脚本使用）
  *   close()          —— 关闭连接
  *
  * 同步策略：启动时按 last_rowid 增量补录新行；tokenizer 变更或索引为空时
@@ -25,6 +26,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { sql, eq, count } from 'drizzle-orm';
@@ -36,7 +38,7 @@ export const DEFAULT_DB_PATH = path.join(MODULE_DIR, 'data', 'magnet.db');
 export const DEFAULT_INDEX_DB_PATH = path.join(MODULE_DIR, 'data', 'dht.search.db');
 
 /** 把配置里的库路径解析为绝对路径：绝对路径原样使用，相对路径基于模块目录 */
-function resolveDbPath(p) {
+export function resolveDbPath(p) {
   if (!p) return p;
   return path.isAbsolute(p) ? p : path.join(MODULE_DIR, p);
 }
@@ -73,8 +75,6 @@ export const SORT_COLUMNS = Object.freeze(['fetchedAt', 'totalSize', 'relevance'
  */
 const ORDER_SQL = Object.freeze({
   '': `ORDER BY m.id ASC`,
-  'id:asc': 'ORDER BY m.id ASC',
-  'id:desc': 'ORDER BY m.id DESC',
   'fetchedAt:asc': 'ORDER BY m.fetchedAt ASC, m.id ASC',
   'fetchedAt:desc': 'ORDER BY m.fetchedAt DESC, m.id DESC',
   'totalSize:asc': 'ORDER BY m.totalSize ASC, m.id ASC',
@@ -135,6 +135,25 @@ function clampInt(value, fallback, min, max) {
   return Math.min(Math.max(Math.floor(num), min), max);
 }
 
+/**
+ * 统一规范化检索的分页与排序参数（searchMagnets / searchByHash 共用）。
+ * 未传 sortBy 时按 id 排序（'' 键），order 仅对显式 sortBy 生效；
+ * limit 传 <=0 或不传表示不限制，否则钳制到 1..MAX_LIMIT。
+ * @returns {{ orderSql: string, limit: number, offset: number }}
+ */
+function normalizeQueryOptions({ sortBy, order, limit, offset }) {
+  const direction = String(order).toLowerCase() === 'asc' ? 'asc' : 'desc';
+  const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : '';
+  return {
+    orderSql: ORDER_SQL[sortKey],
+    limit:
+      limit === undefined || limit === null || Number(limit) <= 0
+        ? -1
+        : clampInt(limit, DEFAULT_LIMIT, 1, MAX_LIMIT),
+    offset: clampInt(offset, 0, 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
 /** files 在库中是 JSON 字符串，返回时解析为对象，失败则保留原始字符串 */
 function parseFiles(raw) {
   if (raw === null || raw === undefined) return raw;
@@ -170,8 +189,9 @@ function openSourceRO(sourcePath) {
   const src = new Database(sourcePath, { readonly: true, fileMustExist: true });
   // 双重保险：连接层只读 + 引擎级禁止任何写入语句
   src.pragma('query_only = ON');
-  src.pragma('cache_size = -64000');
-  src.pragma('mmap_size = 268435456');
+  // 全表顺序扫描不需要 mmap：扫过的页会全部计入 RSS，2GB 库下白白吃掉几百 MB
+  src.pragma('mmap_size = 0');
+  src.pragma('cache_size = -16000');
   return src;
 }
 
@@ -210,61 +230,115 @@ function buildFts(db) {
 const DOCS_COLUMNS = 'id, name, infohash, magnet, files, totalSize, fetchedAt';
 
 /** 每批写入事务的行数上限；分批改写以限制全量重建时的内存峰值 */
-const REBUILD_BATCH = 5000;
+const REBUILD_BATCH = 2000;
+/**
+ * 每批写入事务的字节上限（按 name + files 的字符数估算）。
+ * 只按行数分批时，多文件种子的 files JSON 可达几十 KB，单批仍可能撑到几百 MB，
+ * 故行数与字节数两个阈值先到先生效。
+ * 注：对中文字符（V8 内部按 2 字节存储）会低估约一倍，属于偏安全的方向。
+ */
+const REBUILD_BATCH_BYTES = 16 * 1024 * 1024;
+/** reindex worker 入口（与 db.js 同目录） */
+const REINDEX_WORKER_URL = new URL('./reindex-worker.js', import.meta.url);
+
+/**
+ * 按 id 升序分段扫描源表，逐行 yield（流式，不物化整表）。
+ *
+ * 相比单个跨越全表的大游标：
+ *   - 每段一个独立短游标，不长时间占用源库读快照（源库非 WAL 时尤其重要）；
+ *   - 单段失败可从该 id 续跑；
+ *   - 进度可精确上报。
+ *
+ * 依赖 magnets.id 为 INTEGER PRIMARY KEY（rowid），此时 WHERE id > ? 走 rowid 区间扫描，
+ * 代价与全表顺序扫描相当；若源库 id 只是普通索引列，ORDER BY 保证结果仍然正确，仅略慢。
+ *
+ * from 为开区间下界，调用方需保证它小于待扫描的最小 id：
+ * 全量重建传 min(id) - 1（避免漏掉 id <= 0 的行），增量补录传 last_rowid。
+ */
+function* scanById(src, { from = 0, size = REBUILD_BATCH } = {}) {
+  const stmt = src.prepare(
+    `SELECT ${DOCS_COLUMNS} FROM ${TABLE} WHERE id > ? ORDER BY id LIMIT ?`
+  );
+  let cursor = from;
+  for (;;) {
+    let last = cursor;
+    let n = 0;
+    // 段内仍用 iterate() 逐行取，避免把整段物化成数组
+    for (const row of stmt.iterate(cursor, size)) {
+      last = row.id;
+      n += 1;
+      yield row;
+    }
+    if (n < size) return;
+    cursor = last;
+  }
+}
 
 /**
  * 用源库行填充 FTS 与副本表。
- * @param {db} db                      可写连接（drizzle 实例）
- * @param {Iterable<Object>} rowsIterable 源行迭代器（数组或 better-sqlite3 的 stmt.iterate()）。
- *        传入迭代器可避免一次性把全表载入内存，内存峰值仅约等于一个批次的行数。
+ *
+ * 热路径绕过 drizzle 的 sql`` 模板：后者每次 run() 都会重新 prepare 一条语句
+ * （drizzle 的 SQLiteSession 无语句缓存），每行一次的 Statement 包装对象分配会带来
+ * 明显的 GC 压力。这里改为整个重建复用 3 条 prepared statement。
+ *
+ * 注意：SQLite 这个构建禁用了双引号字符串字面量，原生 SQL 里的字面量一律用单引号。
+ *
+ * @param {db}        db            可写连接（drizzle 实例）
+ * @param {Iterable}  rowsIterable  源行迭代器（数组或 scanById() 生成器）
+ * @param {(info: { rows: number }) => void} [onFlush] 每批落库后回调，rows 为本批行数
  */
-function populate(db, rowsIterable) {
-  const CHUNK = 1000;
-  let ftsBuf = [];
-  let docBuf = [];
+function populate(db, rowsIterable, onFlush) {
+  // drizzle 实例上的 $client 即底层 better-sqlite3 连接（drizzle driver 里 db.$client = client）
+  const raw = db.$client ?? db.session?.client;
+
+  const insertFts = raw.prepare(
+    `INSERT INTO ${FTS_TABLE} (rowid, name, files) VALUES (?, ?, ?)`
+  );
+  // 副本表用 OR REPLACE：重复 id 时覆盖而非抛错，增量补录更稳。
+  // FTS 侧不能这样写 —— contentless FTS5 不支持 REPLACE 冲突处理。
+  const insertDoc = raw.prepare(
+    `INSERT OR REPLACE INTO ${DOCS_TABLE}
+       (id, name, infohash, magnet, files, totalSize, fetchedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  const upsertKw = raw.prepare(
+    `INSERT INTO ${KEYWORD_TABLE} (term, doc_count, occurrences) VALUES (?, ?, ?)
+     ON CONFLICT(term) DO UPDATE SET
+       doc_count = doc_count + excluded.doc_count,
+       occurrences = occurrences + excluded.occurrences`
+  );
+  const runBatch = raw.transaction((rows, kws) => {
+    for (const r of rows) insertFts.run(r.id, r.name, r.files);
+    for (const r of rows) {
+      insertDoc.run(r.id, r.name, r.infohash, r.magnet, r.files, r.totalSize, r.fetchedAt);
+    }
+    for (const [term, k] of kws) upsertKw.run(term, k.doc, k.occ);
+  });
+
   // 热词过滤集：populate 前从过滤表加载，统计时排除用户配置的噪声词
   const filter = new Set(
-    db.all(sql`SELECT term FROM ${sql.raw(KEYWORD_FILTER_TABLE)}`).map((r) => r.term)
+    raw.prepare(`SELECT term FROM ${KEYWORD_FILTER_TABLE}`).pluck().all()
   );
   /** 热词累计：term -> { doc, occ }，随批次 flush 落库，控制内存峰值 */
   const kwMap = new Map();
+  const seen = new Set(); // 复用，避免每行 new Set()
+  let buf = [];
+  let bytes = 0;
+
   const flush = () => {
-    if (!docBuf.length) return;
-    db.transaction((tx) => {
-      for (const r of ftsBuf) {
-        tx.run(sql`INSERT INTO ${sql.raw(FTS_TABLE)} (rowid, name, files)
-          VALUES (${r.id}, ${r.name}, ${r.files})`);
-      }
-      for (let i = 0; i < docBuf.length; i += CHUNK) {
-        const slice = docBuf.slice(i, i + CHUNK).map((r) => ({
-          id: r.id,
-          name: r.name,
-          infohash: r.infohash,
-          magnet: r.magnet,
-          files: r.files,
-          totalSize: r.totalSize,
-          fetchedAt: r.fetchedAt,
-        }));
-        tx.insert(magnetsDocs).values(slice).run();
-      }
-      // 热词 upsert 合并计数（全量重建时表已被清空，增量时按新行累加）
-      for (const [term, k] of kwMap) {
-        tx.run(sql`INSERT INTO ${sql.raw(KEYWORD_TABLE)} (term, doc_count, occurrences)
-          VALUES (${term}, ${k.doc}, ${k.occ})
-          ON CONFLICT(term) DO UPDATE SET
-            doc_count = doc_count + excluded.doc_count,
-            occurrences = occurrences + excluded.occurrences`);
-      }
-    });
-    ftsBuf = [];
-    docBuf = [];
+    if (!buf.length) return;
+    runBatch(buf, kwMap);
+    onFlush?.({ rows: buf.length });
+    buf = [];
+    bytes = 0;
     kwMap.clear();
   };
+
   for (const r of rowsIterable) {
-    ftsBuf.push(r);
-    docBuf.push(r);
+    buf.push(r);
+    bytes += (r.name?.length ?? 0) + (r.files?.length ?? 0);
     // 热词统计：同一文档内去重，doc_count 只计一次
-    const seen = new Set();
+    seen.clear();
     for (const w of keywordTokens(r[KEYWORD_SOURCE])) {
       if (filter.has(w)) continue;
       const e = kwMap.get(w) ?? { doc: 0, occ: 0 };
@@ -275,62 +349,110 @@ function populate(db, rowsIterable) {
       }
       kwMap.set(w, e);
     }
-    if (docBuf.length >= REBUILD_BATCH) flush();
+    if (buf.length >= REBUILD_BATCH || bytes >= REBUILD_BATCH_BYTES) flush();
   }
   flush();
 }
 
-/** 全量重建：从源库灌入所有行并合并索引段 */
-function fullRebuild(db, src) {
-  buildFts(db);
-  db.run(sql`DROP TABLE IF EXISTS ${sql.raw(DOCS_TABLE)}`);
-  db.run(sql`CREATE TABLE ${sql.raw(DOCS_TABLE)} (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL DEFAULT '',
-    infohash TEXT,
-    magnet TEXT,
-    files TEXT,
-    totalSize INTEGER NOT NULL DEFAULT 0,
-    fetchedAt INTEGER NOT NULL DEFAULT 0
-  )`);
+/**
+ * 增量合并 FTS5 segment，替代 'optimize'。
+ *
+ * 'optimize' 会把全部 b-tree 一次性合并成单个大 segment，内存峰值与索引规模成正比。
+ * 这里用官方推荐的等价分步写法：先以 -N 触发一次（把多层 segment 拉平到同一层），
+ * 再以 +N 反复合并，直到 total_changes() 增量 < 2（表示本轮无可合并内容）。
+ *
+ * @param {number} [pages=4096]     每轮合并的页数预算（FTS5 pgsz 默认 4050 字节/页）
+ * @param {number} [maxRounds=512]  轮数上限，兜底防死循环
+ * @returns {number} 实际执行的 +N 合并轮数
+ */
+function mergeFts(db, { pages = 4096, maxRounds = 512 } = {}) {
+  const changes = () => Number(db.get(sql`SELECT total_changes() AS c`)?.c ?? 0);
+  const merge = (n) =>
+    db.run(sql`INSERT INTO ${sql.raw(FTS_TABLE)} (${sql.raw(FTS_TABLE)}, rank)
+      VALUES ('merge', ${n})`);
+  merge(-pages);
+  for (let i = 0; i < maxRounds; i += 1) {
+    const before = changes();
+    merge(pages);
+    if (changes() - before < 2) return i + 1;
+  }
+  return maxRounds;
+}
+
+/**
+ * 全量重建：按 id 分段扫描源库灌入所有行，最后增量合并索引段。
+ *
+ * 建表 DDL 整体包在一个事务里：重建与查询是并发的（reindex() 在 worker 线程执行），
+ * 若 DROP 与 CREATE 分处两个事务，其他连接可能观察到「DROP 已执行、CREATE 还没执行」
+ * 的中间态而拿到 "no such table" 错误 —— 这是 schema 错误，busy_timeout 兜不住。
+ *
+ * populate 期间 countMagnets() 会从 0 递增、检索结果不完整，属于在线重建的固有代价。
+ *
+ * @param {Function} [onFlush] 每批落库后回调，参数为 { rows }
+ */
+function fullRebuild(db, src, onFlush) {
+  const raw = db.$client ?? db.session?.client;
+  raw.transaction(() => {
+    buildFts(db);
+    db.run(sql`DROP TABLE IF EXISTS ${sql.raw(DOCS_TABLE)}`);
+    db.run(sql`CREATE TABLE ${sql.raw(DOCS_TABLE)} (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT '',
+      infohash TEXT,
+      magnet TEXT,
+      files TEXT,
+      totalSize INTEGER NOT NULL DEFAULT 0,
+      fetchedAt INTEGER NOT NULL DEFAULT 0
+    )`);
+    // 热词统计表：全量重建时清空重建，随 populate 重新统计
+    db.run(sql`DROP TABLE IF EXISTS ${sql.raw(KEYWORD_TABLE)}`);
+    db.run(sql`CREATE TABLE ${sql.raw(KEYWORD_TABLE)} (
+      term TEXT PRIMARY KEY,
+      doc_count INTEGER NOT NULL DEFAULT 0,
+      occurrences INTEGER NOT NULL DEFAULT 0
+    )`);
+  })();
+
+  // 从 min(id) - 1 起扫：改前的全表扫描不带 WHERE，会包含所有行；
+  // 换成 keyset 后若从 0 起（id > 0）会静默漏掉 id <= 0 的行。
+  // id 是 rowid 时 min(id) 是一次 O(1) 查找，代价可忽略。
+  const minId = src.prepare(`SELECT min(id) AS m FROM ${TABLE}`).get()?.m;
+  populate(
+    db,
+    scanById(src, { from: minId == null ? 0 : Number(minId) - 1, size: REBUILD_BATCH }),
+    onFlush
+  );
+
+  // 二级索引放到灌数据之后建：空表建索引会让后续每条 INSERT 都维护两个 B-Tree，
+  // 写入慢 2~3 倍；先灌数据再建索引是批量排序构建，快得多。
   db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_fetchedAt`)} ON ${sql.raw(DOCS_TABLE)}(fetchedAt)`);
   db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`);
-  // 热词统计表：全量重建时清空重建，随 populate 重新统计
-  db.run(sql`DROP TABLE IF EXISTS ${sql.raw(KEYWORD_TABLE)}`);
-  db.run(sql`CREATE TABLE ${sql.raw(KEYWORD_TABLE)} (
-    term TEXT PRIMARY KEY,
-    doc_count INTEGER NOT NULL DEFAULT 0,
-    occurrences INTEGER NOT NULL DEFAULT 0
-  )`);
-
-  const stmt = src.prepare(`SELECT ${DOCS_COLUMNS} FROM ${TABLE}`);
-  populate(db, stmt.iterate());
 
   setMeta(db, 'tokenizer', TOKENIZER);
   setMeta(db, 'last_rowid', String(maxSourceId(src)));
-  db.run(sql`INSERT INTO ${sql.raw(FTS_TABLE)} (${sql.raw(FTS_TABLE)}) VALUES ('optimize')`);
+  mergeFts(db);
 }
 
 /**
  * 启动同步：tokenizer 不符或索引为空则全量重建；
  * 否则按 last_rowid 增量补录源库中新增的行。
  */
-function syncIndex(db, src) {
+function syncIndex(db, src, onFlush) {
   const ftsExists = tableExists(db, FTS_TABLE);
   const docsExists = tableExists(db, DOCS_TABLE);
   const stored = getMeta(db, 'tokenizer');
   // 表缺失或 tokenizer 变更 → 全量重建；否则按 last_rowid 增量补录
   if (!ftsExists || !docsExists || stored !== TOKENIZER) {
-    fullRebuild(db, src);
+    fullRebuild(db, src, onFlush);
     return;
   }
   const last = Number(getMeta(db, 'last_rowid') ?? '0');
   const max = maxSourceId(src);
   if (max > last) {
-    const rows = src.prepare(`SELECT ${DOCS_COLUMNS} FROM ${TABLE} WHERE id > ?`).all(last);
-    populate(db, rows);
+    // keyset 分段 + 流式迭代，避免 .all() 把数百万行一次性物化进堆
+    populate(db, scanById(src, { from: last, size: REBUILD_BATCH }), onFlush);
     setMeta(db, 'last_rowid', String(max));
-    db.run(sql`INSERT INTO ${sql.raw(FTS_TABLE)} (${sql.raw(FTS_TABLE)}) VALUES ('optimize')`);
+    mergeFts(db);
   }
 }
 
@@ -344,8 +466,10 @@ function syncIndex(db, src) {
  * @param {Object|string} [options] 源库路径字符串，或 { source, indexDbPath }
  * @param {string} [options.source]      源库路径，默认 process.env.DHT_DB_PATH 或 data/magnet.db
  * @param {string} [options.indexDbPath] 影子索引库路径，默认 process.env.DHT_INDEX_DB_PATH 或 data/dht.search.db
+ * @param {boolean} [options.sync=true]  打开时是否执行同步（全量重建 / 增量补录）；
+ *        传 false 则只建立连接不建索引，供 reindex worker 使用
  * @returns {{ db: import('drizzle-orm/better-sqlite3').BetterSQLite3Database, countMagnets: Function,
- *            searchMagnets: Function, reindex: Function, close: Function }}
+ *            searchMagnets: Function, reindex: Function, rebuildSync: Function, close: Function }}
  */
 export function createMagnetDb(options = {}) {
   const opts = typeof options === 'string' ? { source: options } : options;
@@ -363,10 +487,12 @@ export function createMagnetDb(options = {}) {
   const wdb = new Database(indexPath);
   wdb.pragma('busy_timeout = 5000');
   wdb.pragma('journal_mode = WAL');
-  wdb.pragma('cache_size = -64000');
-  wdb.pragma('mmap_size = 268435456');
+  // 重建期间不需要 mmap；temp_store 改 FILE，把排序/临时页交给磁盘而不是内存
+  // （temp_store = MEMORY 的临时页不受 cache_size 限制，2GB 级排序会吃掉几百 MB）
+  wdb.pragma('mmap_size = 0');
+  wdb.pragma('cache_size = -32000');
   wdb.pragma('synchronous = NORMAL');
-  wdb.pragma('temp_store = MEMORY');
+  wdb.pragma('temp_store = FILE');
   const db = drizzle(wdb);
 
   // 同步水位表（drizzle 不自动建表，按你的选择由 raw DDL 维护）
@@ -394,7 +520,23 @@ export function createMagnetDb(options = {}) {
     if (!src.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(TABLE)) {
       throw new Error(`源库 ${sourcePath} 中不存在 ${TABLE} 表`);
     }
-    syncIndex(db, src);
+    // sync: false 供 reindex worker 使用：它只为重建而来，不必先跑一次增量同步
+    if (opts.sync !== false) {
+      let done = 0;
+      let logged = 0;
+      let nextLog = 100000;
+      syncIndex(db, src, ({ rows }) => {
+        done += rows;
+        if (done >= nextLog) {
+          nextLog = done + 100000;
+          logged = done;
+          console.log(`[index] 已索引 ${done} 行`);
+        }
+      });
+      // 进度按阈值打印，最后一批不足一个阈值时上面不会触发，这里补打总数，
+      // 否则「已索引 100000 行」看起来会像是提前停了
+      if (done > logged) console.log(`[index] 索引完成，共 ${done} 行`);
+    }
   } finally {
     src.close();
   }
@@ -403,9 +545,62 @@ export function createMagnetDb(options = {}) {
   // 在代码层面杜绝查询路径修改数据库。源库本就只读，索引库的写操作只发生在 syncIndex / reindex。
   const rdb = new Database(indexPath, { readonly: true });
   rdb.pragma('query_only = ON');
+  // 重建在 worker 线程并发进行，读连接遇到写锁要等待而不是立刻抛 SQLITE_BUSY
+  rdb.pragma('busy_timeout = 5000');
   rdb.pragma('cache_size = -32000');
   rdb.pragma('mmap_size = 134217728');
   const dbRO = drizzle(rdb);
+
+  // reindex worker 的堆上限与超时；超时传 0 表示不限时
+  const REINDEX_MAX_OLD_SPACE_MB = clampInt(CONFIG.reindexMaxOldSpaceMb, 2048, 256, 65536);
+  const REINDEX_TIMEOUT_MS = clampInt(CONFIG.reindexTimeoutMs, 0, 0, Number.MAX_SAFE_INTEGER);
+
+  let reindexWorker = null;
+  let reindexPromise = null;
+
+  /** 派生 worker 线程执行重建 */
+  function spawnReindexWorker(onProgress) {
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(REINDEX_WORKER_URL, {
+        workerData: { sourcePath, indexPath },
+        // 堆触顶时 worker 会以 ERR_WORKER_OUT_OF_MEMORY 退出，只杀 worker，主进程不受影响
+        resourceLimits: { maxOldGenerationSizeMb: REINDEX_MAX_OLD_SPACE_MB },
+        stdout: true,
+        stderr: true,
+      });
+      reindexWorker = worker;
+
+      let settled = false;
+      let timer = null;
+      const settle = (ok, value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        reindexWorker = null;
+        if (!ok) worker.terminate();
+        (ok ? resolve : reject)(value);
+      };
+
+      if (REINDEX_TIMEOUT_MS > 0) {
+        timer = setTimeout(
+          () => settle(false, new Error(`reindex 超时（${REINDEX_TIMEOUT_MS}ms）`)),
+          REINDEX_TIMEOUT_MS
+        );
+      }
+      worker.on('message', (msg) => {
+        if (msg?.type === 'progress') {
+          onProgress?.(msg);
+          return;
+        }
+        if (msg?.ok) settle(true, msg.indexed);
+        else settle(false, new Error(msg?.error || 'reindex failed'));
+      });
+      worker.on('error', (err) => settle(false, err));
+      worker.on('exit', (code) => {
+        if (!settled) settle(false, new Error(`reindex 进程异常退出（code=${code}）`));
+      });
+    });
+  }
 
   /** 已索引条数（与检索结果一致） */
   function countMagnets() {
@@ -422,8 +617,10 @@ export function createMagnetDb(options = {}) {
     const lim = clampInt(limit, 50, 1, 1000);
     return dbRO.all(sql`
       SELECT term, doc_count, occurrences
-      FROM ${sql.raw(KEYWORD_TABLE)}
-      WHERE term NOT IN (SELECT term FROM ${sql.raw(KEYWORD_FILTER_TABLE)})
+      FROM ${sql.raw(KEYWORD_TABLE)} k
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ${sql.raw(KEYWORD_FILTER_TABLE)} f WHERE f.term = k.term
+      )
       ORDER BY doc_count DESC, occurrences DESC
       LIMIT ${lim}
     `);
@@ -476,15 +673,7 @@ export function createMagnetDb(options = {}) {
     if (!raw) {
       throw new TypeError('searchByHash: 未提供有效的 infohash');
     }
-    const direction = String(order).toLowerCase() === 'asc' ? 'asc' : 'desc';
-    // 未传 sortBy 时走 '' 键（按 id 升序），order 仅对显式 sortBy 生效
-    const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : '';
-    const orderSql = ORDER_SQL[sortKey];
-    const lim =
-      limit === undefined || limit === null || Number(limit) <= 0
-        ? -1
-        : clampInt(limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-    const off = clampInt(offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const { orderSql, limit: lim, offset: off } = normalizeQueryOptions({ sortBy, order, limit, offset });
 
     // 归一化匹配：兼容「带/不带 hash 前缀」两种 infohash 存储，并支持前缀检索
     const cond = sql`lower(m.infohash) = lower(${raw})
@@ -517,16 +706,12 @@ export function createMagnetDb(options = {}) {
       throw new TypeError('searchMagnets: options.query 不能为空，且需包含至少一个字母或数字');
     }
 
-    const direction = String(order).toLowerCase() === 'asc' ? 'asc' : 'desc';
-    // 未传 sortBy 时走 '' 键（按 id 升序），order 仅对显式 sortBy 生效
-    const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : '';
-    const orderSql = ORDER_SQL[sortKey];
-
-    const limit =
-      options.limit === undefined || options.limit === null || Number(options.limit) <= 0
-        ? -1
-        : clampInt(options.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-    const offset = clampInt(options.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const { orderSql, limit, offset } = normalizeQueryOptions({
+      sortBy,
+      order,
+      limit: options.limit,
+      offset: options.offset,
+    });
 
     // total 走 JOIN：源中已删除的残留索引行会被自动剔除，保证 total 与返回数一致
     const totalRow = dbRO.get(sql`
@@ -547,11 +732,21 @@ export function createMagnetDb(options = {}) {
     return { total, limit, offset, items: rows.map(mapRow) };
   }
 
-  /** 全量重建影子索引，返回索引文档数 */
-  function reindex() {
+  /**
+   * 在当前进程内同步执行全量重建。供 reindex worker 调用；
+   * 脚本 / 测试想跳过线程开销时也可直接用。
+   * @param {(p: { done: number, total: number }) => void} [onProgress]
+   * @returns {number} 索引文档数
+   */
+  function rebuildSync(onProgress) {
     const s = openSourceRO(sourcePath);
     try {
-      fullRebuild(db, s);
+      const total = Number(s.prepare(`SELECT count(*) AS c FROM ${TABLE}`).get()?.c ?? 0);
+      let done = 0;
+      fullRebuild(db, s, ({ rows }) => {
+        done += rows;
+        onProgress?.({ done, total });
+      });
     } finally {
       s.close();
     }
@@ -559,8 +754,28 @@ export function createMagnetDb(options = {}) {
     return Number(row?.c ?? 0);
   }
 
+  /**
+   * 全量重建影子索引（在独立 worker 线程中执行）。
+   * 重建是 CPU / 内存密集的同步长任务：放 worker 后既不阻塞事件循环，
+   * worker 触发 OOM 也只杀 worker，主进程的检索服务不受影响。
+   * @param {(p: { done: number, total: number }) => void} [onProgress] 进度回调
+   * @returns {Promise<number>} 索引文档数
+   */
+  function reindex(onProgress) {
+    // 已有重建在跑则复用同一个 promise（注意：第二个调用方的 onProgress 不会生效）
+    if (reindexPromise) return reindexPromise;
+    reindexPromise = spawnReindexWorker(onProgress).finally(() => {
+      reindexPromise = null;
+    });
+    return reindexPromise;
+  }
+
   /** 关闭连接 */
   function close() {
+    if (reindexWorker) {
+      reindexWorker.terminate();
+      reindexWorker = null;
+    }
     if (rdb.open) rdb.close();
     if (wdb.open) wdb.close();
   }
@@ -574,6 +789,7 @@ export function createMagnetDb(options = {}) {
     addKeywordFilter,
     removeKeywordFilter,
     reindex,
+    rebuildSync,
     close,
   };
 }
