@@ -135,6 +135,8 @@ DHT-search/
 
 ## 七、启动
 
+> **首次启动很慢，属正常**：首次运行会从源库（`sourceDbPath`，默认 `data/magnet.db`）全量构建搜索索引并写入索引库（`indexDbPath`，默认 `data/dht.search.db`）。数据量大时这一步可能耗时**几分钟到几十分钟**，期间程序在后台建索引、暂无明显响应，请勿误以为卡死或启动失败。索引库建好（存在 `data/dht.search.db`）后，后续启动会直接加载，几秒内即可提供服务。
+
 ### 普通启动
 ```bash
 npm start            # Node：node index.js
