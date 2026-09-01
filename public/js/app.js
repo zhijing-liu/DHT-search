@@ -830,6 +830,12 @@ initFromUrl();
 /** 输入框已为空：重置搜索状态、移除 URL 中的全部搜索参数、回到热词视图 */
 function handleInputCleared() {
   const hadSearch = !!state.query;
+  // 取消可能仍在进行中的搜索请求，并让其后到的响应自行丢弃，避免覆盖热词视图
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
+  reqSeq++;
   state.query = '';
   state.page = 1;
   state.tokens = [];

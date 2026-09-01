@@ -59,9 +59,12 @@ DHT-search/
 │   ├── db-driver.js          # 统一 SQLite 驱动适配层（Node/Bun 自动切换，抹平差异）
 │   ├── store.js              # 全局配置与共享约定（CONFIG、库路径、表名、排序白名单）
 │   ├── schema.js             # drizzle 表定义（magnets_docs / sync_meta，用于查询构造器）
-│   ├── reindex-worker.js     # Node 下全量重建的 worker 线程脚本
-│   ├── seed-filter.mjs       # 热词噪声词种子脚本（读 hot-filter-words.txt 入库）
-│   └── hot-filter-words.txt  # 噪声词清单（每行一词，# 开头为注释）
+│   └── reindex-worker.js     # Node 下全量重建的 worker 线程脚本
+├── scripts/                  # 运维 / 种子脚本（纯 Node 脚本，非运行时依赖）
+│   ├── seed-filter.mjs       # 热词噪声词种子：读 hot-filter-words.txt 入库（幂等）
+│   ├── hot-filter-words.txt  # 噪声词清单（每行一词，# 开头为注释）
+│   ├── dump-keywords.mjs     # 导出未黑名单化热词（纯 ASCII，按 doc_count 降序）供审阅
+│   └── filter-common-en.mjs  # 自动筛选宽泛英语热词候选，写入 hot-filter-en.auto.txt 供人工审阅
 ├── public/                   # 前端（原生 ES Module，无构建步骤）
 │   ├── index.html
 │   ├── css/
@@ -184,6 +187,8 @@ pm2 delete  <name>    # 删除
 | GET | `/api/hot/filter` | 热词过滤词列表 |
 | POST | `/api/hot/filter` | 新增过滤词，body `{ term }` |
 | DELETE | `/api/hot/filter?term=` | 删除过滤词 |
+| GET | `/api/hot/filter/export` | 导出热词过滤词为纯文本文件（附件下载，每行一词，含 `#` 头注释） |
+| POST | `/api/hot/filter/import` | 批量导入过滤词，body `{ terms: string[] }`，返回 `{ ok, accepted, total }` |
 | POST | `/api/reindex` | 全量重建索引，返回 `{ ok, indexed }` |
 
 ### `GET /api/search` 参数
@@ -200,16 +205,42 @@ pm2 delete  <name>    # 删除
 返回：`{ total, limit, offset, items: [{ id, name, infohash, magnet, files, totalSize, fetchedAt }], truncated? }`
 （`files` 为已解析的 `[{ path, size }]` 数组；整集拉取超出 `maxResults` 时带 `truncated: true`。）
 
-## 九、热词过滤词种子
+## 九、热词过滤词（黑名单）维护
 
-`src/hot-filter-words.txt` 每行一个噪声词（`#` 开头为注释），批量写入 `keyword_filter` 表（幂等）：
+热词过滤词（噪声词）从热词榜与统计中剔除，维护方式有三种：
+
+### 1. 种子脚本（`scripts/`）
+`scripts/hot-filter-words.txt` 每行一个噪声词（`#` 开头为注释），批量写入 `keyword_filter` 表（幂等，可重复运行）：
 
 ```bash
-npm run seed:filter          # 读 src/hot-filter-words.txt 入库
-# 也可通过 API 增删：
+npm run seed:filter          # 读 scripts/hot-filter-words.txt 入库
+```
+
+辅助脚本（不自动入库，仅供人工 / AI 审阅挑选）：
+- `scripts/dump-keywords.mjs`：导出「未黑名单化、纯 ASCII」热词（按 `doc_count` 降序）到 `scripts/hot-keywords-dump.txt`。
+- `scripts/filter-common-en.mjs`：自动筛选宽泛英语热词候选，写入 `scripts/hot-filter-en.auto.txt`（含命中原因注释）。
+
+### 2. HTTP API 增删 / 批量导入导出
+```bash
+# 单条增删
 curl -X POST localhost:3000/api/hot/filter -H 'content-type: application/json' -d '{"term":"foo"}'
 curl -X DELETE 'localhost:3000/api/hot/filter?term=foo'
+
+# 批量导入：terms 为字符串数组（每行一词）；空行 / # 注释 / 纯符号行会被忽略，幂等
+curl -X POST localhost:3000/api/hot/filter/import \
+  -H 'content-type: application/json' \
+  -d '{"terms":["foo","bar"]}'
+# 返回 {"ok":true,"accepted":2,"total":N}
+
+# 导出：返回 text/plain 附件（文件名 hot-filter-export.txt），可保存后再次导入
+curl -L localhost:3000/api/hot/filter/export -o hot-filter-export.txt
 ```
+导入 / 导出文件格式一致：每行一个词，`#` 开头为注释，支持「导出 → 编辑 → 回灌」工作流。
+
+### 3. Web 界面（黑名单面板）
+界面「黑名单」面板标题栏提供 **导入 / 导出** 两个图标按钮：
+- **导出**：浏览器直接下载当前黑名单为 `.txt`。
+- **导入**：选择 `.txt`（每行一词，支持 `#` 注释），批量写入并即时刷新热词榜。
 
 ## 十、测试
 
