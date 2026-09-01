@@ -31,6 +31,8 @@ let reqSeq = 0;
 let abortController = null;
 /** 是否正在搜索（蒙层显示中）：用于阻止重复请求 */
 let isSearching = false;
+/** 浏览器前进/后退还原期间置 true，期间所有 URL 更新只 replaceState，不新增历史记录 */
+let suppressPush = false;
 
 const el = {
   q: document.getElementById('q'),
@@ -527,7 +529,7 @@ function cancelSearch() {
 
 /* ---------- 真服务端分页：每次查询/排序/翻页都从后端按页拉取 ---------- */
 
-async function fetchPage() {
+async function fetchPage(historyMode = 'replace') {
   if (!state.query) return;
   const mySeq = ++reqSeq; // 丢弃过期响应，避免快速翻页时乱序覆盖
 
@@ -579,7 +581,7 @@ async function fetchPage() {
     el.pagerInfo.textContent = `共 ${total} 条结果`;
 
     renderPager(totalPages);
-    updateUrl();
+    updateUrl(historyMode);
   } catch (err) {
     if (mySeq !== reqSeq) return;
     setLoading(false);
@@ -590,8 +592,11 @@ async function fetchPage() {
 
 /* ---------- URL 状态同步 ---------- */
 
-/** 把当前 q / sortBy / order / page 写回地址栏，便于刷新保持与分享 */
-function updateUrl() {
+/** 把当前 q / sortBy / order / page 写回地址栏，便于刷新保持与分享。
+ *  historyMode='push' 时新增一条浏览器历史记录（搜索内容变化时）；
+ *  'replace'（默认）仅改写 URL，不新增历史（排序/筛选/翻页等保持同查询的变更）。 */
+function updateUrl(historyMode = 'replace') {
+  if (suppressPush) historyMode = 'replace';
   const params = new URLSearchParams();
   if (state.query) params.set('q', state.query);
   if (el.sortGroup.sortBy) params.set('sortBy', el.sortGroup.sortBy);
@@ -600,7 +605,9 @@ function updateUrl() {
   if (state.pageSize !== 20) params.set('pageSize', String(state.pageSize));
   if (el.sizeRange.value !== 'all') params.set('sizeRange', el.sizeRange.value);
   const qs = params.toString();
-  history.replaceState(null, '', qs ? `?${qs}` : location.pathname);
+  const url = qs ? `?${qs}` : location.pathname;
+  if (historyMode === 'push') history.pushState(null, '', url);
+  else history.replaceState(null, '', url);
 }
 
 /* ---------- 搜索 ---------- */
@@ -609,22 +616,27 @@ async function doSearch(resetPage = true) {
   // 蒙层显示中（请求进行中）忽略新的搜索触发，防止重复请求
   if (isSearching) return;
   closeSuggestions();
-  state.query = el.q.value.trim();
+  const newQuery = el.q.value.trim();
   syncClearBtn();
-  if (!state.query) {
+  if (!newQuery) {
     // 没有搜索内容时展示热词视图
     showToast('请输入搜索关键词');
     showHotWords();
     return;
   }
+  // 仅当搜索内容相比上一次发生变化时，才新增一条浏览器历史记录；
+  // 排序 / 筛选 / 翻页 / 刷新等保持同一查询的变更只改写 URL，不新增历史记录
+  const queryChanged = newQuery !== state.query;
   if (resetPage) state.page = 1;
+
+  state.query = newQuery;
 
   // 输入为 infohash 时走精确检索，否则走 FTS5 模糊检索并提取高亮 token
   const hashMode = isInfohash(state.query);
   state.tokens = hashMode ? [] : extractTokens(state.query);
 
   // 每次查询/排序变更都从后端按页拉取（真服务端分页）
-  await fetchPage();
+  await fetchPage(queryChanged ? 'push' : 'replace');
 }
 
 // 输入框值变化（失焦触发 change）：去除前后空格后有值则搜索，空值则回到热词视图
@@ -876,26 +888,63 @@ function applyPageSize(raw) {
   el.pageSize.value = String(n);
 }
 
-/* ---------- 从 URL 恢复视图（刷新/分享链接可还原） ---------- */
+/* ---------- 从 URL 恢复视图（刷新/分享链接可还原；前进/后退亦可还原） ---------- */
 
-function initFromUrl() {
+/** 读取地址栏参数（首次加载与浏览器前进/后退共用） */
+function readUrlParams() {
   const params = new URLSearchParams(location.search);
-  const q = params.get('q');
-  const sortBy = params.get('sortBy');
-  const order = params.get('order');
-  const page = params.get('page');
-  if (q) el.q.value = q;
-  if (sortBy) el.sortGroup.sortBy = sortBy;
-  if (order) el.sortGroup.order = order;
-  if (page) state.page = Math.max(1, parseInt(page, 10) || 1);
-  const ps = params.get('pageSize');
-  if (ps) applyPageSize(ps);
-  const sizeRange = params.get('sizeRange');
-  if (sizeRange && SIZE_RANGES.some((r) => r.value === sizeRange)) {
-    el.sizeRange.value = sizeRange;
-  }
-  if (q) doSearch(false); // 保留 URL 中的页码，不重置为第 1 页
+  return {
+    q: params.get('q'),
+    sortBy: params.get('sortBy'),
+    order: params.get('order'),
+    page: params.get('page'),
+    pageSize: params.get('pageSize'),
+    sizeRange: params.get('sizeRange'),
+  };
 }
+
+/** 把地址栏参数应用到控件与 state（不发起请求） */
+function applyUrlParams(p) {
+  if (p.q) el.q.value = p.q;
+  if (p.sortBy) el.sortGroup.sortBy = p.sortBy;
+  if (p.order) el.sortGroup.order = p.order;
+  if (p.page) state.page = Math.max(1, parseInt(p.page, 10) || 1);
+  if (p.pageSize) applyPageSize(p.pageSize);
+  if (p.sizeRange && SIZE_RANGES.some((r) => r.value === p.sizeRange)) {
+    el.sizeRange.value = p.sizeRange;
+  }
+  syncClearBtn();
+}
+
+/** 首次加载：从地址栏还原视图（不新增历史记录） */
+function initFromUrl() {
+  const p = readUrlParams();
+  applyUrlParams(p);
+  if (p.q) {
+    state.query = p.q; // 预置，避免首屏误判为「内容变化」而多压一条历史
+    doSearch(false); // 保留 URL 中的页码，不重置为第 1 页
+  }
+}
+
+/** 浏览器前进/后退：还原地址栏对应的搜索视图，但不新增历史记录 */
+function restoreFromUrl() {
+  const p = readUrlParams();
+  applyUrlParams(p);
+  suppressPush = true; // 还原期间禁止新增历史，避免把前进/后退本身又压成记录
+  if (p.q) {
+    state.query = p.q; // 预置，使 fetchPage 不误判为「内容变化」
+    state.tokens = isInfohash(p.q) ? [] : extractTokens(p.q);
+    fetchPage('replace');
+  } else {
+    state.query = '';
+    state.page = 1;
+    state.total = 0;
+    state.tokens = [];
+    showHotWords();
+  }
+  suppressPush = false;
+}
+window.addEventListener('popstate', restoreFromUrl);
 initFromUrl();
 
 /* ---------- 输入框清空：清空/删空后同步 URL 并回到热词视图 ---------- */
