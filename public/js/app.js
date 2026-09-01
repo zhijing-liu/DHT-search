@@ -10,10 +10,18 @@ const state = {
   tokens: [],
   /** 当前查询命中总数（仅用于计算总页数；数据每次从后端按页拉取） */
   total: 0,
+  /** 当前结果总页数（供页码跳转输入框校验） */
+  totalPages: 1,
   /** 热词数据：null=未加载；数组=已加载（无搜索内容时展示在结果区） */
   hotItems: null,
   /** 输入框下拉提示数据源：热词榜前 1000 个（供相似匹配） */
   hotSuggestions: [],
+  /** 关键词编辑模式：开启后热词可加入黑名单、并显示右侧黑名单列表 */
+  editMode: false,
+  /** 黑名单前端过滤关键字 */
+  blacklistFilter: '',
+  /** 完整黑名单缓存（用于前端过滤） */
+  blacklistItems: [],
 };
 
 /** 请求序号：防止快速翻页时旧请求后到覆盖新结果 */
@@ -36,8 +44,20 @@ const el = {
   loadingOverlay: document.getElementById('loadingOverlay'),
   cancelSearchBtn: document.getElementById('cancelSearchBtn'),
   pager: document.getElementById('pager'),
+  pagerRow: document.getElementById('pagerRow'),
   pagerInfo: document.getElementById('pagerInfo'),
   pageSize: document.getElementById('pageSize'),
+  jumpPage: document.getElementById('jumpPage'),
+  hotView: document.getElementById('hotView'),
+  editToggle: document.getElementById('editToggle'),
+  hotWords: document.getElementById('hotWords'),
+  blacklistPanel: document.getElementById('blacklistPanel'),
+  blacklistFilter: document.getElementById('blacklistFilter'),
+  blacklistList: document.getElementById('blacklistList'),
+  blacklistEmpty: document.getElementById('blacklistEmpty'),
+  blImportBtn: document.getElementById('blImportBtn'),
+  blExportBtn: document.getElementById('blExportBtn'),
+  blImportFile: document.getElementById('blImportFile'),
   sizeRange: document.getElementById('sizeRange'),
   countBadge: document.getElementById('countBadge'),
   suggestions: document.getElementById('suggestions'),
@@ -116,6 +136,8 @@ function renderEmpty(message) {
 }
 
 function renderResults(items) {
+  el.hotView.hidden = true;
+  el.results.hidden = false;
   el.results.replaceChildren();
   if (!items.length) {
     renderEmpty('没有找到匹配的结果');
@@ -128,36 +150,129 @@ function renderResults(items) {
 
 /* ---------- 热词（无搜索内容时的默认视图） ---------- */
 
-/** 把热词渲染为横向排列的气泡按钮，点击即触发对应关键词搜索 */
+/** 把热词渲染为横向排列的气泡按钮，点击即触发对应关键词搜索；
+ *  编辑模式下每个气泡右侧带关闭按钮，点击将关键词加入黑名单 */
 function renderHotWords(items) {
-  el.results.replaceChildren();
+  el.hotWords.replaceChildren();
   if (!items.length) {
-    renderEmpty('暂无热词数据');
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = '暂无热词数据';
+    el.hotWords.appendChild(empty);
     return;
   }
-  const wrap = document.createElement('div');
-  wrap.className = 'hot-words';
   for (const it of items) {
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'hot-chip';
     chip.textContent = it.term;
-    chip.title = `搜索「${it.term}」`;
-    chip.addEventListener('click', () => {
-      el.q.value = it.term;
-      doSearch();
-    });
-    wrap.appendChild(chip);
+    if (state.editMode) {
+      chip.title = `点击右侧 × 将「${it.term}」加入黑名单`;
+      chip.classList.add('editing');
+      const close = document.createElement('span');
+      close.className = 'chip-close';
+      close.setAttribute('aria-label', `将「${it.term}」加入黑名单`);
+      close.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      close.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        addToBlacklist(it.term);
+      });
+      chip.appendChild(close);
+    } else {
+      chip.title = `搜索「${it.term}」`;
+      chip.addEventListener('click', () => {
+        el.q.value = it.term;
+        doSearch();
+      });
+    }
+    el.hotWords.appendChild(chip);
   }
-  el.results.appendChild(wrap);
 }
 
 /** 渲染热词视图（无搜索内容时的默认视图，数据已就绪时调用） */
 function renderHotWordsView() {
   setLoading(false);
+  el.pagerRow.hidden = true;
   el.pager.hidden = true;
-  el.status.textContent = state.hotItems.length ? '热门关键词' : '';
-  renderHotWords(state.hotItems);
+  el.pagerInfo.textContent = '';
+  el.results.hidden = true;
+  el.hotView.hidden = false;
+  el.blacklistPanel.hidden = !state.editMode;
+  el.status.textContent = '';
+  renderHotWords(state.hotItems || []);
+}
+
+/* ---------- 黑名单（热词过滤词）管理 ---------- */
+
+/** 拉取并渲染黑名单列表 */
+async function fetchBlacklist() {
+  try {
+    const resp = await fetch('/api/hot/filter');
+    const data = await resp.json();
+    state.blacklistItems = resp.ok ? data.items || [] : [];
+    renderBlacklist(state.blacklistItems);
+  } catch {
+    state.blacklistItems = [];
+    renderBlacklist([]);
+  }
+}
+
+/** 渲染右侧黑名单列表（支持前端过滤） */
+function renderBlacklist(items) {
+  const filter = state.blacklistFilter;
+  const filtered = filter
+    ? items.filter((it) => String(it.term).toLowerCase().includes(filter))
+    : items;
+
+  el.blacklistList.replaceChildren();
+  el.blacklistEmpty.hidden = filtered.length > 0;
+  for (const it of filtered) {
+    const li = document.createElement('li');
+    li.className = 'bl-item';
+    const term = document.createElement('span');
+    term.className = 'bl-term';
+    term.textContent = it.term;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'bl-remove';
+    remove.setAttribute('aria-label', `将「${it.term}」移出黑名单`);
+    remove.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    remove.addEventListener('click', () => removeFromBlacklist(it.term));
+    li.append(term, remove);
+    el.blacklistList.appendChild(li);
+  }
+}
+
+/** 把关键词加入黑名单：从热词视图移除，并刷新黑名单列表 */
+async function addToBlacklist(term) {
+  try {
+    const resp = await fetch('/api/hot/filter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ term }),
+    });
+    if (!resp.ok) return;
+    state.hotItems = (state.hotItems || []).filter((h) => h.term !== term);
+    renderHotWords(state.hotItems);
+    if (state.editMode) await fetchBlacklist();
+  } catch {
+    /* 忽略网络错误 */
+  }
+}
+
+/** 把关键词从黑名单移除：刷新列表并重新拉取热词（被移除的词可能重新出现） */
+async function removeFromBlacklist(term) {
+  try {
+    const resp = await fetch(`/api/hot/filter?term=${encodeURIComponent(term)}`, { method: 'DELETE' });
+    if (!resp.ok) return;
+    await fetchBlacklist();
+    // 重新拉取热词榜，使被解除黑名单的词按热度重新出现
+    state.hotItems = null;
+    await loadHotData();
+  } catch {
+    /* 忽略网络错误 */
+  }
 }
 
 /** 无搜索内容时展示热词视图（数据未加载则先拉取） */
@@ -321,6 +436,13 @@ function selectSuggestion(term) {
 }
 
 function renderPager(totalPages) {
+  state.totalPages = totalPages;
+  if (el.jumpPage) {
+    el.jumpPage.max = totalPages;
+    el.jumpPage.value = '';
+    el.jumpPage.parentElement.hidden = totalPages <= 1;
+  }
+
   el.pager.innerHTML = '';
   if (totalPages <= 1) {
     el.pager.hidden = true;
@@ -346,8 +468,12 @@ function renderPager(totalPages) {
 
   el.pager.appendChild(mkBtn('上一页', state.page - 1, { disabled: state.page <= 1 }));
 
-  // 页码窗口：显示首尾页 + 当前页附近
-  const pageSet = new Set([1, totalPages, state.page - 1, state.page, state.page + 1]);
+  // 页码窗口：显示首尾两页 + 当前页前后各两页
+  const pageSet = new Set([
+    1, 2,
+    totalPages - 1, totalPages,
+    state.page - 2, state.page - 1, state.page, state.page + 1, state.page + 2,
+  ]);
   const pages = [...pageSet].filter((p) => p >= 1 && p <= totalPages).sort((a, b) => a - b);
   let prev = 0;
   for (const p of pages) {
@@ -432,6 +558,7 @@ async function fetchPage() {
     const from = total === 0 ? 0 : offset + 1;
     const to = Math.min(offset + pageSize, total);
     setLoading(false);
+    el.pagerRow.hidden = false;
     el.pagerInfo.textContent = `共 ${total} 条结果，第 ${state.page}/${totalPages} 页（${from}-${to}）`;
     el.status.textContent = '';
 
@@ -583,12 +710,95 @@ el.reindexBtn.addEventListener('click', doReindex);
 el.syncBtn.addEventListener('click', doSync);
 el.cancelSearchBtn.addEventListener('click', cancelSearch);
 
-/* ---------- 每页数量控件（10-200，自由输入） ---------- */
+/* ---------- 关键词编辑模式开关 ---------- */
+
+el.editToggle.addEventListener('change', () => {
+  state.editMode = el.editToggle.checked;
+  el.blacklistPanel.hidden = !state.editMode;
+  state.blacklistFilter = '';
+  el.blacklistFilter.value = '';
+  if (state.editMode) fetchBlacklist();
+  renderHotWords(state.hotItems || []);
+});
+
+/* 黑名单前端过滤 */
+el.blacklistFilter.addEventListener('input', () => {
+  state.blacklistFilter = el.blacklistFilter.value.trim().toLowerCase();
+  renderBlacklist(state.blacklistItems || []);
+});
+
+/* ---------- 黑名单导入 / 导出（图标按钮） ---------- */
+
+/** 导出：拉取后端导出的文本，触发浏览器下载 */
+el.blExportBtn.addEventListener('click', async () => {
+  try {
+    const resp = await fetch('/api/hot/filter/export');
+    if (!resp.ok) {
+      el.status.textContent = '导出失败';
+      return;
+    }
+    const text = await resp.text();
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `hot-filter-export-${new Date().toISOString().slice(0, 10)}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    el.status.textContent = '黑名单已导出';
+  } catch {
+    el.status.textContent = '导出出错';
+  }
+});
+
+/** 导入：选文件 -> 解析为词数组 -> 批量写入后端 */
+el.blImportBtn.addEventListener('click', () => el.blImportFile.click());
+el.blImportFile.addEventListener('change', async () => {
+  const file = el.blImportFile.files?.[0];
+  el.blImportFile.value = ''; // 允许重复选择同一文件
+  if (!file) return;
+  try {
+    el.blImportBtn.disabled = true;
+    const text = await file.text();
+    const terms = text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('#'));
+    const resp = await fetch('/api/hot/filter/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ terms }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      el.status.textContent = `导入失败：${data.error || resp.status}`;
+      return;
+    }
+    el.status.textContent = `已导入 ${data.accepted} 条（黑名单共 ${data.total} 条）`;
+    await fetchBlacklist();
+    // 重新拉取热词，使新过滤词立即生效
+    state.hotItems = null;
+    await loadHotData();
+  } catch (err) {
+    el.status.textContent = `导入出错：${err.message}`;
+  } finally {
+    el.blImportBtn.disabled = false;
+  }
+});
+
+/* ---------- 每页数量控件（固定下拉选项） ---------- */
+
+const PAGE_SIZE_OPTIONS = [10, 20, 30, 50, 100, 200];
 
 function applyPageSize(raw) {
   let n = parseInt(raw, 10);
   if (!Number.isFinite(n)) n = 20;
-  n = Math.min(200, Math.max(10, n));
+  // 归到最近的合法档位（URL 携带非标准值时也能正确落位）
+  n = PAGE_SIZE_OPTIONS.reduce((closest, opt) =>
+    Math.abs(opt - n) < Math.abs(closest - n) ? opt : closest
+  , PAGE_SIZE_OPTIONS[0]);
   state.pageSize = n;
   el.pageSize.value = String(n);
 }
@@ -664,6 +874,16 @@ el.pageSize.addEventListener('change', () => {
   state.page = 1; // 每页数量变化后回到第一页
   fetchPage();
 });
+
+// 页码跳转：回车跳转
+el.jumpPage.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  const page = parseInt(el.jumpPage.value, 10);
+  if (!Number.isFinite(page) || page < 1 || page > state.totalPages) return;
+  state.page = page;
+  fetchPage();
+});
+
 // 大小范围变化后重新搜索（仅在有查询词时；空查询回到热词视图）
 el.sizeRange.addEventListener('change', () => { if (state.query) doSearch(); });
 

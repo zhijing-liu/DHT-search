@@ -66,14 +66,55 @@
 
     <div id="status" class="status"></div>
 
-    <result-list id="results"></result-list>
+    <section id="hotView" class="hot-view" hidden>
+      <div class="hot-toolbar">
+        <span class="hot-title">热门关键词</span>
+        <label class="edit-switch" title="开启后可删除关键词 / 管理黑名单">
+          <span class="edit-label">关键词编辑</span>
+          <input type="checkbox" id="editToggle" />
+          <span class="edit-track"><span class="edit-thumb"></span></span>
+        </label>
+      </div>
+      <div class="hot-layout">
+        <div id="hotWords" class="hot-words"></div>
+        <aside id="blacklistPanel" class="blacklist-panel" hidden>
+          <div class="bl-head">
+            <h3 class="bl-title">黑名单</h3>
+            <div class="bl-actions">
+              <button id="blImportBtn" class="icon-btn" type="button" aria-label="导入黑名单" title="导入黑名单（.txt，每行一个词）">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              </button>
+              <button id="blExportBtn" class="icon-btn" type="button" aria-label="导出黑名单" title="导出黑名单为 .txt">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              </button>
+              <input id="blImportFile" type="file" accept=".txt,text/plain" hidden />
+            </div>
+          </div>
+          <input id="blacklistFilter" class="bl-filter" type="text" placeholder="过滤黑名单…" autocomplete="off" />
+          <ul id="blacklistList" class="bl-list"></ul>
+          <p id="blacklistEmpty" class="bl-empty">暂无黑名单词</p>
+        </aside>
+      </div>
+    </section>
 
-    <div class="pager-row">
+    <result-list id="results" hidden></result-list>
+
+    <div id="pagerRow" class="pager-row" hidden>
       <span id="pagerInfo" class="pager-info"></span>
       <nav id="pager" class="pager" hidden></nav>
+      <span class="page-jump">
+        跳至 <input id="jumpPage" type="number" min="1" value="" /> 页
+      </span>
       <label class="page-size">
         每页
-        <input id="pageSize" type="number" min="10" max="200" step="10" value="20" />
+        <select id="pageSize">
+          <option value="10">10</option>
+          <option value="20" selected>20</option>
+          <option value="30">30</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
         条
       </label>
     </div>

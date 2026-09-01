@@ -220,6 +220,33 @@ app.delete('/api/hot/filter', apiHandler((req, res) => {
   console.log(`[USER] 删除热词过滤词: "${term}"`);
 }, 500, 'remove filter failed'));
 
+/** 导出热词过滤词为文本文件（每行一个词，带 # 头注释） */
+app.get('/api/hot/filter/export', apiHandler((_req, res) => {
+  const items = api.listKeywordFilters();
+  const text = [
+    '# DHT Search 热词黑名单导出',
+    `# 共 ${items.length} 条，每行一个词；# 开头为注释`,
+    ...items.map((it) => it.term),
+  ].join('\n') + '\n';
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="hot-filter-export.txt"');
+  res.send(text);
+}, 500, 'export filter failed'));
+
+/** 批量导入热词过滤词（body: { terms: string[] }，每行一个词；幂等） */
+app.post('/api/hot/filter/import', apiHandler((req, res) => {
+  const terms = Array.isArray(req.body?.terms) ? req.body.terms : [];
+  let accepted = 0;
+  for (const raw of terms) {
+    const t = String(raw).trim().toLowerCase();
+    if (!t || t.startsWith('#') || !/[\p{L}\p{N}]/u.test(t)) continue; // 跳过空行 / # 注释 / 纯符号
+    api.addKeywordFilter(t);
+    accepted += 1;
+  }
+  const total = api.listKeywordFilters().length;
+  res.json({ ok: true, accepted, total });
+}, 500, 'import filter failed'));
+
 // 兜底错误处理，避免进程崩溃
 app.use((err, _req, res, _next) => {
   console.error(`[SYSTEM][error] 未捕获异常: ${err?.stack || err?.message || err}`);

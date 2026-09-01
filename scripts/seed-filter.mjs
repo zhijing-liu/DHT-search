@@ -7,7 +7,7 @@
  *
  * 用法：
  *   npm run seed:filter
- *   node src/seed-filter.mjs
+ *   node scripts/seed-filter.mjs
  *
  * 扩充过滤词：编辑 hot-filter-words.txt 追加行（支持 # 注释），
  * 再跑一次本脚本即可，重复的词不会重复写入。
@@ -15,8 +15,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { KEYWORD_FILTER_TABLE, DEFAULT_INDEX_DB_PATH } from './store.js';
-import { openDatabase, setPragma, execRaw, prepareStmt, runStmt, transaction, closeDb, getRow } from './db-driver.js';
+import { KEYWORD_FILTER_TABLE, DEFAULT_INDEX_DB_PATH } from '../src/store.js';
+import { openDatabase, setPragma, execRaw, prepareStmt, runStmt, transaction, closeDb, getRow } from '../src/db-driver.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORDS_FILE = path.join(HERE, 'hot-filter-words.txt');
