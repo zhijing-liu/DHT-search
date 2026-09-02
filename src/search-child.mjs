@@ -29,12 +29,25 @@ const indexPath = resolveDbPath(
     DEFAULT_INDEX_DB_PATH
 );
 
+/**
+ * 本进程的内存配额（来自 config.js，缺省值与其保持一致）：
+ *   - cacheSizeKb：SQLite page cache，是**每个进程一份**的私有内存；
+ *   - mmapSizeMb ：mmap 窗口，映射共享 clean page，多进程读同一库不重复占用，
+ *                  且可被 OS 回收，故同样的预算给 mmap 比给 page cache 划算。
+ * 检索是分页的（单次 ≤ MAX_LIMIT 条），工作集很小，默认「小 cache + 中等 mmap」。
+ */
+const CACHE_SIZE_KB =
+  Number(CONFIG.searchProcessCacheSizeKb) > 0 ? Math.trunc(Number(CONFIG.searchProcessCacheSizeKb)) : 2048;
+const MMAP_SIZE_MB =
+  Number(CONFIG.searchProcessMmapSizeMb) >= 0 ? Math.trunc(Number(CONFIG.searchProcessMmapSizeMb)) : 32;
+
 // 只读连接：与主进程查询连接同构；query_only 杜绝误写，busy_timeout 等待重建写锁
 const rdb = openDatabase(indexPath, { readonly: true });
 setPragma(rdb, 'query_only', 'ON');
 setPragma(rdb, 'busy_timeout', 5000);
-setPragma(rdb, 'cache_size', -32000);
-setPragma(rdb, 'mmap_size', 134217728);
+// SQLite 的 cache_size 负数值单位才是 KiB，故这里取负
+setPragma(rdb, 'cache_size', -CACHE_SIZE_KB);
+setPragma(rdb, 'mmap_size', MMAP_SIZE_MB * 1024 * 1024);
 const dbRO = createDrizzle(rdb);
 
 const { searchMagnetsSync } = buildSearchApi(dbRO);

@@ -45,6 +45,32 @@ DHT Search 把一个由外部程序（如 DHT 爬虫）持续写入的「源库�
 | Node | `better-sqlite3` + `drizzle-orm/better-sqlite3` | 独立 **worker 线程**（OOM 只杀 worker，主进程不受影响） |
 | Bun | `bun:sqlite` + `drizzle-orm/bun-sqlite` | 同进程同步（仍保持 Promise 形态） |
 
+### 搜索执行模型（按需子进程）
+检索放在**独立子进程**中执行——不是为了并发能力，而是为了「客户端断开即停」：
+`better-sqlite3` / `bun:sqlite` 都是同步 API，一条查询会把执行单元阻塞在 C++ 里，
+而 `worker.terminate()` 的终止标志要等执行权回到 JS 才被检查，卡在原生调用里的
+查询根本收不到信号（实测：Node 下 terminate 到退出 23328ms，Bun 下 6s 后仍存活）。
+只有操作系统级的 `SIGKILL` 能真正中断，而线程无法被 OS 单独杀掉——所以执行单元
+只能是进程。
+
+进程是**按需 fork** 的，而非常驻：
+
+| 时机 | 行为 |
+|------|------|
+| 服务启动 | **0 个**进程，不占额外内存 |
+| 查询到来 | 复用空闲进程；没有且未达 `searchMaxProcesses` 才 fork |
+| 进程全忙 | 新查询进等待队列（FIFO），不新建进程 |
+| 客户端断开 | `SIGKILL` 该进程并移除（**不补位**），下次查询按需再 fork |
+| 空闲超时 | 超过 `searchProcessIdleMs` 后回收，进程数回到 0 |
+
+取消能力分两级，完整覆盖：**排队中** → 从队列直接移除（零成本）；**已派发** →
+`SIGKILL` 真正中断正在执行的同步查询。
+
+> 注：检索是分页的（单次 ≤ `MAX_LIMIT` 200 条），单个进程的内存需求很低，
+> 子进程的 PRAGMA 已按此调优（`cache_size = -2000`、`mmap_size = 32MB`）。
+> 进程内存的大头是运行时基线本身（Bun ~60-120MB），因此降低内存的主要手段是
+> **减少进程数**，而不是压 PRAGMA。
+
 ## 三、项目结构
 
 ```
@@ -94,7 +120,7 @@ DHT-search/
 - **热门关键词榜**：构建索引时统计 `name` 中的合格 token（去单字、去纯数字、去噪声词），按文档频率降序。
 - **热词过滤词**：用户可维护噪声词清单（经 `seed-filter.mjs` 或 API），从热词榜与统计中剔除。
 - **输入联想**：基于热词的「完全相等 > 前缀 > 包含 > 模糊（Levenshtein）」分级匹配。
-- **搜索缓存**：进程内 LRU 缓存，按序列化字节数限内存、按 TTL 过期（默认 256MB / 1h）。
+- **搜索缓存**：进程内 LRU 缓存，存序列化后的 JSON 字符串（命中时直接回写，零 stringify），按字节数限内存、按 TTL 过期（默认 32MB / 1h）。整集拉取（`limit=all`）的结果不进缓存。
 - **在线重建**：`reindex()` 全量重建在 worker 线程（Node）或同进程（Bun）执行，重建期间检索仍可用；运行期按 `syncIntervalMs` 自动增量补录。
 - **零前端构建**：纯原生 ES Module + 自定义元素 + Shadow DOM，直接用浏览器加载。
 - **RPC 推送**：结果卡片「推送」按钮可将磁力链接经 JSON-RPC 2.0（`aria2.addUri`）推送到 aria2 / Motrix 下载器；地址与密钥在「设置」中配置，密钥按 aria2 约定以 `token:` 前缀发送。
@@ -108,11 +134,18 @@ DHT-search/
 | `sourceDbPath` | `data/magnet.db` | 源库路径（含 `magnets` 表） |
 | `indexDbPath` | `data/dht.search.db` | 影子索引库路径 |
 | `port` | `3000` | HTTP 服务端口 |
-| `maxResults` | `20000` | 「整集拉取」（limit=0/`all`）单次返回上限，超出标记 `truncated` |
+| `maxResults` | `2000` | 「整集拉取」（`limit=all`）单次返回上限，超出标记 `truncated` |
 | `reindexMaxOldSpaceMb` | `2048` | Node 下重建 worker 的堆上限（MB），触顶只杀 worker |
 | `reindexTimeoutMs` | `0` | 重建超时（ms），`0` 表示不限制 |
-| `searchCacheMaxSizeMb` | `256` | 搜索缓存最大占用内存（MB） |
+| `searchCacheMaxSizeMb` | `32` | 搜索缓存最大占用内存（MB）；缓存存序列化后的 JSON 字符串，故该值 ≈ 实际堆占用 |
 | `searchCacheTtlMs` | `3600000` | 搜索缓存 TTL（ms，默认 1 小时） |
+| `searchMaxProcesses` | `2` | 最大并发搜索进程数（按需 fork，服务启动时常驻 0 个） |
+| `searchProcessCacheSizeKb` | `2048` | 每个搜索子进程的 SQLite page cache（KiB）——**每进程一份**的私有内存，总额 = 本值 × `searchMaxProcesses` |
+| `searchProcessMmapSizeMb` | `32` | 每个搜索子进程的 mmap 窗口（MB）——映射共享 clean page，多进程读同一库不重复占用，可给相对大的值；`0` 关闭 |
+| `searchProcessRecycleImmediate` | `false` | 查询完成**立即回收**进程；`true` 时空闲恒为 0 个进程，但每次查询都要重付 fork 冷启动（约 1s） |
+| `searchProcessIdleMs` | `60000` | 搜索进程空闲多久后回收（ms），空闲足够久后进程数回到 0；`0` 关闭回收。**仅在 `searchProcessRecycleImmediate = false` 时生效** |
+| `searchQueueMax` | `16` | 搜索等待队列上限：进程全忙时新查询排队，超出快速失败 |
+| `searchQueueTimeoutMs` | `10000` | 排队超时（ms），超时快速失败；`0` 不限时 |
 | `syncIntervalMs` | `3600000` | 运行期自动增量同步间隔（ms，默认 1 小时；`0` 关闭） |
 
 路径解析优先级：**显式参数 > config.js > 环境变量（`DHT_DB_PATH` / `DHT_INDEX_DB_PATH`）> 模块默认值**。
@@ -198,7 +231,7 @@ pm2 delete  <name>    # 删除
 | `q` | 必填，搜索关键词（至少一个字母/数字） |
 | `sortBy` | `fetchedAt` / `totalSize` / `relevance`；其他值忽略（按 id 排序） |
 | `order` | `asc` / `desc`，默认 `desc`，仅 `sortBy` 传入时生效 |
-| `limit` | 每页条数（钳制 1..200）；`0` 或 `all` 表示整集拉取 |
+| `limit` | 每页条数（钳制 1..200，缺省 20）；**仅 `all` 表示整集拉取**，`0` / 负数 / 非数值一律按分页处理 |
 | `offset` | 分页偏移 |
 | `minSize` / `maxSize` | 体积区间（字节）过滤 |
 | `by` | `hash` 时按 infohash 精确检索（其余走 FTS5 模糊） |

@@ -133,17 +133,27 @@ function clampInt(value, fallback, min, max) {
 
 /**
  * 归一化 limit。
- * - 缺省 / null / 'all' / 空串 / 数值 <= 0  -> -1，表示「整集拉取」（受 WHOLESET_CAP 截断）
- * - 非数值（如 'abc'）                      -> DEFAULT_LIMIT
- * - 其余                                    -> 钳制到 [1, MAX_LIMIT]
+ * - 'all' / 数字 -1   -> -1，表示「整集拉取」（受 WHOLESET_CAP 截断）。
+ *                        数字 -1 是内部标记，必须原样返回以保证本函数幂等；
+ *                        字符串 '-1' 则按用户输入处理，归入下面的「<= 0 → 分页」。
+ * - 缺省 / null / 非数值 / <= 0  -> DEFAULT_LIMIT（默认分页）
+ * - 其余                         -> 钳制到 [1, MAX_LIMIT]
+ *
+ * 「整集拉取」是显式 opt-in，只有 limit=all 才触发。
+ * 旧行为把「不传 limit」也当作整集拉取，一次就能拉回上万条完整记录（含 files），
+ * 是内存峰值的主要来源；改为默认分页后，单次查询结果规模由 MAX_LIMIT 硬保证，
+ * 内存预算才有确定性。
  */
 function toLimit(value) {
-  if (value === undefined || value === null) return -1;
+  if (value === undefined || value === null) return DEFAULT_LIMIT;
+  // -1 是「整集拉取」的内部标记（由本函数或 'all' 产生），必须原样保留：
+  // normalizeSearchQuery 是幂等的、各层会重复调用它，若把 -1 当成「负数 → 分页」，
+  // 则 HTTP 层归一化出的 -1 传到搜索子进程再归一化一次就会静默退化成分页。
+  if (value === -1) return -1;
   const text = String(value).trim().toLowerCase();
   if (text === 'all') return -1;
   const num = Number(text);
-  if (!Number.isFinite(num)) return DEFAULT_LIMIT;
-  if (num <= 0) return -1;
+  if (!Number.isFinite(num) || num <= 0) return DEFAULT_LIMIT;
   return clampInt(num, DEFAULT_LIMIT, 1, MAX_LIMIT);
 }
 
@@ -497,20 +507,20 @@ function syncIndex(db, src, onFlush) {
 /**
  * 检索逻辑工厂：接收「只读数据库连接（drizzle 包装）」，返回同步检索函数。
  *
- * 主线程在 createMagnetDb 内用它构建查询 API；搜索 worker 线程也用它（各自持有独立的
+ * 主线程在 createMagnetDb 内用它构建查询 API；搜索子进程也用它（各自持有独立的
  * 只读连接）构建同样的逻辑——从而 Bun / Node 共用同一套实现，无需 isBun 分支。
  *
  * 重要：better-sqlite3 / bun:sqlite 均为同步 API，单条 SQL 执行期间会阻塞事件循环，
  * 无法被 JS 中途打断。因此「客户端断开即停止」不能在本函数内实现，而由 HTTP 层把查询
- * 放进独立 worker 线程、断开时 worker.terminate() 杀掉整个线程来完成（见 src/searchPool.js）。
+ * 放进独立子进程、断开时 SIGKILL 掉整个进程来完成（见 src/searchPool.js）——
+ * 这也是搜索执行单元只能是进程而非线程的原因：线程的 terminate() 无法中断
+ * 卡在原生调用里的查询，只有操作系统级的 kill 可以。
  * 本函数只负责把结果查出来，并对整集拉取做内存上限保护（WHOLESET_CAP）。
  *
  * @param {object} dbRO drizzle-orm 包装的只读连接，提供 .all() 执行 SELECT
  * @returns {{ searchMagnetsSync: Function }}
  */
 export function buildSearchApi(dbRO) {
-  /** 整集拉取（limit<=0 / 不传）时的单轮分页大小：够大以减少 SQL 往返，又限制单次内存 */
-  const CHUNK_SIZE = 2000;
   /** 整集拉取安全上限（与 config.js 的 MAX_RESULTS 对齐，配置缺失则回退 20000） */
   const WHOLESET_CAP =
     Number.isFinite(Number(MAX_RESULTS)) && Number(MAX_RESULTS) > 0 ? Number(MAX_RESULTS) : 20000;
@@ -592,24 +602,20 @@ export function buildSearchApi(dbRO) {
   }
 
   /**
-   * 同步检索：先 count 再取页（或整集分批取数），一次性返回。测试与搜索 worker 均使用此函数。
-   * 整集拉取（归一化后 limit = -1）按 CHUNK_SIZE 分批取数并限制到 WHOLESET_CAP，避免一次性
-   * 把百万级结果全部载入内存；worker 线程在执行期间若被主线程 terminate，整个线程直接被杀，
-   * 无需本函数干预。
+   * 同步检索：先 count 再取页（整集拉取则一次取到 CAP），一次性返回。测试与搜索子进程均使用此函数。
+   * 整集拉取（归一化后 limit = -1）限制到 WHOLESET_CAP，避免把百万级结果全部载入内存；
+   * 子进程在执行期间若被主进程 SIGKILL，整个进程由操作系统回收，无需本函数干预。
    */
   function searchMagnetsSync(options) {
     const { buildCount, buildPage, wholeSet, effLimit, effOffset } = prepareSearch(options);
     const total = Number(dbRO.all(buildCount())[0]?.total ?? 0);
     if (wholeSet) {
-      const items = [];
-      let offset = 0;
-      while (items.length < WHOLESET_CAP) {
-        const page = dbRO.all(buildPage(CHUNK_SIZE, offset)).map(mapRow);
-        for (const row of page) items.push(row);
-        if (page.length < CHUNK_SIZE) break;
-        offset += CHUNK_SIZE;
-      }
-      const truncated = total > WHOLESET_CAP || items.length >= WHOLESET_CAP;
+      // 一次性取到 CAP 上限，只排一次序。
+      // 原实现按 OFFSET 分批翻页，但 ORDER BY 带 bm25 时每一轮都要把整个匹配集
+      // 重新排序一遍再丢弃前 n 行——取满 CAP 要重排 CAP/CHUNK 轮，是纯粹的浪费。
+      const items = dbRO.all(buildPage(WHOLESET_CAP + 1, 0)).map(mapRow);
+      const truncated = total > WHOLESET_CAP || items.length > WHOLESET_CAP;
+      if (items.length > WHOLESET_CAP) items.length = WHOLESET_CAP;
       return { total, limit: 'all', offset: 0, items, truncated };
     }
     const items = total ? dbRO.all(buildPage(effLimit, effOffset)).map(mapRow) : [];
@@ -695,8 +701,12 @@ export function createMagnetDb(options = {}) {
   setPragma(rdb, 'query_only', 'ON');
   // 重建在 worker 线程并发进行，读连接遇到写锁要等待而不是立刻抛 SQLITE_BUSY
   setPragma(rdb, 'busy_timeout', 5000);
-  setPragma(rdb, 'cache_size', -32000);
-  setPragma(rdb, 'mmap_size', 134217728);
+  // 主进程这条只读连接只服务 countMagnets / 热词榜等轻量查询，固定取「小 cache +
+  // 中等 mmap」即可，且它的开销不随并发进程数放大。
+  // 搜索子进程的同类配额见 config.js 的 SEARCH_PROCESS_CACHE_SIZE_KB /
+  // SEARCH_PROCESS_MMAP_SIZE_MB —— 那些是「每个进程一份」，会随并发数线性放大。
+  setPragma(rdb, 'cache_size', -2000);
+  setPragma(rdb, 'mmap_size', 33554432);
   const dbRO = createDrizzle(rdb);
 
   // reindex worker 的堆上限与超时；超时传 0 表示不限时

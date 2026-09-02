@@ -23,6 +23,13 @@ import {
   SEARCH_CACHE_MAX_SIZE_MB,
   SEARCH_CACHE_TTL_MS,
   SYNC_INTERVAL_MS,
+  SEARCH_MAX_PROCESSES,
+  SEARCH_PROCESS_CACHE_SIZE_KB,
+  SEARCH_PROCESS_MMAP_SIZE_MB,
+  SEARCH_PROCESS_RECYCLE_IMMEDIATE,
+  SEARCH_PROCESS_IDLE_MS,
+  SEARCH_QUEUE_MAX,
+  SEARCH_QUEUE_TIMEOUT_MS,
 } from '../config.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -45,6 +52,13 @@ export const CONFIG = {
   searchCacheMaxSizeMb: SEARCH_CACHE_MAX_SIZE_MB,
   searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
   syncIntervalMs: SYNC_INTERVAL_MS,
+  searchMaxProcesses: SEARCH_MAX_PROCESSES,
+  searchProcessCacheSizeKb: SEARCH_PROCESS_CACHE_SIZE_KB,
+  searchProcessMmapSizeMb: SEARCH_PROCESS_MMAP_SIZE_MB,
+  searchProcessRecycleImmediate: SEARCH_PROCESS_RECYCLE_IMMEDIATE,
+  searchProcessIdleMs: SEARCH_PROCESS_IDLE_MS,
+  searchQueueMax: SEARCH_QUEUE_MAX,
+  searchQueueTimeoutMs: SEARCH_QUEUE_TIMEOUT_MS,
 };
 
 /** 把配置里的库路径解析为绝对路径：绝对路径原样使用，相对路径基于项目根目录 */

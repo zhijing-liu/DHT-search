@@ -10,8 +10,8 @@
  *   q        必填，搜索关键词
  *   sortBy   可选 'fetchedAt' | 'totalSize' | 'relevance'（其余值忽略，按 id 排序）
  *   order    可选 'asc' | 'desc'，默认 desc，仅 sortBy 传入时生效
- *   limit    可选；不传 / 传 0 / 传 'all' 均表示「整集拉取」（一次性返回全部匹配，
- *            上限 MAX_RESULTS）；传正数表示普通分页（非数值回退 20，钳制 1..200）
+ *   limit    可选；默认分页（每页 20 条，钳制 1..200）。仅传 'all' 表示「整集拉取」
+ *            （一次性返回全部匹配，上限 MAX_RESULTS）；0 / 负数 / 非数值一律按分页处理
  *   offset   可选，分页偏移（默认 0）
  * 返回：{ total, limit, offset, items, truncated? }
  */
@@ -34,14 +34,27 @@ const api = createMagnetDb();
 
 // 搜索子进程池：检索在独立进程中执行，客户端断开时 SIGKILL 该进程即可真正中断查询
 // （worker 线程的 terminate() 无法中断同步原生查询，详见 src/searchPool.js 文件头）。
+// 进程按需 fork：启动时 0 个，第一个查询到来才启动，客户端断开或空闲超时后回收，
+// 上限由 config.js 的 SEARCH_MAX_PROCESSES 控制。
 // 必须在 createMagnetDb() 之后创建——此时索引库文件已就绪，子进程才能以只读方式打开。
-const searchExecutor = createSearchExecutor(undefined, api.indexPath);
+const searchExecutor = createSearchExecutor({
+  maxProcesses: CONFIG.searchMaxProcesses,
+  recycleImmediate: CONFIG.searchProcessRecycleImmediate,
+  idleMs: CONFIG.searchProcessIdleMs,
+  queueMax: CONFIG.searchQueueMax,
+  queueTimeoutMs: CONFIG.searchQueueTimeoutMs,
+  indexPath: api.indexPath,
+});
 
 /* ------------------------------------------------------------------ */
 /* 搜索结果内存缓存                                                    */
 /* ------------------------------------------------------------------ */
 /**
  * 进程内搜索缓存：以「最大内存占用 + 每条 TTL」双约束淘汰。
+ *  - 存的是**序列化后的 JSON 字符串**而非对象：对象的堆占用约为 JSON 字节数的
+ *    3~5 倍（隐藏类指针、UTF-16 String、重复的 files 键名），存字符串让
+ *    SEARCH_CACHE_MAX_SIZE_MB 的配额 ≈ 实际堆占用，命中时也可直接 res.send 省掉
+ *    一次完整 stringify；
  *  - maxSize + sizeCalculation：按序列化后字节数限制总内存（空间约束）；
  *  - ttl + updateAgeOnGet：每条缓存独立计时，被访问即刷新 TTL；
  *    默认 1 小时，经 config.js 的 SEARCH_CACHE_TTL_MS 覆盖；
@@ -56,7 +69,8 @@ const SEARCH_CACHE_TTL_MS =
 
 const searchCache = new LRUCache({
   maxSize: SEARCH_CACHE_MAX_SIZE,
-  sizeCalculation: (value) => Buffer.byteLength(JSON.stringify(value)),
+  // 缓存值是序列化后的字符串，其字节长度即堆占用，无需再 stringify 一次去估算
+  sizeCalculation: (body) => Buffer.byteLength(body),
   ttl: SEARCH_CACHE_TTL_MS,
   updateAgeOnGet: true,
   ttlAutopurge: true,
@@ -129,7 +143,9 @@ app.get('/api/search', apiHandler(async (req, res) => {
   const cached = searchCache.get(key);
   if (cached) {
     log.cache('HIT', describeSearch(s));
-    return res.json(cached);
+    // 缓存里已是序列化好的 JSON 字符串，直接回写，省掉一次完整 stringify
+    res.type('application/json');
+    return res.send(cached);
   }
   log.cache('MISS', describeSearch(s));
 
@@ -151,7 +167,8 @@ app.get('/api/search', apiHandler(async (req, res) => {
   const onClose = () => {
     if (aborted) return;
     aborted = true;
-    job.terminate();
+    // 仍在队列中 → 零成本移除；已派发 → SIGKILL 该进程。两者由 cancel() 内部判别
+    job.cancel();
   };
   req.on('close', onClose);
   res.on('close', onClose);
@@ -160,22 +177,23 @@ app.get('/api/search', apiHandler(async (req, res) => {
     const result = await job.done;
     req.off('close', onClose);
     res.off('close', onClose);
-    job.release();
     // 竞态：结果已产出，但客户端恰在此刻断开——丢弃结果，不缓存也不响应
     if (aborted) {
       logCancelled();
       return;
     }
-    searchCache.set(key, result);
+    const body = JSON.stringify(result);
+    // 整集拉取（limit=all）的结果体量远大于分页结果，不进缓存，
+    // 避免一次请求就把整个缓存预算吃掉
+    if (s.limit !== -1) searchCache.set(key, body);
     try {
-      res.json(result);
+      res.type('application/json').send(body);
     } catch {
       /* 响应已关闭，忽略写入异常 */
     }
   } catch (e) {
     req.off('close', onClose);
     res.off('close', onClose);
-    job.release();
     if (aborted) {
       logCancelled();
       return;

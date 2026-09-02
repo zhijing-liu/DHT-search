@@ -10,7 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { sql } from 'drizzle-orm';
-import { createMagnetDb } from '../src/db.js';
+import { createMagnetDb, normalizeSearchQuery } from '../src/db.js';
 import { MAX_LIMIT } from '../src/store.js';
 import { openDatabase, setPragma, execRaw, closeDb } from '../src/db-driver.js';
 
@@ -265,6 +265,42 @@ console.log('\n[5] 分页');
   check('offset 负数被钳制到 0', () => {
     const r = api.searchMagnets({ query: 'brunette', offset: -5 });
     assert.equal(r.offset, 0);
+  });
+  // 「整集拉取」是显式 opt-in：只有 limit=all 才触发。
+  // 不传 / 0 / 负数一律回退分页，避免一次请求拉回上万条完整记录撑爆内存。
+  check('不传 limit 走分页（回退 20）而非整集拉取', () => {
+    const r = api.searchMagnets({ query: 'brunette' });
+    assert.equal(r.limit, 20);
+  });
+  check('limit=0 按分页处理（不再是整集拉取）', () => {
+    assert.equal(api.searchMagnets({ query: 'brunette', limit: 0 }).limit, 20);
+  });
+  // 注意：数字 -1 是「整集拉取」的内部标记（须原样传递以保证幂等），
+  // 故这里用字符串 '-1' 与 -5 代表真实用户输入的负数。
+  check("limit='-1'（字符串，用户输入）按分页处理", () => {
+    assert.equal(api.searchMagnets({ query: 'brunette', limit: '-1' }).limit, 20);
+  });
+  check('limit=-5 按分页处理', () => {
+    assert.equal(api.searchMagnets({ query: 'brunette', limit: -5 }).limit, 20);
+  });
+  check('limit=all 才是整集拉取（limit 字段为 "all"）', () => {
+    const r = api.searchMagnets({ query: 'brunette', limit: 'all' });
+    assert.equal(r.limit, 'all');
+    assert.deepEqual(r.items.map((i) => i.id), [4, 1]);
+    assert.equal(r.truncated, false);
+  });
+  // normalizeSearchQuery 必须幂等：HTTP 层归一化出的参数会再被搜索子进程归一化一次。
+  // 若「整集拉取」标记 -1 在二次调用时被当成「负数 → 分页」，limit=all 会静默失效。
+  check('normalizeSearchQuery 幂等：limit=all 二次调用仍为 -1', () => {
+    const once = normalizeSearchQuery({ query: 'brunette', limit: 'all' });
+    assert.equal(once.limit, -1);
+    assert.equal(normalizeSearchQuery(once).limit, -1);
+  });
+  check('normalizeSearchQuery 幂等：普通分页参数二次调用不变', () => {
+    const once = normalizeSearchQuery({
+      query: 'brunette', limit: 5, offset: 2, sortBy: 'totalSize', order: 'asc',
+    });
+    assert.deepEqual(normalizeSearchQuery(once), once);
   });
   api.close();
 }
