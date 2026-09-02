@@ -46,6 +46,7 @@ import {
   runStmt,
   transaction,
   closeDb,
+  execRaw,
 } from './db-driver.js';
 import { sql, eq, count } from 'drizzle-orm';
 import { magnetsDocs, syncMeta } from './schema.js';
@@ -415,6 +416,18 @@ function optimizeFts(db, level = 4) {
 }
 
 /**
+ * 把 WAL 合并回主库并截断（TRUNCATE），避免 -wal 文件无限增长拖慢读查询。
+ * WAL 模式下写操作先追加到 -wal，读查询要「主库 + WAL」合并读，-wal 越大读越慢；
+ * 正常关闭连接会自动 checkpoint，但进程被强杀（SIGKILL）时不会，导致 -wal 累积。
+ * 故在每次写操作收尾时主动执行一次（此时无并发写，TRUNCATE 所需的独占锁立即可得）。
+ * 仅在写连接上调用（db 为 drizzle 可写实例）。
+ */
+function checkpointWAL(db) {
+  const raw = db.$client ?? db.session?.client;
+  execRaw(raw, 'PRAGMA wal_checkpoint(TRUNCATE)');
+}
+
+/**
  * 全量重建：按 id 分段扫描源库灌入所有行，最后增量合并索引段。
  *
  * 建表 DDL 整体包在一个事务里：重建与查询是并发的（reindex() 在 worker 线程执行），
@@ -466,6 +479,7 @@ function fullRebuild(db, src, onFlush) {
   setMeta(db, 'tokenizer', TOKENIZER);
   setMeta(db, 'last_rowid', String(maxSourceId(src)));
   optimizeFts(db);
+  checkpointWAL(db);
 }
 
 /**
@@ -488,6 +502,7 @@ function syncIndex(db, src, onFlush) {
     populate(db, scanById(src, { from: last, size: REBUILD_BATCH }), onFlush);
     setMeta(db, 'last_rowid', String(max));
     optimizeFts(db);
+    checkpointWAL(db);
   }
 }
 
@@ -524,6 +539,16 @@ export function buildSearchApi(dbRO) {
   /** 整集拉取安全上限（与 config.js 的 MAX_RESULTS 对齐，配置缺失则回退 20000） */
   const WHOLESET_CAP =
     Number.isFinite(Number(MAX_RESULTS)) && Number(MAX_RESULTS) > 0 ? Number(MAX_RESULTS) : 20000;
+
+  /**
+   * 匹配数超过该值才启用「索引反转驱动」做 totalSize/fetchedAt 排序。
+   * 反转驱动从二级索引倒序扫、逐个用 EXISTS 校验 FTS 匹配，凑够 LIMIT 个就停，
+   * 避免「JOIN 全部匹配行再全量排序」。实测（热 cache）：movie 9513 快 5 倍、
+   * 111 30167 快 1.8 倍，但 mp4 208247 反而慢 12%——EXISTS 的逐行 FTS 校验代价随
+   * 倒排列表大小增长，超大匹配时不划算。故设此下限：非精确词（>5000）走反转，
+   * 精确词（≤5000）匹配本就少，直接 JOIN 更快。
+   */
+  const INDEX_SCAN_MIN_TOTAL = 5000;
 
   /**
    * 构造大小筛选片段（值已由 normalizeSearchQuery 校验为「有限非负」或 undefined）。
@@ -579,7 +604,13 @@ export function buildSearchApi(dbRO) {
 
   /**
    * 由归一化参数构造 count / 分页 SQL 工厂。
-   * 两种检索模式的差异只有「是否 JOIN FTS 表 + 匹配条件」，其余拼装完全共用一份。
+   * 两种检索模式的差异只有「是否 JOIN FTS 表 + 匹配条件」，其余拼装基本共用。
+   *
+   * 两条针对宽泛词（匹配数上万）的性能优化，实测数据见下：
+   *  - count：FTS 且无大小筛选时直接查 FTS 虚表，省掉「每个匹配 rowid 回 docs 做一次
+   *    主键查找」的开销（the 词 8.1 万匹配：1241ms → 23ms）；
+   *  - page：FTS + 无大小筛选 + 默认 id 排序时，用子查询预取 rowid 再 JOIN，
+   *    利用 FTS5 对 rowid 有序输出的提前终止，只 JOIN 需要的行（234ms → 24ms）。
    */
   function prepareSearch(options) {
     const s = normalizeSearchQuery(options);
@@ -588,13 +619,56 @@ export function buildSearchApi(dbRO) {
       FROM ${sql.raw(DOCS_TABLE)} m ${join}
       WHERE ${cond}${buildSizeCond(s)}
     `;
+    const hasSize = s.minSize !== undefined || s.maxSize !== undefined;
     return {
-      buildCount: () => sql`SELECT count(*) AS total ${fromWhere}`,
-      buildPage: (lim, off) => sql`
-        SELECT ${sql.raw(SELECT_COLUMNS)} ${fromWhere}
-        ${sql.raw(orderSqlFor(s))}
-        LIMIT ${lim} OFFSET ${off}
-      `,
+      // count 不需要 docs 的任何列，JOIN 只为剔除「源库已删除但索引未清理」的残留行，
+      // 代价是每个匹配 rowid 回 docs 做一次主键查找。无大小筛选时省掉它（残留行会略
+      // 增 total，DHT 场景删除极少可接受）；有大小筛选仍需 JOIN 才能按 m.totalSize 过滤。
+      buildCount: () =>
+        s.by === 'fts' && !hasSize
+          ? sql`SELECT count(*) AS total FROM ${sql.raw(FTS_TABLE)} WHERE ${cond}`
+          : sql`SELECT count(*) AS total ${fromWhere}`,
+      buildPage: (lim, off, useIndexScan = false) => {
+        // 预取路径仅在「FTS + 无大小筛选 + 默认 id 排序」下可用：
+        //  - hash 检索没有 rowid 有序输出；
+        //  - 有大小筛选时过滤在外层，预取的行可能被 totalSize 过滤掉导致结果偏少；
+        //  - 非 id 排序（fetchedAt/totalSize/bm25）的排序键不是 rowid，无法提前终止。
+        if (s.by === 'fts' && !hasSize && !s.sortBy) {
+          const dir = s.order === 'asc' ? 'ASC' : 'DESC';
+          return sql`
+            SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m
+            JOIN (SELECT rowid FROM ${sql.raw(FTS_TABLE)}
+                  WHERE ${cond} ORDER BY rowid ${sql.raw(dir)}
+                  LIMIT ${lim} OFFSET ${off}) f ON m.id = f.rowid
+            ORDER BY m.id ${sql.raw(dir)}
+          `;
+        }
+        // 索引反转驱动：宽泛词（total 大）按 totalSize 排序时，从二级索引倒序扫描
+        // docs、逐个用 EXISTS 校验 FTS 匹配，凑够 LIMIT+OFFSET 个就停，避免「JOIN
+        // 全部匹配行 + 全量排序」。仅在匹配占比高时划算（由 useIndexScan 阈值控制），
+        // 精确词仍走下方 JOIN。bm25 无索引，不适用本路径。
+        // 注意：**只用于 totalSize**。fetchedAt 索引选择性差（时间戳大量重复），反转
+        // 驱动会扫过成片相同时间戳的行，凑 LIMIT 个匹配需扫极多行，实测 111 词反而
+        // 从 1044ms 恶化到 9227ms，故 fetchedAt 仍走 JOIN 路径。
+        if (useIndexScan && s.by === 'fts' && !hasSize && s.sortBy === 'totalSize') {
+          const dir = s.order === 'asc' ? 'ASC' : 'DESC';
+          const col = s.sortBy;
+          return sql`
+            SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m
+            WHERE EXISTS (
+              SELECT 1 FROM ${sql.raw(FTS_TABLE)}
+              WHERE ${cond} AND ${sql.raw(FTS_TABLE)}.rowid = m.id
+            )
+            ORDER BY m.${sql.raw(col)} ${sql.raw(dir)}, m.id ${sql.raw(dir)}
+            LIMIT ${lim} OFFSET ${off}
+          `;
+        }
+        return sql`
+          SELECT ${sql.raw(SELECT_COLUMNS)} ${fromWhere}
+          ${sql.raw(orderSqlFor(s))}
+          LIMIT ${lim} OFFSET ${off}
+        `;
+      },
       wholeSet: s.limit === -1,
       effLimit: s.limit,
       effOffset: s.offset,
@@ -609,16 +683,18 @@ export function buildSearchApi(dbRO) {
   function searchMagnetsSync(options) {
     const { buildCount, buildPage, wholeSet, effLimit, effOffset } = prepareSearch(options);
     const total = Number(dbRO.all(buildCount())[0]?.total ?? 0);
+    // 宽泛词才启用索引反转驱动（匹配占比高，凑 LIMIT 个就停比全量 JOIN + 排序划算）
+    const useIndexScan = total > INDEX_SCAN_MIN_TOTAL;
     if (wholeSet) {
       // 一次性取到 CAP 上限，只排一次序。
       // 原实现按 OFFSET 分批翻页，但 ORDER BY 带 bm25 时每一轮都要把整个匹配集
       // 重新排序一遍再丢弃前 n 行——取满 CAP 要重排 CAP/CHUNK 轮，是纯粹的浪费。
-      const items = dbRO.all(buildPage(WHOLESET_CAP + 1, 0)).map(mapRow);
+      const items = dbRO.all(buildPage(WHOLESET_CAP + 1, 0, useIndexScan)).map(mapRow);
       const truncated = total > WHOLESET_CAP || items.length > WHOLESET_CAP;
       if (items.length > WHOLESET_CAP) items.length = WHOLESET_CAP;
       return { total, limit: 'all', offset: 0, items, truncated };
     }
-    const items = total ? dbRO.all(buildPage(effLimit, effOffset)).map(mapRow) : [];
+    const items = total ? dbRO.all(buildPage(effLimit, effOffset, useIndexScan)).map(mapRow) : [];
     return { total, limit: effLimit, offset: effOffset, items };
   }
 
@@ -707,6 +783,11 @@ export function createMagnetDb(options = {}) {
   // SEARCH_PROCESS_MMAP_SIZE_MB —— 那些是「每个进程一份」，会随并发数线性放大。
   setPragma(rdb, 'cache_size', -2000);
   setPragma(rdb, 'mmap_size', 33554432);
+  // 排序临时 B-Tree 放内存而非磁盘：宽泛词 + totalSize/fetchedAt/bm25 排序时，
+  // 匹配量可达数十万，排序临时数据落磁盘（temp_store 默认 FILE）会慢数倍，
+  // 实测 mp4 词 20.8 万匹配：6681ms → 836ms。排序只存「排序键 + rowid」，
+  // 数十万行也就几 MB，内存安全。
+  setPragma(rdb, 'temp_store', 'MEMORY');
   const dbRO = createDrizzle(rdb);
 
   // reindex worker 的堆上限与超时；超时传 0 表示不限时
@@ -906,6 +987,7 @@ export function createMagnetDb(options = {}) {
       populate(db, scanById(src, { from: last, size: REBUILD_BATCH }), onFlush);
       setMeta(db, 'last_rowid', String(max));
       optimizeFts(db);
+      checkpointWAL(db);
       return { skipped: false, added: max - last };
     } finally {
       src.close();

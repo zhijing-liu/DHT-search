@@ -48,6 +48,10 @@ setPragma(rdb, 'busy_timeout', 5000);
 // SQLite 的 cache_size 负数值单位才是 KiB，故这里取负
 setPragma(rdb, 'cache_size', -CACHE_SIZE_KB);
 setPragma(rdb, 'mmap_size', MMAP_SIZE_MB * 1024 * 1024);
+// 排序临时数据放内存：宽泛词 + 非 id 排序（totalSize/fetchedAt/bm25）时匹配量可达
+// 数十万，落磁盘排序慢数倍（实测 20.8 万匹配 6681ms→836ms）。排序只存排序键+rowid，
+// 数十万行仅几 MB，内存安全。
+setPragma(rdb, 'temp_store', 'MEMORY');
 const dbRO = createDrizzle(rdb);
 
 const { searchMagnetsSync } = buildSearchApi(dbRO);
