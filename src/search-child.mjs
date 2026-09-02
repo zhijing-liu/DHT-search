@@ -1,0 +1,55 @@
+/**
+ * 搜索子进程：在独立进程内执行检索，主线程在客户端断开时 SIGKILL 掉本进程，
+ * 即可中断其正在执行的同步 SQLite 查询。
+ *
+ * 为什么必须是「进程」而不是「线程」
+ * ------------------------------------------------------------------
+ * better-sqlite3 / bun:sqlite 都是同步 API，一条查询会把整个执行单元阻塞在 C++
+ * 里。worker.terminate() 走的是 V8 的 Isolate::TerminateExecution —— 终止标志要等
+ * 执行权回到 JS 才被检查，卡在原生调用里的查询根本收不到信号。实测：
+ *   - Node + better-sqlite3：terminate() 到 worker 真正退出 = 23328ms（＝查询跑完）
+ *   - Bun + bun:sqlite     ：6s 后 worker 仍存活
+ * 两个运行时都无法中断。唯一能打断同步原生调用的是操作系统级 kill，实测
+ * kill(SIGKILL) -> exit 在两个运行时均为 6ms。
+ *
+ * 本进程以只读方式打开索引库（query_only=ON），被 SIGKILL 不会造成任何数据损坏。
+ *
+ * 与主进程共用同一套检索实现（buildSearchApi），Bun / Node 下逻辑一致。
+ */
+import { openDatabase, createDrizzle, setPragma } from './db-driver.js';
+import { CONFIG, resolveDbPath, DEFAULT_INDEX_DB_PATH } from './store.js';
+import { buildSearchApi } from './db.js';
+
+const indexPath = resolveDbPath(
+  // 优先用主进程经环境变量传来的实际索引路径（见 searchPool.js），
+  // 否则回退到与主进程相同的默认解析链。
+  process.env.DHT_SEARCH_INDEX_DB_PATH ??
+    CONFIG.indexDbPath ??
+    process.env.DHT_INDEX_DB_PATH ??
+    DEFAULT_INDEX_DB_PATH
+);
+
+// 只读连接：与主进程查询连接同构；query_only 杜绝误写，busy_timeout 等待重建写锁
+const rdb = openDatabase(indexPath, { readonly: true });
+setPragma(rdb, 'query_only', 'ON');
+setPragma(rdb, 'busy_timeout', 5000);
+setPragma(rdb, 'cache_size', -32000);
+setPragma(rdb, 'mmap_size', 134217728);
+const dbRO = createDrizzle(rdb);
+
+const { searchMagnetsSync } = buildSearchApi(dbRO);
+
+process.on('message', (msg) => {
+  const { id, params } = msg;
+  try {
+    const result = searchMagnetsSync(params);
+    process.send({ id, type: 'result', result });
+  } catch (e) {
+    process.send({
+      id,
+      type: 'error',
+      error: e?.message || 'search failed',
+      code: e?.code,
+    });
+  }
+});

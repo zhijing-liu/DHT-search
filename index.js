@@ -10,8 +10,8 @@
  *   q        必填，搜索关键词
  *   sortBy   可选 'fetchedAt' | 'totalSize' | 'relevance'（其余值忽略，按 id 排序）
  *   order    可选 'asc' | 'desc'，默认 desc，仅 sortBy 传入时生效
- *   limit    可选；传 0 / 'all' 表示「整集拉取」（一次性返回全部匹配，上限 MAX_RESULTS）；
- *            传正数表示普通分页（默认 20，钳制 1..200）
+ *   limit    可选；不传 / 传 0 / 传 'all' 均表示「整集拉取」（一次性返回全部匹配，
+ *            上限 MAX_RESULTS）；传正数表示普通分页（非数值回退 20，钳制 1..200）
  *   offset   可选，分页偏移（默认 0）
  * 返回：{ total, limit, offset, items, truncated? }
  */
@@ -19,20 +19,23 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { createMagnetDb } from './src/db.js';
-import { CONFIG, SORT_COLUMNS } from './src/store.js';
+import { createMagnetDb, normalizeSearchQuery, normalizeKeyword } from './src/db.js';
+import { createSearchExecutor } from './src/searchPool.js';
+import { CONFIG } from './src/store.js';
 import { LRUCache } from 'lru-cache';
+import { log } from './src/logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-/** 整集拉取的安全上限：单次请求最多返回这么多条，超出则 truncated=true；可由 config.js 的 MAX_RESULTS 覆盖 */
-const maxResults = Number(CONFIG.maxResults);
-const MAX_RESULTS = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 20000;
-
 const PORT = Number(CONFIG.port) || Number(process.env.PORT) || 3000;
 
 const api = createMagnetDb();
+
+// 搜索子进程池：检索在独立进程中执行，客户端断开时 SIGKILL 该进程即可真正中断查询
+// （worker 线程的 terminate() 无法中断同步原生查询，详见 src/searchPool.js 文件头）。
+// 必须在 createMagnetDb() 之后创建——此时索引库文件已就绪，子进程才能以只读方式打开。
+const searchExecutor = createSearchExecutor(undefined, api.indexPath);
 
 /* ------------------------------------------------------------------ */
 /* 搜索结果内存缓存                                                    */
@@ -74,27 +77,22 @@ app.use((req, res, next) => {
   if (req.path === '/' || req.path === '/index.html' || req.path.startsWith('/api/')) {
     const start = Date.now();
     res.on('finish', () => {
-      console.log(`[USER] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms)`);
+      log.request(req.method, req.originalUrl, res.statusCode, Date.now() - start);
     });
   }
   next();
 });
 
-/** 是否请求整集拉取（返回全部匹配，而非分页） */
-function isWholeSet(limitParam) {
-  if (limitParam === undefined) return false;
-  if (limitParam === 'all') return true;
-  const n = Number(limitParam);
-  return Number.isFinite(n) && n <= 0;
-}
+/** 未预期异常的兜底文案（仅当 err.message 为空时启用） */
+const INTERNAL_ERROR = 'internal error';
 
 /** 统一包装 API 处理器：同步或异步执行，异常时按指定状态码返回 { error } */
-function apiHandler(fn, status = 500, fallback = 'internal error') {
+function apiHandler(fn, status = 500) {
   return (req, res) => {
     Promise.resolve()
       .then(() => fn(req, res))
       .catch((err) => {
-        if (!res.headersSent) res.status(status).json({ error: err?.message || fallback });
+        if (!res.headersSent) res.status(status).json({ error: err?.message || INTERNAL_ERROR });
       });
   };
 }
@@ -104,96 +102,124 @@ app.get('/', (_req, res) => res.redirect('/index.html'));
 app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
 
-/** 构造搜索缓存键：覆盖所有影响结果的参数，保证命中结果一致 */
-function searchCacheKey(q, by, sortBy, order, limitParam, offsetParam, minSize, maxSize) {
-  const whole = isWholeSet(limitParam);
-  const page = whole ? 'all' : `${limitParam ?? ''}:${offsetParam ?? ''}`;
-  return [q, by ?? '', sortBy ?? '', order, page, minSize ?? '', maxSize ?? ''].join('|');
+/**
+ * 构造搜索缓存键：直接由归一化后的检索参数派生。
+ * 这样「影响结果的字段」与「参与比对的字段」永远同源——将来新增检索参数时，
+ * 不可能再出现「忘了同步进缓存键导致不同查询撞 key」的问题。
+ */
+function searchCacheKey(s) {
+  return JSON.stringify([s.query, s.by, s.sortBy, s.order, s.limit, s.offset, s.minSize, s.maxSize]);
 }
 
-app.get('/api/search', apiHandler((req, res) => {
-  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-  if (!q) {
+/** 检索日志描述串（缓存 HIT / MISS / 客户端取消三处共用） */
+function describeSearch(s) {
+  return `q="${s.query}" 模式=${s.by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${s.sortBy ?? 'id'}/${s.order}`;
+}
+
+app.get('/api/search', apiHandler(async (req, res) => {
+  // 参数只归一化这一次：缓存键、worker 派参、日志描述全部由这一个对象派生。
+  // 注意 HTTP 参数名是 q，而领域字段名是 query，在此处完成这唯一的命名映射；
+  // req.query 的值可能是字符串也可能是数组，normalizeSearchQuery 统一收敛为安全类型。
+  const s = normalizeSearchQuery({ ...req.query, query: req.query.q });
+  if (!s.query) {
     return res.status(400).json({ error: 'query 不能为空' });
   }
 
-  const sortBy = SORT_COLUMNS.includes(req.query.sortBy) ? req.query.sortBy : undefined;
-  const order = req.query.order === 'asc' ? 'asc' : 'desc';
-  // 仅当显式传 by=hash 时走 infohash 精确检索，其余走 FTS5 模糊检索
-  const by = req.query.by === 'hash' ? 'hash' : undefined;
-  // 大小范围筛选（字节）；非有限值视为不限制
-  const minSize = Number(req.query.minSize);
-  const maxSize = Number(req.query.maxSize);
-
-  const key = searchCacheKey(q, by, sortBy, order, req.query.limit, req.query.offset,
-    Number.isFinite(minSize) ? minSize : '', Number.isFinite(maxSize) ? maxSize : '');
+  const key = searchCacheKey(s);
   const cached = searchCache.get(key);
   if (cached) {
-    console.log(`[cache] HIT  q="${q}" 模式=${by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${sortBy ?? 'id'}/${order}`);
+    log.cache('HIT', describeSearch(s));
     return res.json(cached);
   }
-  console.log(`[cache] MISS q="${q}" 模式=${by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${sortBy ?? 'id'}/${order}`);
+  log.cache('MISS', describeSearch(s));
 
-  let result;
-  if (isWholeSet(req.query.limit)) {
-    // 整集拉取：一次查询取回全部匹配
-    const raw = api.searchMagnets({ query: q, sortBy, order, limit: -1, by, minSize, maxSize });
-    let items = raw.items;
-    const truncated = items.length > MAX_RESULTS;
-    if (truncated) items = items.slice(0, MAX_RESULTS);
-    result = { total: raw.total, limit: 'all', offset: 0, items, truncated };
-  } else {
-    // 普通分页
-    const limitParam = Number(req.query.limit);
-    const offsetParam = Number(req.query.offset);
-    result = api.searchMagnets({
-      query: q,
-      sortBy,
-      order,
-      by,
-      minSize,
-      maxSize,
-      limit: Number.isFinite(limitParam) ? limitParam : undefined,
-      offset: Number.isFinite(offsetParam) ? offsetParam : undefined,
-    });
+  // 把检索放进独立子进程执行；客户端断开时 SIGKILL 该进程，直接中断其正在执行的
+  // 同步 SQLite 查询——这是「关页面即停」唯一有效的手段（线程 terminate 无效，见 searchPool.js）。
+  // s 已归一化，且归一化是幂等的，子进程侧可直接使用。
+  const job = searchExecutor.run(s);
+
+  /** 客户端已断开：丢弃结果、不缓存、不响应（响应已无法送达） */
+  const logCancelled = () =>
+    log.cancel(`客户端断开，已取消检索 ${describeSearch(s)}`);
+
+  let aborted = false;
+  // 客户端断开（关闭页面 / 中止请求 / 新一轮搜索取消旧请求）时：
+  // 1) 标记 aborted，避免正常分支再写响应 / 缓存；
+  // 2) 立即 SIGKILL 该搜索子进程——由操作系统回收进程，其中正在执行的同步 SQLite 查询随之中断。
+  // 用 req 的 close 而非仅靠 res 的 close：Express 5 下 res.close 在 keep-alive 正常响应完成后
+  // 也会触发，对「客户端已离开」判断不可靠；req.close 才是断连信号。两者兜底，Bun / Node 均生效。
+  const onClose = () => {
+    if (aborted) return;
+    aborted = true;
+    job.terminate();
+  };
+  req.on('close', onClose);
+  res.on('close', onClose);
+
+  try {
+    const result = await job.done;
+    req.off('close', onClose);
+    res.off('close', onClose);
+    job.release();
+    // 竞态：结果已产出，但客户端恰在此刻断开——丢弃结果，不缓存也不响应
+    if (aborted) {
+      logCancelled();
+      return;
+    }
+    searchCache.set(key, result);
+    try {
+      res.json(result);
+    } catch {
+      /* 响应已关闭，忽略写入异常 */
+    }
+  } catch (e) {
+    req.off('close', onClose);
+    res.off('close', onClose);
+    job.release();
+    if (aborted) {
+      logCancelled();
+      return;
+    }
+    throw e; // 交给 apiHandler 统一返回 500
   }
-
-  searchCache.set(key, result);
-  return res.json(result);
-}, 400, 'search failed'));
+}, 400));
 
 /** 手动全量重建影子索引（在 worker 线程中执行，重建期间检索仍可用） */
 app.post('/api/reindex', apiHandler(async (_req, res) => {
-  console.log('[USER] 手动触发全量索引重建');
+  log.user('手动触发全量索引重建');
   const indexed = await api.reindex(({ done, total }) => {
-    console.log(`[SYSTEM][reindex] 重建进度 ${done}/${total}`);
+    log.progress(`重建进度 ${done}/${total}`);
   });
   // 索引内容已变更，清空搜索缓存避免返回旧结果
   searchCache.clear();
-  console.log(`[SYSTEM] 索引重建完成，累计 ${indexed} 条，已清空搜索缓存`);
+  log.ok(`索引重建完成，累计 ${indexed} 条，已清空搜索缓存`);
   res.json({ ok: true, indexed });
-}, 500, 'reindex failed'));
+}));
 
 /** 增量同步最新索引（按 last_rowid 仅补录源库新增行，秒级；与重建互斥） */
 app.post('/api/sync', apiHandler((_req, res) => {
-  console.log('[USER] 手动触发增量同步');
-  api.syncIncremental();
-  // 索引内容已变更，清空搜索缓存避免返回旧结果
-  searchCache.clear();
-  console.log('[SYSTEM] 增量同步完成，已清空搜索缓存');
-  res.json({ ok: true });
-}, 500, 'sync failed'));
+  log.user('手动触发增量同步');
+  const { skipped, added } = api.syncIncremental();
+  // 确实补录了新行才清缓存；无新增时不必让已有缓存白白失效
+  if (added > 0) searchCache.clear();
+  if (skipped) {
+    log.warn('增量同步跳过（重建进行中）');
+  } else {
+    log.ok(`增量同步完成，补录 ${added} 行${added > 0 ? '，已清空搜索缓存' : ''}`);
+  }
+  res.json({ ok: true, skipped, added });
+}));
 
 /** 当前已索引的 magnet 总数 */
 app.get('/api/count', apiHandler((_req, res) => {
   res.json({ count: api.countMagnets() });
-}, 500, 'count failed'));
+}));
 
 /** 热词榜（暂未接入页面，用于验证落库数据） */
 app.get('/api/hot', apiHandler((req, res) => {
   const limit = Number(req.query.limit);
   res.json({ items: api.topKeywords(Number.isFinite(limit) ? limit : 50) });
-}, 500, 'hot failed'));
+}));
 
 /** 热词过滤词列表 */
 app.get('/api/hot/filter', apiHandler((_req, res) => {
@@ -202,13 +228,14 @@ app.get('/api/hot/filter', apiHandler((_req, res) => {
 
 /** 添加热词过滤词（body: { term }） */
 app.post('/api/hot/filter', apiHandler((req, res) => {
-  const term = String(req.body?.term ?? '').trim().toLowerCase();
-  if (!term || !/[\p{L}\p{N}]/u.test(term)) {
+  // 校验规则与 db 层共用 normalizeKeyword，避免两处各写一份
+  const term = normalizeKeyword(req.body?.term);
+  if (!term) {
     return res.status(400).json({ error: 'term 不能为空且需包含字母或数字' });
   }
   res.json({ ok: true, term: api.addKeywordFilter(term) });
-  console.log(`[USER] 添加热词过滤词: "${term}"`);
-}, 500, 'add filter failed'));
+  log.user(`添加热词过滤词: "${term}"`);
+}));
 
 /** 删除热词过滤词（query: ?term=） */
 app.delete('/api/hot/filter', apiHandler((req, res) => {
@@ -217,8 +244,8 @@ app.delete('/api/hot/filter', apiHandler((req, res) => {
     return res.status(400).json({ error: 'term 不能为空' });
   }
   res.json({ ok: true, term: api.removeKeywordFilter(term) });
-  console.log(`[USER] 删除热词过滤词: "${term}"`);
-}, 500, 'remove filter failed'));
+  log.user(`删除热词过滤词: "${term}"`);
+}));
 
 /** 导出热词过滤词为文本文件（每行一个词，带 # 头注释） */
 app.get('/api/hot/filter/export', apiHandler((_req, res) => {
@@ -231,34 +258,26 @@ app.get('/api/hot/filter/export', apiHandler((_req, res) => {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="hot-filter-export.txt"');
   res.send(text);
-}, 500, 'export filter failed'));
+}));
 
 /** 批量导入热词过滤词（body: { terms: string[] }，每行一个词；幂等） */
 app.post('/api/hot/filter/import', apiHandler((req, res) => {
   const terms = Array.isArray(req.body?.terms) ? req.body.terms : [];
-  let accepted = 0;
-  for (const raw of terms) {
-    const t = String(raw).trim().toLowerCase();
-    if (!t || t.startsWith('#') || !/[\p{L}\p{N}]/u.test(t)) continue; // 跳过空行 / # 注释 / 纯符号
-    api.addKeywordFilter(t);
-    accepted += 1;
-  }
+  // # 开头是导入文件格式的注释行（本接口特有规则）；其余无效项由 addKeywordFilters 内部跳过。
+  // 走批量接口而非逐条 addKeywordFilter：单事务写入，快得多且具备原子性。
+  const accepted = api.addKeywordFilters(terms.filter((t) => !String(t).trim().startsWith('#')));
   const total = api.listKeywordFilters().length;
   res.json({ ok: true, accepted, total });
-}, 500, 'import filter failed'));
+}));
 
 // 兜底错误处理，避免进程崩溃
 app.use((err, _req, res, _next) => {
-  console.error(`[SYSTEM][error] 未捕获异常: ${err?.stack || err?.message || err}`);
+  log.error(`未捕获异常: ${err?.stack || err?.message || err}`);
   res.status(500).json({ error: 'internal error' });
 });
 
 const server = app.listen(PORT, () => {
-  console.log('[SYSTEM] ==========================================');
-  console.log(`[SYSTEM] DHT Search 服务已启动: http://localhost:${PORT}`);
-  console.log(`[SYSTEM] 配置: port=${PORT} maxResults=${MAX_RESULTS}`);
-  console.log('[SYSTEM] 等待用户请求...');
-  console.log('[SYSTEM] ==========================================');
+  log.banner(PORT, CONFIG.maxResults);
 });
 
 // 运行期自动增量同步：默认每小时按 last_rowid 补录一次源库新增行
@@ -269,14 +288,18 @@ const SYNC_INTERVAL_MS = (() => {
 })();
 const syncTimer = setInterval(async () => {
   try {
-    // syncIncremental 是同步函数（重建期间直接 return undefined 跳过本轮），
-    // 这里统一 await + try/catch：既兼容同步返回值，也能拦住同步抛错，
-    // 避免回调内未捕获异常直接终止进程
-    await api.syncIncremental();
-    // 索引内容可能已变更，清空搜索缓存，避免继续返回旧结果
-    searchCache.clear();
+    // syncIncremental 是同步函数，这里统一 await + try/catch：既兼容同步返回值，
+    // 也能拦住同步抛错，避免回调内未捕获异常直接终止进程
+    const { skipped, added } = await api.syncIncremental();
+    // 只有真的补录了新行才清缓存——否则每小时白白冲掉全部搜索结果
+    if (added > 0) {
+      searchCache.clear();
+      log.ok(`增量同步完成，补录 ${added} 行，已清空搜索缓存`);
+    } else if (!skipped) {
+      log.system('增量同步完成，无新增行');
+    }
   } catch (err) {
-    console.error(`[SYSTEM][sync] 增量同步失败: ${err?.message || err}`);
+    log.error(`增量同步失败: ${err?.message || err}`);
   }
 }, SYNC_INTERVAL_MS);
 if (typeof syncTimer.unref === 'function') syncTimer.unref();
@@ -287,17 +310,21 @@ if ('requestTimeout' in server) server.requestTimeout = 0;
 if ('headersTimeout' in server) server.headersTimeout = 0;
 
 server.on('error', (err) => {
-  console.error(`[SYSTEM][error] 服务启动失败: ${err.message}`);
+  log.error(`服务启动失败: ${err.message}`);
   api.close();
   process.exit(1);
 });
 
-process.on('SIGINT', () => {
-  console.log('\n[SYSTEM] 收到 SIGINT，正在关闭服务并释放数据库...');
+// 统一退出处理：SIGINT(终端 Ctrl+C / pm2 默认) 与 SIGTERM(docker stop / kill -15 / systemd)
+function shutdown(signal) {
+  log.shutdown(`收到 ${signal}，正在关闭服务并释放资源...`);
   clearInterval(searchCacheSweep);
   clearInterval(syncTimer);
   searchCache.clear();
+  searchExecutor.terminateAll();
   api.close();
-  console.log('[SYSTEM] 服务已关闭');
+  log.system('服务已关闭');
   process.exit(0);
-});
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

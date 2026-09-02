@@ -31,6 +31,9 @@ const cleanup = () => {
   }
 };
 cleanup();
+// cleanup() 只删文件不建目录；全新环境下 test/data 并不存在，
+// 缺了它 openDatabase 会直接抛 "directory does not exist"，故在此自建。
+fs.mkdirSync(path.join(HERE, 'data'), { recursive: true });
 
 let passed = 0;
 /**
@@ -223,9 +226,10 @@ console.log('\n[4] 排序');
     assert.deepEqual(desc.items.map((i) => i.id), asc.items.map((i) => i.id).reverse());
     assert.notDeepEqual(desc.items.map((i) => i.id), [1, 4]); // 确实按相关性重排，而非按 id
   });
-  check('非法 sortBy 回退为按 id 排序', () => {
+  check('非法 sortBy 回退为按 id 排序（方向仍跟随 order 默认 desc）', () => {
     const r = api.searchMagnets({ query: 'brunette', sortBy: 'name; DROP TABLE magnets' });
-    assert.deepEqual(r.items.map((i) => i.id), [1, 4]);
+    // 与「不传 sortBy」同路径：回退 id 列 + 默认 desc，故为 [4, 1]
+    assert.deepEqual(r.items.map((i) => i.id), [4, 1]);
   });
   api.close();
 }
@@ -233,16 +237,17 @@ console.log('\n[4] 排序');
 console.log('\n[5] 分页');
 {
   const api = openApi();
+  // 以下用例未传 sortBy/order，走「回退 id 列 + 默认 desc」＝ id 倒序 [4, 1]
   check('limit=1 / offset=0 取第一条', () => {
     const r = api.searchMagnets({ query: 'brunette', limit: 1, offset: 0 });
     assert.equal(r.items.length, 1);
-    assert.equal(r.items[0].id, 1);
+    assert.equal(r.items[0].id, 4);
     assert.equal(r.total, 2);
   });
   check('limit=1 / offset=1 取第二条', () => {
     const r = api.searchMagnets({ query: 'brunette', limit: 1, offset: 1 });
     assert.equal(r.items.length, 1);
-    assert.equal(r.items[0].id, 4);
+    assert.equal(r.items[0].id, 1);
   });
   check('offset 超出范围返回空数组但 total 不变', () => {
     const r = api.searchMagnets({ query: 'brunette', limit: 20, offset: 999 });

@@ -19,6 +19,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "chalk": "^6.0.0",
     "drizzle-orm": "^0.45.2",
     "express": "^5.2.1",
     "lru-cache": "^11.5.2"

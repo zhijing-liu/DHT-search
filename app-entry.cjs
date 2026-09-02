@@ -9,7 +9,14 @@
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
-import(pathToFileURL(path.join(__dirname, 'index.js')).href).catch((err) => {
-  console.error('[entry] 启动 index.js 失败：', err);
+import(pathToFileURL(path.join(__dirname, 'index.js')).href).catch(async (err) => {
+  let prefix = '[entry] 启动 index.js 失败：';
+  try {
+    const chalk = (await import('chalk')).default;
+    prefix = chalk.red('✖') + ' ' + chalk.red('[entry] 启动 index.js 失败：');
+  } catch {
+    /* chalk 不可用则退化为纯文本 */
+  }
+  console.error(prefix, err);
   process.exit(1);
 });

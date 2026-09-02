@@ -17,8 +17,9 @@
  *
  * 暴露能力：
  *   countMagnets()   —— 已索引条数
- *   searchMagnets()  —— 对 name / files 两列做 FTS5 模糊搜索，支持分页与
- *                       可选排序（不传 sortBy 按 id；relevance 按 bm25）
+ *   searchMagnets()  —— 检索（FTS5 模糊 / infohash 精确），支持分页与排序
+ *   normalizeSearchQuery() —— 检索参数归一化，HTTP 层与数据层共用（幂等）
+ *   normalizeKeyword()     —— 热词 / 过滤词归一化，HTTP 层与数据层共用
  *   reindex()        —— 全量重建影子索引（异步；Node 走 worker 线程，Bun 退化为同进程）
  *   rebuildSync()    —— 同上但在当前进程内同步执行（供 worker / 脚本使用）
  *   close()          —— 关闭连接
@@ -31,6 +32,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
+import { log } from './logger.js';
 import {
   isBun,
   openDatabase,
@@ -62,6 +64,7 @@ import {
   MAX_LIMIT,
   SORT_COLUMNS,
 } from './store.js';
+import { MAX_RESULTS } from '../config.js';
 
 /**
  * 排序 SQL 白名单。ORDER BY 的列名与方向无法参数化，故写死为常量按需取用，
@@ -129,23 +132,58 @@ function clampInt(value, fallback, min, max) {
 }
 
 /**
- * 统一规范化检索的分页与排序参数（searchMagnets / searchByHash 共用）。
- * 未传 sortBy 时按 id 排序（'' 键），order 仅对显式 sortBy 生效；
- * limit 传 <=0 或不传表示不限制，否则钳制到 1..MAX_LIMIT。
- * @returns {{ orderSql: string, limit: number, offset: number }}
+ * 归一化 limit。
+ * - 缺省 / null / 'all' / 空串 / 数值 <= 0  -> -1，表示「整集拉取」（受 WHOLESET_CAP 截断）
+ * - 非数值（如 'abc'）                      -> DEFAULT_LIMIT
+ * - 其余                                    -> 钳制到 [1, MAX_LIMIT]
  */
-function normalizeQueryOptions({ sortBy, order, limit, offset }) {
-  const direction = String(order).toLowerCase() === 'asc' ? 'asc' : 'desc';
-  // 未传 sortBy 时回退到 id 列，但方向仍跟随 order（默认 desc=倒序），
-  // 这样默认视图下点「正序/倒序」也能立即改变结果，而不会忽略方向
-  const sortKey = SORT_COLUMNS.includes(sortBy) ? `${sortBy}:${direction}` : `id:${direction}`;
+function toLimit(value) {
+  if (value === undefined || value === null) return -1;
+  const text = String(value).trim().toLowerCase();
+  if (text === 'all') return -1;
+  const num = Number(text);
+  if (!Number.isFinite(num)) return DEFAULT_LIMIT;
+  if (num <= 0) return -1;
+  return clampInt(num, DEFAULT_LIMIT, 1, MAX_LIMIT);
+}
+
+/** 归一化大小筛选（字节）：非有限值或负数一律视为「不限制」 */
+function toSize(value) {
+  const num = Number(value);
+  return Number.isFinite(num) && num >= 0 ? num : undefined;
+}
+
+/** 由已校验的 sortBy / order 取白名单内的 ORDER BY 片段 */
+function orderSqlFor({ sortBy, order }) {
+  return ORDER_SQL[sortBy ? `${sortBy}:${order}` : `id:${order}`];
+}
+
+/**
+ * 检索参数归一化——HTTP 层与数据层共用的唯一入口。
+ *
+ * 把任意来源的原始输入（Express 的 req.query、测试直接构造的对象、worker 转发的对象）
+ * 收敛为一个规范对象：所有字段均已校验 / 已钳制，可直接用于构造缓存键、派发给搜索
+ * worker、拼装 SQL。
+ *
+ * 幂等：对已归一化的对象再次调用结果不变，因此允许各层放心重复调用而不必「谁负责
+ * 归一化」地互相推诿——直接调用 searchMagnets() 的使用方同样安全。
+ *
+ * @param {object} [raw] 原始检索参数
+ * @returns {{ query: string, sortBy: string|undefined, order: 'asc'|'desc',
+ *             by: 'hash'|'fts', minSize: number|undefined, maxSize: number|undefined,
+ *             limit: number, offset: number }} limit 为 -1 表示整集拉取
+ */
+export function normalizeSearchQuery(raw = {}) {
+  const source = raw ?? {};
   return {
-    orderSql: ORDER_SQL[sortKey],
-    limit:
-      limit === undefined || limit === null || Number(limit) <= 0
-        ? -1
-        : clampInt(limit, DEFAULT_LIMIT, 1, MAX_LIMIT),
-    offset: clampInt(offset, 0, 0, Number.MAX_SAFE_INTEGER),
+    query: typeof source.query === 'string' ? source.query.trim() : '',
+    sortBy: SORT_COLUMNS.includes(source.sortBy) ? source.sortBy : undefined,
+    order: String(source.order).toLowerCase() === 'asc' ? 'asc' : 'desc',
+    by: source.by === 'hash' ? 'hash' : 'fts',
+    minSize: toSize(source.minSize),
+    maxSize: toSize(source.maxSize),
+    limit: toLimit(source.limit),
+    offset: clampInt(source.offset, 0, 0, Number.MAX_SAFE_INTEGER),
   };
 }
 
@@ -169,6 +207,18 @@ function keywordTokens(text) {
   return String(text ?? '').match(TOKEN_PATTERN)
     ?.map((t) => t.toLowerCase())
     .filter((w) => w.length >= MIN_KEYWORD_LEN && !NUMERIC_ONLY.test(w)) ?? [];
+}
+
+/**
+ * 归一化热词 / 过滤词：去首尾空白 + 小写折叠。
+ * 不含任何字母或数字时返回空串，调用方自行决定是跳过还是报错——HTTP 层与数据层共用，
+ * 避免同一套校验在多处各写一遍。
+ * @param {unknown} term
+ * @returns {string} 归一化后的词；无效输入返回空串
+ */
+export function normalizeKeyword(term) {
+  const t = String(term ?? '').trim().toLowerCase();
+  return /[\p{L}\p{N}]/u.test(t) ? t : '';
 }
 
 /* ------------------------------------------------------------------ */
@@ -444,6 +494,131 @@ function syncIndex(db, src, onFlush) {
  * @param {boolean} [options.sync=true]  打开时是否执行同步（全量重建 / 增量补录）；
  *        传 false 则只建立连接不建索引，供 reindex worker 使用
  */
+/**
+ * 检索逻辑工厂：接收「只读数据库连接（drizzle 包装）」，返回同步检索函数。
+ *
+ * 主线程在 createMagnetDb 内用它构建查询 API；搜索 worker 线程也用它（各自持有独立的
+ * 只读连接）构建同样的逻辑——从而 Bun / Node 共用同一套实现，无需 isBun 分支。
+ *
+ * 重要：better-sqlite3 / bun:sqlite 均为同步 API，单条 SQL 执行期间会阻塞事件循环，
+ * 无法被 JS 中途打断。因此「客户端断开即停止」不能在本函数内实现，而由 HTTP 层把查询
+ * 放进独立 worker 线程、断开时 worker.terminate() 杀掉整个线程来完成（见 src/searchPool.js）。
+ * 本函数只负责把结果查出来，并对整集拉取做内存上限保护（WHOLESET_CAP）。
+ *
+ * @param {object} dbRO drizzle-orm 包装的只读连接，提供 .all() 执行 SELECT
+ * @returns {{ searchMagnetsSync: Function }}
+ */
+export function buildSearchApi(dbRO) {
+  /** 整集拉取（limit<=0 / 不传）时的单轮分页大小：够大以减少 SQL 往返，又限制单次内存 */
+  const CHUNK_SIZE = 2000;
+  /** 整集拉取安全上限（与 config.js 的 MAX_RESULTS 对齐，配置缺失则回退 20000） */
+  const WHOLESET_CAP =
+    Number.isFinite(Number(MAX_RESULTS)) && Number(MAX_RESULTS) > 0 ? Number(MAX_RESULTS) : 20000;
+
+  /**
+   * 构造大小筛选片段（值已由 normalizeSearchQuery 校验为「有限非负」或 undefined）。
+   * 无条件时返回空片段，调用方无需再判空。
+   */
+  function buildSizeCond({ minSize, maxSize }) {
+    const conds = [];
+    if (minSize !== undefined) conds.push(sql`m.totalSize >= ${minSize}`);
+    if (maxSize !== undefined) conds.push(sql`m.totalSize <= ${maxSize}`);
+    // bun 下 drizzle-orm/bun-sqlite 会把 sql.join 的字符串分隔符参数化成 `?`，导致 `>= ? AND <= ?`
+    // 错拼成 `>= ?? <= ?`。故显式拼接 SQL 片段，不用 join。
+    if (conds.length === 0) return sql``;
+    if (conds.length === 1) return sql` AND ${conds[0]}`;
+    return sql` AND ${conds[0]} AND ${conds[1]}`;
+  }
+
+  /** 归一化 infohash：剥离 magnet 链接里的 urn:btih: 前缀，并去除所有非字母数字字符 */
+  function normalizeInfohash(query) {
+    return String(query ?? '')
+      .replace(/^.*urn:btih:/i, '')
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .toLowerCase();
+  }
+
+  /** FTS5 模糊检索：JOIN FTS 表，顺带剔除源库中已删除的残留索引行（保证 total 与返回数一致） */
+  function ftsWhere(query) {
+    const match = buildMatchExpression(query);
+    if (!match) {
+      throw new TypeError('searchMagnets: options.query 不能为空，且需包含至少一个字母或数字');
+    }
+    // FTS5 MATCH 必须接收「SQL 字符串字面量」形式的查询表达式（单引号包裹），否则 SQLite 会把
+    // 双引号短语误当标识符、或把参数化占位符 ? 在 prepare 阶段抛 fts5: near "?"。
+    // match 已白名单化（仅字母数字 / 双引号 / AND / *），安全。
+    return {
+      join: sql`JOIN ${sql.raw(FTS_TABLE)} f ON m.id = f.rowid`,
+      cond: sql`${sql.raw(FTS_TABLE)} MATCH ${sql.raw(`'${match}'`)}`,
+    };
+  }
+
+  /** infohash 精确检索：无需 JOIN，直接匹配副本表，兼容「带/不带 hash 前缀」并支持前缀检索 */
+  function hashWhere(query) {
+    const raw = normalizeInfohash(query);
+    if (!raw) {
+      throw new TypeError('searchByHash: 未提供有效的 infohash');
+    }
+    return {
+      join: sql``,
+      cond: sql`lower(m.infohash) = lower(${raw})
+        OR lower(m.infohash) = lower(${'hash' + raw})
+        OR lower(m.infohash) LIKE lower(${raw + '%'})`,
+    };
+  }
+
+  /**
+   * 由归一化参数构造 count / 分页 SQL 工厂。
+   * 两种检索模式的差异只有「是否 JOIN FTS 表 + 匹配条件」，其余拼装完全共用一份。
+   */
+  function prepareSearch(options) {
+    const s = normalizeSearchQuery(options);
+    const { join, cond } = s.by === 'hash' ? hashWhere(s.query) : ftsWhere(s.query);
+    const fromWhere = sql`
+      FROM ${sql.raw(DOCS_TABLE)} m ${join}
+      WHERE ${cond}${buildSizeCond(s)}
+    `;
+    return {
+      buildCount: () => sql`SELECT count(*) AS total ${fromWhere}`,
+      buildPage: (lim, off) => sql`
+        SELECT ${sql.raw(SELECT_COLUMNS)} ${fromWhere}
+        ${sql.raw(orderSqlFor(s))}
+        LIMIT ${lim} OFFSET ${off}
+      `,
+      wholeSet: s.limit === -1,
+      effLimit: s.limit,
+      effOffset: s.offset,
+    };
+  }
+
+  /**
+   * 同步检索：先 count 再取页（或整集分批取数），一次性返回。测试与搜索 worker 均使用此函数。
+   * 整集拉取（归一化后 limit = -1）按 CHUNK_SIZE 分批取数并限制到 WHOLESET_CAP，避免一次性
+   * 把百万级结果全部载入内存；worker 线程在执行期间若被主线程 terminate，整个线程直接被杀，
+   * 无需本函数干预。
+   */
+  function searchMagnetsSync(options) {
+    const { buildCount, buildPage, wholeSet, effLimit, effOffset } = prepareSearch(options);
+    const total = Number(dbRO.all(buildCount())[0]?.total ?? 0);
+    if (wholeSet) {
+      const items = [];
+      let offset = 0;
+      while (items.length < WHOLESET_CAP) {
+        const page = dbRO.all(buildPage(CHUNK_SIZE, offset)).map(mapRow);
+        for (const row of page) items.push(row);
+        if (page.length < CHUNK_SIZE) break;
+        offset += CHUNK_SIZE;
+      }
+      const truncated = total > WHOLESET_CAP || items.length >= WHOLESET_CAP;
+      return { total, limit: 'all', offset: 0, items, truncated };
+    }
+    const items = total ? dbRO.all(buildPage(effLimit, effOffset)).map(mapRow) : [];
+    return { total, limit: effLimit, offset: effOffset, items };
+  }
+
+  return { searchMagnetsSync };
+}
+
 export function createMagnetDb(options = {}) {
   const opts = typeof options === 'string' ? { source: options } : options;
   // 优先级：调用方显式传入 > config.js > 环境变量 > 模块内默认值
@@ -488,7 +663,7 @@ export function createMagnetDb(options = {}) {
   try {
     const srcMode = getPragma(src, 'journal_mode').journal_mode;
     if (srcMode !== 'wal') {
-      console.warn(`[warn] 源库非 WAL 模式（${srcMode}）：构建索引时的只读扫描可能与写入进程争用锁`);
+      log.warn(`源库非 WAL 模式（${srcMode}）：构建索引时的只读扫描可能与写入进程争用锁`);
     }
     if (!getRow(src, `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`, [TABLE])) {
       throw new Error(`源库 ${sourcePath} 中不存在 ${TABLE} 表`);
@@ -503,12 +678,12 @@ export function createMagnetDb(options = {}) {
         if (done >= nextLog) {
           nextLog = done + 100000;
           logged = done;
-          console.log(`[index] 已索引 ${done} 行`);
+          log.progress(`已索引 ${done} 行`);
         }
       });
       // 进度按阈值打印，最后一批不足一个阈值时上面不会触发，这里补打总数，
       // 否则「已索引 100000 行」看起来会像是提前停了
-      if (done > logged) console.log(`[index] 索引完成，共 ${done} 行`);
+      if (done > logged) log.ok(`索引完成，共 ${done} 行`);
     }
   } finally {
     src.close();
@@ -607,131 +782,51 @@ export function createMagnetDb(options = {}) {
 
   /** 添加热词过滤词（幂等，小写归一；增量统计与热词榜均立即生效） */
   function addKeywordFilter(term) {
-    const t = String(term).trim().toLowerCase();
-    if (!t) throw new TypeError('addKeywordFilter: term 不能为空');
+    const t = normalizeKeyword(term);
+    if (!t) throw new TypeError('addKeywordFilter: term 不能为空，且需包含字母或数字');
     db.run(sql`INSERT OR IGNORE INTO ${sql.raw(KEYWORD_FILTER_TABLE)} (term, created_at)
       VALUES (${t}, ${Date.now()})`);
     return t;
   }
 
+  /**
+   * 批量添加热词过滤词（幂等、去重、单事务）。
+   * 逐条 INSERT 会让每条各自开启一次事务；导入成百上千条时合并为一个事务既快得多，
+   * 也保证「要么全写入、要么全不写」。
+   * @param {Iterable<string>} terms 原始词条；空白 / 纯符号等无效项自动跳过
+   * @returns {number} 实际写入的条数（已去重）
+   */
+  function addKeywordFilters(terms) {
+    const unique = new Set();
+    for (const raw of terms ?? []) {
+      const t = normalizeKeyword(raw);
+      if (t) unique.add(t);
+    }
+    if (unique.size === 0) return 0;
+
+    const raw = db.$client ?? db.session?.client;
+    const stmt = prepareStmt(
+      raw,
+      `INSERT OR IGNORE INTO ${KEYWORD_FILTER_TABLE} (term, created_at) VALUES (?, ?)`
+    );
+    const now = Date.now();
+    transaction(raw, (list) => {
+      for (const t of list) runStmt(stmt, [t, now]);
+    })([...unique]);
+    return unique.size;
+  }
+
   /** 删除热词过滤词（删除后该词重新出现在热词榜） */
   function removeKeywordFilter(term) {
-    const t = String(term).trim().toLowerCase();
+    const t = String(term ?? '').trim().toLowerCase();
     if (!t) throw new TypeError('removeKeywordFilter: term 不能为空');
     db.run(sql`DELETE FROM ${sql.raw(KEYWORD_FILTER_TABLE)} WHERE term = ${t}`);
     return t;
   }
 
-  /**
-   * FTS5 模糊搜索（name + files 两列，files 按整个 JSON 字符串匹配）。
-   *
-   * @param {Object} options
-   * @param {string}  options.query                   搜索关键词，必填；清洗后无有效 token 会抛错
-   * @param {'fetchedAt'|'totalSize'|'relevance'} [options.sortBy] 排序列；不传则按 id 排序
-   * @param {'asc'|'desc'} [options.order='desc']     排序方向，仅 sortBy 传入时生效
-   * @param {number} [options.limit=20]               每页条数，钳制至 1..200；传 <=0 或不传表示不限制
-   * @param {number} [options.offset=0]               偏移量，钳制至 >= 0
-   * @returns {{ total: number, limit: number, offset: number, items: Array<Object> }}
-   */
-  /**
-   * 把 minSize / maxSize（字节）构造为 SQL 过滤片段（数值已校验为有限非负）。
-   * 返回 null 表示不加大小过滤。
-   */
-  function sizeFilterSql(minSize, maxSize) {
-    const conds = [];
-    const mn = Number(minSize);
-    const mx = Number(maxSize);
-    if (Number.isFinite(mn) && mn >= 0) conds.push(sql`m.totalSize >= ${mn}`);
-    if (Number.isFinite(mx) && mx >= 0) conds.push(sql`m.totalSize <= ${mx}`);
-    // 注意：bun 下 drizzle-orm/bun-sqlite 会把 sql.join 的字符串分隔符参数化成
-    // 一个 `?`，导致 `>= ? AND <= ?` 错拼成 `>= ?? <= ?`。故改为显式拼接 SQL 片段。
-    if (conds.length === 0) return null;
-    if (conds.length === 1) return conds[0];
-    return sql`${conds[0]} AND ${conds[1]}`;
-  }
-
-  /** 按 infohash 精确检索（大小写不敏感，支持前缀匹配） */
-  function searchByHash({ query, sortBy, order = 'desc', limit, offset, minSize, maxSize }) {
-    // 归一化：剥离 magnet 链接里的 urn:btih: 前缀，并去除所有非字母数字字符
-    const raw = String(query)
-      .replace(/^.*urn:btih:/i, '')
-      .replace(/[^a-zA-Z0-9]/g, '')
-      .toLowerCase();
-    if (!raw) {
-      throw new TypeError('searchByHash: 未提供有效的 infohash');
-    }
-    const { orderSql, limit: lim, offset: off } = normalizeQueryOptions({ sortBy, order, limit, offset });
-    const sf = sizeFilterSql(minSize, maxSize);
-    const sizeCond = sf ? sql` AND ${sf}` : sql``;
-
-    // 归一化匹配：兼容「带/不带 hash 前缀」两种 infohash 存储，并支持前缀检索
-    const cond = sql`lower(m.infohash) = lower(${raw})
-      OR lower(m.infohash) = lower(${'hash' + raw})
-      OR lower(m.infohash) LIKE lower(${raw + '%'})`;
-    const total = Number(dbRO.all(sql`
-      SELECT count(*) AS total FROM ${sql.raw(DOCS_TABLE)} m WHERE ${cond}${sizeCond}
-    `)[0]?.total ?? 0);
-
-    return {
-      total,
-      limit: lim,
-      offset: off,
-      items: dbRO.all(sql`
-        SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m
-        WHERE ${cond}${sizeCond}
-        ${sql.raw(orderSql)}
-        LIMIT ${lim} OFFSET ${off}
-      `).map(mapRow),
-    };
-  }
-
-  function searchMagnets(options = {}) {
-    const { query, sortBy, order = 'desc', by, minSize, maxSize } = options;
-
-    // infohash 未进入 FTS 索引，按 hash 检索时单独走副本表
-    if (by === 'hash') {
-      return searchByHash({ query, sortBy, order, limit: options.limit, offset: options.offset, minSize, maxSize });
-    }
-
-    const match = buildMatchExpression(query);
-    // FTS5 MATCH 必须接收「SQL 字符串字面量」形式的查询表达式（单引号包裹），
-    // 否则 SQLite 会把双引号短语误当标识符、或把参数化占位符 ? 在 prepare 阶段
-    // 抛 fts5: near "?"。match 已白名单化（仅字母数字/双引号/星号/AND），安全。
-    const matchLit = `'${match}'`;
-    if (!match) {
-      throw new TypeError('searchMagnets: options.query 不能为空，且需包含至少一个字母或数字');
-    }
-
-    const { orderSql, limit, offset } = normalizeQueryOptions({
-      sortBy,
-      order,
-      limit: options.limit,
-      offset: options.offset,
-    });
-
-    const sf = sizeFilterSql(minSize, maxSize);
-    const sizeCond = sf ? sql` AND ${sf}` : sql``;
-
-    // total 走 JOIN：源中已删除的残留索引行会被自动剔除，保证 total 与返回数一致
-    const total = Number(dbRO.all(sql`
-      SELECT count(*) AS total FROM ${sql.raw(FTS_TABLE)} f
-      JOIN ${sql.raw(DOCS_TABLE)} m ON m.id = f.rowid
-      WHERE ${sql.raw(FTS_TABLE)} MATCH ${sql.raw(matchLit)}${sizeCond}
-    `)[0]?.total ?? 0);
-
-    return {
-      total,
-      limit,
-      offset,
-      items: dbRO.all(sql`
-        SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(FTS_TABLE)} f
-        JOIN ${sql.raw(DOCS_TABLE)} m ON m.id = f.rowid
-        WHERE ${sql.raw(FTS_TABLE)} MATCH ${sql.raw(matchLit)}${sizeCond}
-        ${sql.raw(orderSql)}
-        LIMIT ${limit} OFFSET ${offset}
-      `).map(mapRow),
-    };
-  }
+  // 检索逻辑抽到模块级 buildSearchApi(dbRO)：主线程与搜索 worker 共用同一套实现，
+  // 取消由 HTTP 层把查询放进 worker 线程、断开时 worker.terminate() 实现（见 src/searchPool.js）。
+  const search = buildSearchApi(dbRO);
 
   /**
    * 在当前进程内同步执行全量重建。供 reindex worker 调用；
@@ -783,20 +878,25 @@ export function createMagnetDb(options = {}) {
    * 运行期增量补录：按 last_rowid 把源库新增行灌入索引（由 index.js 定时调用，默认每小时一次）。
    * 与 reindex() 互斥（reindexPromise 非空）：重建期间跳过本轮，下一周期再试。
    * 不触发全量重建——tokenizer 变更等结构性变更交由重启或手动 reindex 处理。
-   * @param {(p: { done: number, total: number }) => void} [onProgress]
+   *
+   * 注意：这里透传给 populate 的回调签名是 { rows }（每批落库行数），不是 { done, total }；
+   * 需要整体进度的场景请用 reindex() 的 onProgress。
+   *
+   * @param {(p: { rows: number }) => void} [onFlush] 每批落库后回调
+   * @returns {{ skipped: boolean, added: number }} 本轮是否因重建而跳过、补录的 id 跨度
    */
-  function syncIncremental(onProgress) {
+  function syncIncremental(onFlush) {
     // 重建进行中（reindexPromise 非空）则跳过本轮，与 reindex 互斥
-    if (reindexPromise) return;
+    if (reindexPromise) return { skipped: true, added: 0 };
     const src = openSourceRO(sourcePath);
     try {
       const last = Number(getMeta(db, 'last_rowid') ?? '0');
       const max = maxSourceId(src);
-      if (max > last) {
-        populate(db, scanById(src, { from: last, size: REBUILD_BATCH }), onProgress);
-        setMeta(db, 'last_rowid', String(max));
-        optimizeFts(db);
-      }
+      if (max <= last) return { skipped: false, added: 0 };
+      populate(db, scanById(src, { from: last, size: REBUILD_BATCH }), onFlush);
+      setMeta(db, 'last_rowid', String(max));
+      optimizeFts(db);
+      return { skipped: false, added: max - last };
     } finally {
       src.close();
     }
@@ -814,11 +914,15 @@ export function createMagnetDb(options = {}) {
 
   return {
     db,
+    // 实际解析后的路径，供调用方（如搜索子进程池）复用，避免各自再猜一遍路径
+    indexPath,
+    sourcePath,
     countMagnets,
-    searchMagnets,
+    searchMagnets: search.searchMagnetsSync,
     topKeywords,
     listKeywordFilters,
     addKeywordFilter,
+    addKeywordFilters,
     removeKeywordFilter,
     reindex,
     syncIncremental,

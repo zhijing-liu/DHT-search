@@ -585,8 +585,10 @@ async function fetchPage(historyMode = 'replace') {
   } catch (err) {
     if (mySeq !== reqSeq) return;
     setLoading(false);
-    // 主动取消（AbortError）不视为错误
-    showToast(err.name === 'AbortError' ? '已取消搜索' : `请求出错：${err.message}`);
+    // 主动取消（AbortError）：提示统一由 cancelSearch() 负责，这里不再重复弹通知；
+    // 翻页/新搜索覆盖旧请求时的 abort 也无需提示
+    if (err.name === 'AbortError') return;
+    showToast(`请求出错：${err.message}`);
   }
 }
 
