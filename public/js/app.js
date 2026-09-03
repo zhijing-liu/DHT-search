@@ -138,7 +138,7 @@ function formatCount(n) {
 /** 拉取并刷新右上角种子数量 */
 async function loadCount() {
   try {
-    const resp = await fetch('/api/count');
+    const resp = await fetch('api/count');
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || resp.status);
     el.countBadge.textContent = `已索引 ${formatCount(data.count)} 条`;
@@ -238,7 +238,7 @@ function renderHotWordsView() {
 /** 拉取并渲染黑名单列表 */
 async function fetchBlacklist() {
   try {
-    const resp = await fetch('/api/hot/filter');
+    const resp = await fetch('api/hot/filter');
     const data = await resp.json();
     state.blacklistItems = resp.ok ? data.items || [] : [];
     renderBlacklist(state.blacklistItems);
@@ -277,7 +277,7 @@ function renderBlacklist(items) {
 /** 把关键词加入黑名单：从热词视图移除，并刷新黑名单列表 */
 async function addToBlacklist(term) {
   try {
-    const resp = await fetch('/api/hot/filter', {
+    const resp = await fetch('api/hot/filter', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ term }),
@@ -294,7 +294,7 @@ async function addToBlacklist(term) {
 /** 把关键词从黑名单移除：刷新列表并重新拉取热词（被移除的词可能重新出现） */
 async function removeFromBlacklist(term) {
   try {
-    const resp = await fetch(`/api/hot/filter?term=${encodeURIComponent(term)}`, { method: 'DELETE' });
+    const resp = await fetch(`api/hot/filter?term=${encodeURIComponent(term)}`, { method: 'DELETE' });
     if (!resp.ok) return;
     await fetchBlacklist();
     // 重新拉取热词榜，使被解除黑名单的词按热度重新出现
@@ -317,7 +317,7 @@ function showHotWords() {
 /** 一次拉取热词榜：前 200 条作为默认视图，全部用于输入框下拉提示 */
 async function loadHotData() {
   try {
-    const resp = await fetch('/api/hot?limit=1000');
+    const resp = await fetch('api/hot?limit=1000');
     const data = await resp.json();
     const items = resp.ok ? data.items || [] : [];
     state.hotItems = items.slice(0, 200);
@@ -581,7 +581,7 @@ async function fetchPage(historyMode = 'replace') {
 
   setLoading(true);
   try {
-    const resp = await fetch(`/api/search?${params}`, { signal });
+    const resp = await fetch(`api/search?${params}`, { signal });
     const data = await resp.json();
     if (mySeq !== reqSeq) return; // 已有更新的请求，丢弃本次
     if (!resp.ok) {
@@ -709,7 +709,7 @@ async function doReindex() {
   el.reindexBtn.disabled = true;
   el.reindexBtn.textContent = '重建中…';
   try {
-    const resp = await fetch('/api/reindex', { method: 'POST' });
+    const resp = await fetch('api/reindex', { method: 'POST' });
     const data = await resp.json();
     if (!resp.ok) {
       showToast(`重建失败：${data.error || resp.status}`);
@@ -738,7 +738,7 @@ async function doSync() {
   el.syncBtn.disabled = true;
   el.syncBtn.textContent = '同步中…';
   try {
-    const resp = await fetch('/api/sync', { method: 'POST' });
+    const resp = await fetch('api/sync', { method: 'POST' });
     const data = await resp.json();
     if (!resp.ok) {
       showToast(`同步失败：${data.error || resp.status}`);
@@ -804,7 +804,7 @@ function renderStats(d) {
 
 function startStatsStream() {
   if (statsSource) return;
-  statsSource = new EventSource('/api/stats/stream');
+  statsSource = new EventSource('api/stats/stream');
   statsSource.addEventListener('stats', (e) => {
     try {
       renderStats(JSON.parse(e.data));
@@ -935,7 +935,7 @@ el.blacklistFilter.addEventListener('input', () => {
 /** 导出：拉取后端导出的文本，触发浏览器下载 */
 el.blExportBtn.addEventListener('click', async () => {
   try {
-    const resp = await fetch('/api/hot/filter/export');
+    const resp = await fetch('api/hot/filter/export');
     if (!resp.ok) {
       showToast('导出失败');
       return;
@@ -969,7 +969,7 @@ el.blImportFile.addEventListener('change', async () => {
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith('#'));
-    const resp = await fetch('/api/hot/filter/import', {
+    const resp = await fetch('api/hot/filter/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ terms }),
