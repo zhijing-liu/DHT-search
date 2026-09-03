@@ -60,6 +60,18 @@
 
         <div class="settings-section">
           <div class="settings-item">
+            <div class="settings-item-title">运行状态悬浮窗</div>
+            <div class="settings-item-desc">开启后页面右下角常驻显示内存占用、缓存命中率与重建进度</div>
+            <label class="stats-switch" title="开启后页面右下角常驻显示运行状态">
+              <span>开启悬浮窗</span>
+              <input type="checkbox" id="statsToggle" />
+              <span class="stats-track"><span class="stats-thumb"></span></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-item">
             <div class="settings-item-title">RPC 推送（aria2 / Motrix）</div>
             <div class="settings-item-desc">将磁力链接推送到本地下载器；下载器需开启 JSON-RPC 并允许跨域</div>
             <div class="rpc-config">
@@ -148,6 +160,33 @@
       <button id="cancelSearchBtn" type="button" class="loading-cancel">取消搜索</button>
     </div>
   </div>
+
+  <!-- 运行状态悬浮窗：默认贴左边缘只露竖排标签，鼠标移入向右滑出 -->
+  <aside id="statsHud" class="stats-hud" hidden>
+    <div class="stats-hud-panel">
+      <div class="stats-hud-head">
+        <span class="stats-hud-title">运行状态</span>
+        <span id="statsStatus" class="stats-hud-status">连接中…</span>
+      </div>
+      <div class="stats-hud-rows">
+        <div class="stats-row"><span>缓存占用</span><b id="stCache">—</b></div>
+        <div class="stats-row"><span>缓存条目</span><b id="stEntries">—</b></div>
+        <div class="stats-row"><span>命中率</span><b id="stHitRate">—</b></div>
+        <div class="stats-row"><span>堆内存</span><b id="stHeap">—</b></div>
+        <div class="stats-row"><span>RSS</span><b id="stRss">—</b></div>
+        <div class="stats-row"><span>搜索进程</span><b id="stProcs">—</b></div>
+        <div class="stats-row"><span>已索引</span><b id="stIndexed">—</b></div>
+        <div class="stats-row"><span>下次同步</span><b id="stNextSync">—</b></div>
+      </div>
+      <div id="reindexProgress" class="stats-hud-progress" hidden>
+        <div class="reindex-bar"><div id="reindexBarFill" class="reindex-bar-fill"></div></div>
+        <div id="reindexText" class="reindex-text">0 / 0</div>
+      </div>
+    </div>
+    <div class="stats-hud-tab" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+    </div>
+  </aside>
 
   <script type="module" src="/js/app.js"></script>
 </body>

@@ -17,6 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { KEYWORD_FILTER_TABLE, DEFAULT_INDEX_DB_PATH } from '../src/store.js';
 import { openDatabase, setPragma, execRaw, prepareStmt, runStmt, transaction, closeDb, getRow } from '../src/db-driver.js';
+import { normalizeKeyword } from '../src/db.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORDS_FILE = path.join(HERE, 'hot-filter-words.txt');
@@ -56,9 +57,9 @@ const now = Date.now();
 let added = 0;
 transaction(db, (list) => {
   for (const w of list) {
-    // 小写归一（与热词统计的 token 折叠行为一致），并剔除不含字母数字的行
-    const term = w.toLowerCase();
-    if (!term || !/[\p{L}\p{N}]/u.test(term)) continue;
+    // 复用 db 层的归一化：小写折叠 + 剔除不含字母数字的行
+    const term = normalizeKeyword(w);
+    if (!term) continue;
     const info = runStmt(ins, [term, now]);
     if (info.changes > 0) added += 1;
   }

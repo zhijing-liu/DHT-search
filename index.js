@@ -24,6 +24,17 @@ import { createSearchExecutor } from './src/searchPool.js';
 import { CONFIG } from './src/store.js';
 import { LRUCache } from 'lru-cache';
 import { log } from './src/logger.js';
+import {
+  runtimeStats,
+  markCacheHit,
+  markCacheMiss,
+  beginReindex,
+  setReindexProgress,
+  endReindex,
+  beginSync,
+  endSync,
+  initSyncClock,
+} from './src/stats.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -100,13 +111,19 @@ app.use((req, res, next) => {
 /** 未预期异常的兜底文案（仅当 err.message 为空时启用） */
 const INTERNAL_ERROR = 'internal error';
 
-/** 统一包装 API 处理器：同步或异步执行，异常时按指定状态码返回 { error } */
-function apiHandler(fn, status = 500) {
+/**
+ * 统一包装 API 处理器：同步或异步执行，异常时按指定状态码返回 { error }。
+ * @param {Function} fn       处理器（可同步或返回 Promise）
+ * @param {number}   status  异常时响应的 HTTP 状态码，默认 500
+ * @param {string}   defaultMessage 当 err.message 为空时使用的兜底文案
+ *        （默认 INTERNAL_ERROR）；调用方可传更具语义的提示，例如 'list filter failed'
+ */
+function apiHandler(fn, status = 500, defaultMessage = INTERNAL_ERROR) {
   return (req, res) => {
     Promise.resolve()
       .then(() => fn(req, res))
       .catch((err) => {
-        if (!res.headersSent) res.status(status).json({ error: err?.message || INTERNAL_ERROR });
+        if (!res.headersSent) res.status(status).json({ error: err?.message || defaultMessage });
       });
   };
 }
@@ -142,11 +159,13 @@ app.get('/api/search', apiHandler(async (req, res) => {
   const key = searchCacheKey(s);
   const cached = searchCache.get(key);
   if (cached) {
+    markCacheHit();
     log.cache('HIT', describeSearch(s));
     // 缓存里已是序列化好的 JSON 字符串，直接回写，省掉一次完整 stringify
     res.type('application/json');
     return res.send(cached);
   }
+  markCacheMiss();
   log.cache('MISS', describeSearch(s));
 
   // 把检索放进独立子进程执行；客户端断开时 SIGKILL 该进程，直接中断其正在执行的
@@ -205,9 +224,17 @@ app.get('/api/search', apiHandler(async (req, res) => {
 /** 手动全量重建影子索引（在 worker 线程中执行，重建期间检索仍可用） */
 app.post('/api/reindex', apiHandler(async (_req, res) => {
   log.user('手动触发全量索引重建');
-  const indexed = await api.reindex(({ done, total }) => {
-    log.progress(`重建进度 ${done}/${total}`);
-  });
+  beginReindex();
+  let indexed;
+  try {
+    indexed = await api.reindex(({ done, total }) => {
+      // 进度写入运行时状态，由 SSE 顺带推送给设置面板（不额外做事件总线）
+      setReindexProgress(done, total);
+      log.progress(`重建进度 ${done}/${total}`);
+    });
+  } finally {
+    endReindex();
+  }
   // 索引内容已变更，清空搜索缓存避免返回旧结果
   searchCache.clear();
   log.ok(`索引重建完成，累计 ${indexed} 条，已清空搜索缓存`);
@@ -217,7 +244,14 @@ app.post('/api/reindex', apiHandler(async (_req, res) => {
 /** 增量同步最新索引（按 last_rowid 仅补录源库新增行，秒级；与重建互斥） */
 app.post('/api/sync', apiHandler((_req, res) => {
   log.user('手动触发增量同步');
-  const { skipped, added } = api.syncIncremental();
+  let skipped = false;
+  let added = 0;
+  beginSync();
+  try {
+    ({ skipped, added } = api.syncIncremental());
+  } finally {
+    endSync(added);
+  }
   // 确实补录了新行才清缓存；无新增时不必让已有缓存白白失效
   if (added > 0) searchCache.clear();
   if (skipped) {
@@ -232,6 +266,80 @@ app.post('/api/sync', apiHandler((_req, res) => {
 app.get('/api/count', apiHandler((_req, res) => {
   res.json({ count: api.countMagnets() });
 }));
+
+/* ------------------------------------------------------------------ */
+/* 运行状态监测（设置面板 SSE）                                        */
+/* ------------------------------------------------------------------ */
+/**
+ * 已索引总数缓存：count(*) 是百万行主键扫描，代价远大于其他字段，
+ * 故服务端侧降频到 10 秒一次，其余字段随每次推送更新。
+ */
+let indexedCache = { value: 0, at: 0 };
+
+/**
+ * 采集一份完整运行期快照——所有推送字段的唯一组装点。
+ * 新增/删除面板指标只改这个函数，SSE 路由与前端渲染都不必改动。
+ * 注意推的是时间戳而非倒计时：相对时间交给前端本地逐秒渲染，
+ * 服务端无需为此提高推送频率。
+ */
+function collectStats() {
+  if (Date.now() - indexedCache.at > 10_000) {
+    indexedCache = { value: api.countMagnets(), at: Date.now() };
+  }
+  const m = process.memoryUsage();
+  const { hit, miss } = runtimeStats.cache;
+  const total = hit + miss;
+  return {
+    cacheEntries: searchCache.size,
+    cacheBytes: searchCache.calculatedSize,
+    cacheMaxBytes: SEARCH_CACHE_MAX_SIZE,
+    hit,
+    miss,
+    hitRate: total ? +(hit / total).toFixed(4) : 0,
+    heapMB: +(m.heapUsed / 1048576).toFixed(1),
+    rssMB: +(m.rss / 1048576).toFixed(1),
+    processes: searchExecutor.size,
+    indexed: indexedCache.value,
+    nextSyncAt: runtimeStats.sync.nextAt,
+    lastSyncAt: runtimeStats.sync.lastAt,
+    syncing: runtimeStats.sync.running,
+    reindex: runtimeStats.reindex,
+  };
+}
+
+/** 设置面板运行状态流：弹窗打开期间订阅，关闭即断开 */
+app.get('/api/stats/stream', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    // 反代（nginx 等）下禁止缓冲，否则进度条会卡住不动
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders?.();
+  res.write('retry: 3000\n\n');
+
+  let closed = false;
+  /** 清理推送定时器——不清理就是真实的内存泄漏（每打开一次面板残留一个） */
+  function cleanup() {
+    if (closed) return;
+    closed = true;
+    clearInterval(timer);
+  }
+  const push = () => {
+    if (closed) return;
+    try {
+      res.write(`event: stats\ndata: ${JSON.stringify(collectStats())}\n\n`);
+    } catch {
+      cleanup(); // 连接已断，停止推送
+    }
+  };
+  const timer = setInterval(push, 3000);
+
+  push(); // 立即推一次，避免打开面板后空白 3 秒
+  req.on('close', cleanup);
+  res.on('error', cleanup);
+});
 
 /** 热词榜（暂未接入页面，用于验证落库数据） */
 app.get('/api/hot', apiHandler((req, res) => {
@@ -304,20 +412,28 @@ const SYNC_INTERVAL_MS = (() => {
   const v = Number(CONFIG.syncIntervalMs);
   return Number.isFinite(v) && v > 0 ? v : 3600000;
 })();
+// 启动时 createMagnetDb() 内部已同步过一次，据此建立同步节拍（供面板显示倒计时）
+initSyncClock(SYNC_INTERVAL_MS);
 const syncTimer = setInterval(async () => {
+  let added = 0;
+  beginSync();
   try {
     // syncIncremental 是同步函数，这里统一 await + try/catch：既兼容同步返回值，
     // 也能拦住同步抛错，避免回调内未捕获异常直接终止进程
-    const { skipped, added } = await api.syncIncremental();
+    const r = await api.syncIncremental();
+    added = r.added;
     // 只有真的补录了新行才清缓存——否则每小时白白冲掉全部搜索结果
     if (added > 0) {
       searchCache.clear();
       log.ok(`增量同步完成，补录 ${added} 行，已清空搜索缓存`);
-    } else if (!skipped) {
+    } else if (!r.skipped) {
       log.system('增量同步完成，无新增行');
     }
   } catch (err) {
     log.error(`增量同步失败: ${err?.message || err}`);
+  } finally {
+    // 无论成败都推进同步节拍，面板倒计时才不会卡死
+    endSync(added, SYNC_INTERVAL_MS);
   }
 }, SYNC_INTERVAL_MS);
 if (typeof syncTimer.unref === 'function') syncTimer.unref();

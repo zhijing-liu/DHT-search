@@ -33,6 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { log } from './logger.js';
+import { clampInt, normalizeKeyword } from './util.js';
 import {
   isBun,
   openDatabase,
@@ -123,13 +124,6 @@ export function buildMatchExpression(input) {
       return `"${token.toLowerCase()}"${isLast ? '*' : ''}`;
     })
     .join(' AND ');
-}
-
-/** 把任意值钳制为 [min, max] 区间内的整数 */
-function clampInt(value, fallback, min, max) {
-  const num = Number(value);
-  if (!Number.isFinite(num)) return fallback;
-  return Math.min(Math.max(Math.floor(num), min), max);
 }
 
 /**
@@ -227,10 +221,8 @@ function keywordTokens(text) {
  * @param {unknown} term
  * @returns {string} 归一化后的词；无效输入返回空串
  */
-export function normalizeKeyword(term) {
-  const t = String(term ?? '').trim().toLowerCase();
-  return /[\p{L}\p{N}]/u.test(t) ? t : '';
-}
+// normalizeKeyword 的实现见 ./util.js，此处重新导出供 HTTP 层（index.js）引用
+export { normalizeKeyword };
 
 /* ------------------------------------------------------------------ */
 /* 源库只读连接                                                        */

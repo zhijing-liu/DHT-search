@@ -13,7 +13,7 @@
  */
 
 /** SQLite 源库路径：由其他采集程序写入的 magnet.db，构建索引时以只读方式打开 */
-export const SOURCE_DB_PATH = 'G:/active_project/DHT/data/magnet.db';
+export const SOURCE_DB_PATH = 'data/magnet.db';
 
 /** 影子索引库路径：本服务维护的 FTS5 倒排索引 + 去规范化副本都在此库；相对路径基于项目根目录 */
 export const INDEX_DB_PATH = 'data/dht.search.db';

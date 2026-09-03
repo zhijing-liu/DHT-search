@@ -29,6 +29,16 @@ export function formatDate(ts) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/** 把毫秒差格式化为 mm:ss / h:mm:ss（用于同步倒计时） */
+export function formatCountdown(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '-';
+  const s = Math.round(ms / 1000);
+  const p = (x) => String(x).padStart(2, '0');
+  return s >= 3600
+    ? `${Math.floor(s / 3600)}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`
+    : `${p(Math.floor(s / 60))}:${p(s % 60)}`;
+}
+
 /** 复制文本到剪贴板（带降级方案），并提示已复制 */
 export async function copyText(text, btn) {
   try {

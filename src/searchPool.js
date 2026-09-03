@@ -31,14 +31,9 @@
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { log } from './logger.js';
+import { clampInt } from './util.js';
 
 const CHILD_PATH = fileURLToPath(new URL('./search-child.mjs', import.meta.url));
-
-function clampInt(v, dflt, min, max) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return dflt;
-  return Math.min(max, Math.max(min, Math.trunc(n)));
-}
 
 export class SearchExecutor {
   /**

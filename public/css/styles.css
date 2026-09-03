@@ -373,7 +373,6 @@
     flex: 1 1 auto;
     min-height: 0;
     width: 100%;
-    max-width: 1100px;
     display: flex;
     gap: 20px;
     align-items: stretch;
@@ -732,6 +731,46 @@
   .settings-item-title { font-size: 14px; font-weight: 500; }
   .settings-item-desc { color: var(--muted); font-size: 12px; line-height: 1.45; }
 
+  /* 运行状态悬浮窗开关（外观对齐热词区的 .edit-switch，独立一套避免跨容器耦合） */
+  .stats-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+    cursor: pointer;
+    user-select: none;
+    color: var(--muted);
+    font-size: 13px;
+
+    & input { position: absolute; opacity: 0; width: 0; height: 0; }
+    & .stats-track {
+      position: relative;
+      flex: none;
+      width: 40px;
+      height: 22px;
+      border-radius: 999px;
+      background: var(--border);
+      transition: background 0.15s ease;
+    }
+    & .stats-thumb {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #fff;
+      transition: transform 0.15s ease;
+    }
+    & input:checked + .stats-track {
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+    }
+    & input:checked + .stats-track .stats-thumb { transform: translateX(18px); }
+    & input:focus-visible + .stats-track {
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+    }
+  }
+
   .rpc-config { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
   .rpc-field {
     display: flex; flex-direction: column; gap: 6px;
@@ -794,6 +833,155 @@
   transition: transform 0.15s ease, filter 0.15s ease;
   &:hover { filter: brightness(1.1); transform: rotate(40deg); }
   &:active { transform: rotate(180deg); }
+}
+
+/* ------------------------------------------------------------------ */
+/* 运行状态悬浮窗（贴左下角，避开右下角的悬浮刷新按钮）                  */
+/* ------------------------------------------------------------------ */
+
+.stats-hud {
+  position: fixed;
+  left: 0;
+  bottom: 14px;
+  z-index: 55;
+  display: flex;
+  align-items: stretch;
+  /* 抽屉：默认只露出 26px 把手，把手与面板间恒留 8px 缝（悬浮把手感）；
+     移入时整体向右滑出。34 = 把手 26 + 缝 8 */
+  gap: 8px;
+  transform: translateX(calc(-100% + 34px));
+  /* 收起带 1.2s 延时：鼠标移出后停留片刻再缩回，短暂扫过不会闪缩 */
+  transition: transform 0.25s ease 1.2s;
+  will-change: transform;
+
+  /* display:flex 会盖掉 [hidden] 的 display:none，须显式还原 */
+  &[hidden] { display: none; }
+  &:hover, &:focus-within {
+    transform: translateX(0);
+    /* 展开立即生效：覆盖默认态的收起延时 */
+    transition-delay: 0s;
+  }
+
+  /* 面板本体：半透明 + 毛玻璃，压在内容之上仍能看清底层；
+     把手展开后已淡出，面板四角全圆角、四边全边框 */
+  .stats-hud-panel {
+    width: 196px;
+    padding: 9px 11px;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(31, 41, 55, 0.72);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.32);
+    color: var(--text);
+    font-size: 12px;
+  }
+
+  /* 收起时露出的独立把手：箭头 icon 居中，四角圆角；展开后淡出，面板独立显示 */
+  .stats-hud-tab {
+    flex: none;
+    width: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(31, 41, 55, 0.72);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    box-shadow: 2px 0 12px rgba(0, 0, 0, 0.28);
+    color: var(--muted);
+    cursor: default;
+    user-select: none;
+    opacity: 1;
+    /* 淡入与面板缩回同步（同为 1.2s 延时），不会抢在面板前面冒出来 */
+    transition: opacity 0.2s ease 1.2s;
+  }
+
+  /* 展开后把手淡出并让出交互 */
+  &:hover .stats-hud-tab,
+  &:focus-within .stats-hud-tab {
+    opacity: 0;
+    pointer-events: none;
+    /* 淡出立即生效：覆盖默认态的延时 */
+    transition-delay: 0s;
+  }
+
+  .stats-hud-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .stats-hud-title { font-weight: 600; }
+  .stats-hud-status {
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .stats-hud-rows { display: flex; flex-direction: column; gap: 2px; }
+
+  /* 一行一条：标签靠左、数值靠右等宽对齐 */
+  .stats-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    line-height: 1.65;
+
+    & span { color: var(--muted); white-space: nowrap; }
+    & b {
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+  }
+
+  .stats-hud-progress {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-top: 7px;
+    padding-top: 7px;
+    border-top: 1px solid var(--border);
+
+    /* display:flex 会盖掉 [hidden] 的 display:none，须显式还原 */
+    &[hidden] { display: none; }
+  }
+  .reindex-bar {
+    height: 5px;
+    overflow: hidden;
+    background: var(--bg);
+    border-radius: 999px;
+  }
+  .reindex-bar-fill {
+    width: 0;
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    transition: width 0.3s ease;
+  }
+  .reindex-text {
+    color: var(--muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* 触屏设备没有 hover，抽屉永远展不开，故直接常显 */
+@media (hover: none) {
+  .stats-hud { transform: none; }
+}
+
+/* 窄屏缩窄面板，避免展开后遮挡过多正文 */
+@media (max-width: 560px) {
+  .stats-hud .stats-hud-panel { width: 172px; }
 }
 
 /* ------------------------------------------------------------------ */

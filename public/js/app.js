@@ -1,6 +1,12 @@
 /** 注册自定义元素（<magnet-card> / <magnet-files> / <result-list> / <dht-sort-group>） */
 import './components.js';
-import { getRpcConfig, saveRpcConfig, showToast } from './util.js';
+import {
+  getRpcConfig,
+  saveRpcConfig,
+  showToast,
+  formatBytes,
+  formatCountdown,
+} from './util.js';
 
 const state = {
   query: '',
@@ -70,6 +76,20 @@ const el = {
   sizeRange: document.getElementById('sizeRange'),
   countBadge: document.getElementById('countBadge'),
   suggestions: document.getElementById('suggestions'),
+  statsHud: document.getElementById('statsHud'),
+  statsToggle: document.getElementById('statsToggle'),
+  statsStatus: document.getElementById('statsStatus'),
+  reindexProgress: document.getElementById('reindexProgress'),
+  reindexBarFill: document.getElementById('reindexBarFill'),
+  reindexText: document.getElementById('reindexText'),
+  stCache: document.getElementById('stCache'),
+  stEntries: document.getElementById('stEntries'),
+  stHitRate: document.getElementById('stHitRate'),
+  stHeap: document.getElementById('stHeap'),
+  stRss: document.getElementById('stRss'),
+  stProcs: document.getElementById('stProcs'),
+  stIndexed: document.getElementById('stIndexed'),
+  stNextSync: document.getElementById('stNextSync'),
 };
 
 /** 大小范围固定档位（字节边界） */
@@ -449,7 +469,10 @@ function renderPager(totalPages) {
   state.totalPages = totalPages;
   if (el.jumpPage) {
     el.jumpPage.max = totalPages;
-    el.jumpPage.value = '';
+    // 输入框与当前页码保持同步；用户正在输入（持有焦点）时不打断
+    if (document.activeElement !== el.jumpPage) {
+      el.jumpPage.value = String(state.page);
+    }
     el.jumpPage.parentElement.hidden = totalPages <= 1;
   }
 
@@ -735,7 +758,100 @@ async function doSync() {
   }
 }
 
+/* ---------- 设置面板运行状态（SSE 实时刷新） ---------- */
+
+let statsSource = null;
+/** 最近一份快照：倒计时由本地逐秒重算，不依赖服务端推送频率 */
+let lastStats = null;
+/** 本地倒计时节拍（仅弹窗打开期间运行） */
+let statsTick = null;
+
+/** 下次同步倒计时：服务端只推时间戳，相对时间在本地算 */
+function renderCountdown() {
+  if (!lastStats) return;
+  el.stNextSync.textContent = lastStats.nextSyncAt
+    ? `${formatCountdown(lastStats.nextSyncAt - Date.now())} 后`
+    : '未启用自动同步';
+}
+
+function renderStats(d) {
+  lastStats = d;
+  el.stCache.textContent = `${formatBytes(d.cacheBytes)} / ${formatBytes(d.cacheMaxBytes)}`;
+  el.stEntries.textContent = `${d.cacheEntries} 条`;
+  el.stHitRate.textContent = `${(d.hitRate * 100).toFixed(1)}%（${d.hit} / ${d.hit + d.miss}）`;
+  el.stHeap.textContent = `${d.heapMB} MB`;
+  el.stRss.textContent = `${d.rssMB} MB`;
+  el.stProcs.textContent = `${d.processes} 个`;
+  el.stIndexed.textContent = d.indexed.toLocaleString('zh-CN');
+  renderCountdown();
+
+  // 重建进度条：仅重建中且总数已知时显示
+  const bar = d.reindex && d.reindex.running && d.reindex.total > 0;
+  el.reindexProgress.hidden = !bar;
+  if (bar) {
+    const pct = (d.reindex.done / d.reindex.total) * 100;
+    el.reindexBarFill.style.width = `${pct.toFixed(1)}%`;
+    el.reindexText.textContent =
+      `${d.reindex.done.toLocaleString('zh-CN')} / ${d.reindex.total.toLocaleString('zh-CN')}（${pct.toFixed(1)}%）`;
+  }
+
+  el.statsStatus.textContent = d.reindex && d.reindex.running
+    ? '正在重建索引…'
+    : d.syncing
+      ? '正在同步索引…'
+      : '每 3 秒自动刷新';
+}
+
+function startStatsStream() {
+  if (statsSource) return;
+  statsSource = new EventSource('/api/stats/stream');
+  statsSource.addEventListener('stats', (e) => {
+    try {
+      renderStats(JSON.parse(e.data));
+    } catch {
+      /* 忽略脏帧，等下一帧补上 */
+    }
+  });
+  // EventSource 自带重连，这里只更新状态提示
+  statsSource.onerror = () => { el.statsStatus.textContent = '连接中断，正在重连…'; };
+  // 倒计时每秒走一次，不必为此提高服务端推送频率
+  statsTick = setInterval(renderCountdown, 1000);
+}
+
+function stopStatsStream() {
+  if (statsSource) {
+    statsSource.close();
+    statsSource = null;
+  }
+  if (statsTick) {
+    clearInterval(statsTick);
+    statsTick = null;
+  }
+  lastStats = null;
+}
+
 el.settingsBtn.addEventListener('click', () => el.settingsDialog.showModal());
+
+/* ---------- 运行状态悬浮窗开关（选择持久化到 localStorage） ---------- */
+
+const STATS_HUD_KEY = 'dht_stats_hud';
+
+/** 应用开关状态：开启则显示悬浮窗并订阅 SSE，关闭则隐藏并断开连接 */
+function applyStatsToggle(on) {
+  el.statsToggle.checked = on;
+  el.statsHud.hidden = !on;
+  if (on) startStatsStream();
+  else stopStatsStream();
+}
+
+el.statsToggle.addEventListener('change', () => {
+  const on = el.statsToggle.checked;
+  localStorage.setItem(STATS_HUD_KEY, on ? '1' : '0');
+  applyStatsToggle(on);
+});
+
+// 恢复上次的选择：开着就立即连上，不依赖弹窗是否打开
+applyStatsToggle(localStorage.getItem(STATS_HUD_KEY) === '1');
 
 /* ---------- RPC 推送配置（aria2 / Motrix）持久化 ---------- */
 function initRpcSettings() {
@@ -1001,14 +1117,34 @@ el.pageSize.addEventListener('change', () => {
   fetchPage();
 });
 
-// 页码跳转：回车跳转
+// 页码跳转：回车跳转；非法输入用 toast 提示（不再静默忽略），并选中内容便于直接改
 el.jumpPage.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
-  const page = parseInt(el.jumpPage.value, 10);
-  if (!Number.isFinite(page) || page < 1 || page > state.totalPages) return;
+  const raw = el.jumpPage.value.trim();
+  const page = parseInt(raw, 10);
+  if (!raw || !Number.isFinite(page)) {
+    showToast('请输入有效页码');
+    el.jumpPage.select();
+    return;
+  }
+  if (page < 1) {
+    showToast('页码不能小于 1');
+    el.jumpPage.select();
+    return;
+  }
+  if (page > state.totalPages) {
+    showToast(`超出最大页数，共 ${state.totalPages} 页`);
+    el.jumpPage.select();
+    return;
+  }
   state.page = page;
+  // 失焦：结果返回后 renderPager 才能同步新页码（它不覆盖持有焦点的输入框）
+  el.jumpPage.blur();
   fetchPage();
 });
+
+// 点进输入框自动全选当前页码，直接键入目标页即可
+el.jumpPage.addEventListener('focus', () => el.jumpPage.select());
 
 // 大小范围变化后重新搜索（仅在有查询词时；空查询回到热词视图）
 el.sizeRange.addEventListener('change', () => { if (state.query) doSearch(); });
