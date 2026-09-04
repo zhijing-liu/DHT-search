@@ -22,6 +22,17 @@ export const INDEX_DB_PATH = 'data/dht.search.db';
 export const PORT = 3000;
 
 /**
+ * 前端静态资源部署前缀（vite build 的 base 路径）。
+ * - 空字符串（默认）：资源按站点根引用（/assets/...），适合服务直接对外、或 nginx
+ *   把后端「剥前缀」后放在站点根的场景；
+ * - 设为 `/dht`（或 `/dht/`）：构建产物的 index.html 将以 /dht/assets/... 引用资源，
+ *   适合服务被 nginx 等反代部署在子路径的场景（nginx 示例：
+ *   `location /dht/ { proxy_pass http://127.0.0.1:3000/; }`，去掉尾斜杠即剥掉前缀）。
+ * 本项只被 web/vite.config.js 读取，仅影响 `npm run build:web` 的构建结果，改后需重新构建。
+ */
+export const WEB_BASE_PATH = '';
+
+/**
  * 单次「整集拉取」（limit=all）最多返回条数，超出则 truncated=true
  * （0 表示不限制，上限由代码兜底为 20000）。
  * 注意：分页路径由 db.js 的 MAX_LIMIT（200）约束，与本项无关。

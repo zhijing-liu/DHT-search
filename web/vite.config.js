@@ -1,7 +1,19 @@
 import { defineConfig } from 'vite'
 import tailwindcss from '@tailwindcss/vite'
+import { WEB_BASE_PATH } from '../config.js'
+
+/**
+ * 部署前缀 -> vite base：
+ * - '' / '/' / 缺省 → '/'（站点根，与改动前行为一致）
+ * - '/dht' / 'dht/' → '/dht/'
+ */
+// 可选：构建时用 VITE_BASE 环境变量临时覆盖 config.js（CI / 临时验证用）
+const raw = String(process.env.VITE_BASE ?? WEB_BASE_PATH ?? '').trim()
+const base = !raw || raw === '/' ? '/' : `/${raw.replace(/^\/+|\/+$/g, '')}/`
 
 export default defineConfig({
+  // 产物 index.html 中 css/js 的引用前缀，交由 config.js 的 WEB_BASE_PATH 控制
+  base,
   plugins: [
     tailwindcss(),
   ],
