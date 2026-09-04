@@ -13,8 +13,5 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@tailwindcss/vite": "^4.3.3",
-    "tailwindcss": "^4.3.3",
-    "vite": "^8.2.2"
   }
 }
