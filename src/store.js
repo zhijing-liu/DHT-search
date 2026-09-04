@@ -13,6 +13,7 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isCompiledExe } from './db-driver.js';
 import {
   SOURCE_DB_PATH,
   INDEX_DB_PATH,
@@ -30,17 +31,21 @@ import {
   SEARCH_PROCESS_IDLE_MS,
   SEARCH_QUEUE_MAX,
   SEARCH_QUEUE_TIMEOUT_MS,
-} from '../config.js';
+} from './settings.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-/** 项目根目录：config.js 与 data/ 都在此处（不在 src/ 下） */
-const ROOT_DIR = path.resolve(MODULE_DIR, '..');
+/**
+ * 根基准目录：相对路径（config.js 的 data/… 路径项）都以它为基。
+ * 源码态是仓库根；编译产物（bun --compile）内 import.meta.url 指向虚拟文件系统，
+ * 改用 exe 同目录 —— 部署时把 config.js / public/ / data/ 放在 exe 旁边即可。
+ */
+const ROOT_DIR = isCompiledExe ? path.dirname(process.execPath) : path.resolve(MODULE_DIR, '..');
 
 /**
  * 来自 config.js 的运行期配置。
  * 这里把 config.js 里「独立 export const 变量」重新聚合成 CONFIG.xxx 形式，
  * 仅为向上兼容 db.js / index.js 既有的 CONFIG.xxx 访问方式；
- * 新代码建议直接 `import { PORT } from '../config.js'` 引用具名常量。
+ * 新代码建议直接 `import { PORT } from './settings.js'` 引用具名常量。
  */
 export const CONFIG = {
   sourceDbPath: SOURCE_DB_PATH,

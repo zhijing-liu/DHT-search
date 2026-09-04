@@ -1,0 +1,72 @@
+/**
+ * 纯压缩：把 dist/ 按完整结构打成 release/DHT-Search-<版本号>.zip
+ * ------------------------------------------------------------------
+ * 本脚本只做压缩，不做任何构建 / 同步 —— 构建请先执行 `npm run build:exe`。
+ *
+ *   用法：npm run pack:zip
+ *   产物：release/DHT-Search-v<版本号>.zip
+ *
+ * 细节：
+ *   - zip 内含顶层目录 DHT-Search/，解压即得完整交付目录（结构原样保留）；
+ *   - 空目录（如尚未放数据库的 data/）也会写入条目，解压后可见；
+ *   - exe / db 等高熵二进制走 store（仅归档不压缩），速度更快。
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const DIST = path.join(ROOT, 'dist');
+const RELEASE = path.join(ROOT, 'release');
+const ZIP_ROOT = 'DHT-Search'; // zip 内的顶层目录名
+
+const exeName = process.platform === 'win32' ? 'DHT-Search.exe' : 'DHT-Search';
+if (!fs.existsSync(path.join(DIST, exeName))) {
+  console.error(`[pack] dist/ 里没有 ${exeName} —— 请先执行 npm run build:exe`);
+  process.exit(1);
+}
+
+const { version } = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+const zipName = `DHT-Search-v${version}.zip`;
+fs.mkdirSync(RELEASE, { recursive: true });
+const outPath = path.join(RELEASE, zipName);
+if (fs.existsSync(outPath)) fs.rmSync(outPath);
+
+console.log(`[pack] 压缩 dist/ → release/${zipName} ...`);
+// archiver v8 起改为类 API：new ZipArchive(options)；旧 v7 是 archiver('zip', options) 函数
+const { ZipArchive } = await import('archiver');
+const output = fs.createWriteStream(outPath);
+const archive = new ZipArchive({ zlib: { level: 9 } });
+const done = new Promise((resolve, reject) => {
+  output.on('close', resolve);
+  archive.on('error', reject);
+});
+archive.pipe(output);
+
+// exe / db 已是高熵二进制，压缩收益趋近于零，走 store 模式显著提速
+const storeRe = /\.(exe|db|zip|7z|gz)$/i;
+
+/** 递归收集 dist 下所有文件与目录，zip 内统一挂在 DHT-Search/ 顶层目录下 */
+function addDir(dir, rel = '') {
+  let hasContent = false;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const abs = path.join(dir, entry.name);
+    const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      if (addDir(abs, relPath)) hasContent = true;
+      continue;
+    }
+    archive.file(abs, { name: `${ZIP_ROOT}/${relPath}`, store: storeRe.test(entry.name) });
+    hasContent = true;
+  }
+  // 空目录不会随文件进 zip：显式写目录条目，保证解压后结构完整（如空的 data/）
+  if (!hasContent && rel) archive.append('', { name: `${ZIP_ROOT}/${rel}/` });
+  return hasContent;
+}
+addDir(DIST);
+
+await archive.finalize();
+await done;
+
+const sizeMb = (fs.statSync(outPath).size / 1048576).toFixed(1);
+console.log(`[pack] 完成: release/${zipName}（${sizeMb} MB）`);

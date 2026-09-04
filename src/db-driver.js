@@ -20,6 +20,17 @@
 
 const isBun = typeof Bun !== 'undefined';
 
+/**
+ * 是否运行在 bun build --compile 编译产物中。
+ * 判据：编译产物内所有模块的 import.meta.url 都指向 Bun 的虚拟文件系统 ——
+ * Unix 下是 /$bunfs/root/…，Windows 下是虚拟盘 B:/~BUN/root/…（URL 编码为 %7EBUN）；
+ * 源码运行时是磁盘真实路径。注意不能用 argv[1] / existsSync 判别：编译产物里
+ * argv[1] 是虚拟脚本路径且 existsSync 对它返回 true。Node 运行时恒为 false。
+ */
+const VIRTUAL_FS_MARKERS = ['/$bunfs/', '%7EBUN/', '~BUN/'];
+export const isCompiledExe =
+  isBun && VIRTUAL_FS_MARKERS.some((marker) => import.meta.url.includes(marker));
+
 let Database;
 let drizzle;
 
@@ -27,8 +38,17 @@ if (isBun) {
   ({ Database } = await import('bun:sqlite'));
   ({ drizzle } = await import('drizzle-orm/bun-sqlite'));
 } else {
-  Database = (await import('better-sqlite3')).default;
-  ({ drizzle } = await import('drizzle-orm/better-sqlite3'));
+  // 注意：包名不能写成可被静态分析的字面量 —— bun build --compile 会把字面量动态
+  // import（甚至 process.env.X ?? '字面量' 这类可常量折叠的表达式）解析成构建期依赖：
+  // 打包时报 Could not resolve；标 external 则会在 exe 启动时尝试解析同样报错。
+  // 而编译/分发环境里根本没有 better-sqlite3（Node 专用原生模块，Bun 路径用内置
+  // bun:sqlite）。用 join 拼接后打包器无法折叠，真正的 import 只会在 Node 源码态触达。
+  const nodeSqlite = ['better-sqlite', '3'].join('');
+  Database = (await import(nodeSqlite)).default;
+  // drizzle 的 Node 驱动同样不可写字面量：其 driver.js 顶部硬 import "better-sqlite3"，
+  // 字面量动态 import 会把整条依赖链拉进编译期解析，而包不在编译环境里
+  const nodeDriver = ['drizzle-orm/better-sqlite', '3'].join('');
+  ({ drizzle } = await import(nodeDriver));
 }
 
 export { isBun, Database, drizzle };

@@ -9,6 +9,8 @@
     "dev:bun": "bun --watch index.js",
     "dev:web": "npm --prefix web run dev",
     "build:web": "npm --prefix web run build",
+    "build:exe": "npm run build:web & bun scripts/build-exe.mjs",
+    "pack:zip": "node scripts/pack-zip.mjs",
     "smoke": "node test/smoke.mjs",
     "test": "node test/smoke.mjs",
     "seed:filter": "node scripts/seed-filter.mjs",
@@ -36,6 +38,7 @@
     "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {
+    "archiver": "^8.0.0",
     "nodemon": "^3.1.14"
   }
 }

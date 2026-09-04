@@ -22,7 +22,8 @@ import express from 'express';
 import { createMagnetDb, normalizeSearchQuery, normalizeKeyword } from './src/db.js';
 import { createSearchExecutor } from './src/searchPool.js';
 import { createAccessControl } from './src/accessControl.js';
-import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY } from './config.js';
+import { isCompiledExe } from './src/db-driver.js';
+import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY } from './src/settings.js';
 import { CONFIG } from './src/store.js';
 import { LRUCache } from 'lru-cache';
 import { log } from './src/logger.js';
@@ -38,7 +39,11 @@ import {
   initSyncClock,
 } from './src/stats.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// 编译产物（bun --compile）内 import.meta.url 指向虚拟文件系统，静态资源目录
+// 改取 exe 同目录的 public/；源码态行为不变
+const __dirname = isCompiledExe
+  ? path.dirname(process.execPath)
+  : path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 // 端口唯一来源是 config.js（env 兜底永不生效，已移除，见 config.js 顶部说明）

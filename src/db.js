@@ -32,13 +32,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
-import { fork } from 'node:child_process';
+import { fork, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { log } from './logger.js';
 import { runtimeStats } from './stats.js';
 import { clampInt, normalizeKeyword } from './util.js';
 import {
   isBun,
+  isCompiledExe,
   openDatabase,
   createDrizzle,
   setPragma,
@@ -54,6 +55,7 @@ import {
 } from './db-driver.js';
 import { sql, eq, count } from 'drizzle-orm';
 import { magnetsDocs, syncMeta } from './schema.js';
+import { INDEX_WORKER_FLAG } from './worker-flags.js';
 import {
   CONFIG,
   resolveDbPath,
@@ -69,7 +71,7 @@ import {
   MAX_LIMIT,
   SORT_COLUMNS,
 } from './store.js';
-import { MAX_RESULTS } from '../config.js';
+import { MAX_RESULTS } from './settings.js';
 
 /**
  * 排序 SQL 白名单。ORDER BY 的列名与方向无法参数化，故写死为常量按需取用，
@@ -888,13 +890,17 @@ export function createMagnetDb(options = {}) {
    */
   function spawnIndexChild(mode, onProgress) {
     return new Promise((resolve, reject) => {
-      const child = fork(REINDEX_WORKER_PATH, [], {
-        stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-        env: {
-          ...process.env,
-          DHT_REINDEX_JOB: JSON.stringify({ sourcePath, indexPath, mode }),
-        },
-      });
+      const stdio = ['ignore', 'inherit', 'inherit', 'ipc'];
+      const env = {
+        ...process.env,
+        DHT_REINDEX_JOB: JSON.stringify({ sourcePath, indexPath, mode }),
+      };
+      // 源码运行：fork 磁盘上的执行体；编译产物（bun --compile）内本文件位于虚拟
+      // 文件系统、无法 fork，改为 spawn exe 自身并传启动标记自拉起 —— 两种方式的
+      // IPC 消息协议一致（见 reindex-worker.js）
+      const child = isCompiledExe
+        ? spawn(process.execPath, [INDEX_WORKER_FLAG], { stdio, env })
+        : fork(REINDEX_WORKER_PATH, [INDEX_WORKER_FLAG], { stdio, env });
       reindexWorker = child;
 
       let settled = false;

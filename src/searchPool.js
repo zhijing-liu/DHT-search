@@ -28,10 +28,12 @@
  *   - 仍在队列中：直接从队列移除，零成本取消；
  *   - 已派发：SIGKILL 该进程，真正中断其正在执行的同步查询。
  */
-import { fork } from 'node:child_process';
+import { fork, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { log } from './logger.js';
 import { clampInt } from './util.js';
+import { isCompiledExe } from './db-driver.js';
+import { SEARCH_WORKER_FLAG } from './worker-flags.js';
 
 const CHILD_PATH = fileURLToPath(new URL('./search-child.mjs', import.meta.url));
 
@@ -101,10 +103,13 @@ export class SearchExecutor {
     const env = this.indexPath
       ? { ...process.env, DHT_SEARCH_INDEX_DB_PATH: this.indexPath }
       : process.env;
-    const child = fork(CHILD_PATH, [], {
-      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-      env,
-    });
+    const stdio = ['ignore', 'inherit', 'inherit', 'ipc'];
+    // 源码运行：fork 磁盘上的执行体；编译产物（bun --compile）内本文件位于虚拟
+    // 文件系统、无法 fork，改为 spawn exe 自身并传启动标记自拉起 —— 两种方式的
+    // IPC 消息协议一致（见 search-child.mjs）
+    const child = isCompiledExe
+      ? spawn(process.execPath, [SEARCH_WORKER_FLAG], { stdio, env })
+      : fork(CHILD_PATH, [SEARCH_WORKER_FLAG], { stdio, env });
     const slot = {
       child,
       busy: false,
