@@ -45,6 +45,26 @@ const PORT = Number(CONFIG.port) || Number(process.env.PORT) || 3000;
 
 const api = createMagnetDb();
 
+/* ------------------------------------------------------------------ */
+/* 已索引总数内存缓存（事件驱动）                                      */
+/* ------------------------------------------------------------------ */
+/**
+ * count(*) 是百万行主键扫描，代价远高于其他查询。但 magnets_docs 的行数
+ * 只在「会改动索引的事件」后才变化：启动初始化、增量同步补录新行、全量重建完成。
+ * 故改为事件驱动的内存缓存——这些事件成功后调用 syncIndexedCount() 刷新一次，
+ * 平时直接返回内存值，不再每次请求都扫表。
+ */
+let indexedCountCache = { value: null };
+function syncIndexedCount() {
+  try {
+    indexedCountCache.value = api.countMagnets();
+  } catch {
+    indexedCountCache.value = null; // 失败留空，下次请求懒加载兜底
+  }
+}
+// 启动即初始化（createMagnetDb 内部已完成启动同步，索引库已是正确状态）
+syncIndexedCount();
+
 // 搜索子进程池：检索在独立进程中执行，客户端断开时 SIGKILL 该进程即可真正中断查询
 // （worker 线程的 terminate() 无法中断同步原生查询，详见 src/searchPool.js 文件头）。
 // 进程按需 fork：启动时 0 个，第一个查询到来才启动，客户端断开或空闲超时后回收，
@@ -251,6 +271,8 @@ app.post('/api/reindex', apiHandler(async (_req, res) => {
   }
   // 索引内容已变更，清空搜索缓存避免返回旧结果
   searchCache.clear();
+  // 行数已彻底变化，刷新内存中的总数（重建完成、最终值已落库）
+  syncIndexedCount();
   log.ok(`索引重建完成，累计 ${indexed} 条，已清空搜索缓存`);
   res.json({ ok: true, indexed });
 }));
@@ -267,7 +289,11 @@ app.post('/api/sync', apiHandler((_req, res) => {
     endSync(added);
   }
   // 确实补录了新行才清缓存；无新增时不必让已有缓存白白失效
-  if (added > 0) searchCache.clear();
+  if (added > 0) {
+    searchCache.clear();
+    // 行数增加，刷新内存中的总数
+    syncIndexedCount();
+  }
   if (skipped) {
     log.warn('增量同步跳过（重建进行中）');
   } else {
@@ -276,20 +302,15 @@ app.post('/api/sync', apiHandler((_req, res) => {
   res.json({ ok: true, skipped, added });
 }));
 
-/** 当前已索引的 magnet 总数 */
+/** 当前已索引的 magnet 总数（直接读事件驱动的内存缓存，不扫表） */
 app.get('/api/count', apiHandler((_req, res) => {
-  res.json({ count: api.countMagnets() });
+  if (indexedCountCache.value == null) syncIndexedCount(); // 兜底懒加载
+  res.json({ count: indexedCountCache.value ?? 0 });
 }));
 
 /* ------------------------------------------------------------------ */
 /* 运行状态监测（设置面板 SSE）                                        */
 /* ------------------------------------------------------------------ */
-/**
- * 已索引总数缓存：count(*) 是百万行主键扫描，代价远大于其他字段，
- * 故服务端侧降频到 10 秒一次，其余字段随每次推送更新。
- */
-let indexedCache = { value: 0, at: 0 };
-
 /**
  * 采集一份完整运行期快照——所有推送字段的唯一组装点。
  * 新增/删除面板指标只改这个函数，SSE 路由与前端渲染都不必改动。
@@ -297,9 +318,7 @@ let indexedCache = { value: 0, at: 0 };
  * 服务端无需为此提高推送频率。
  */
 function collectStats() {
-  if (Date.now() - indexedCache.at > 10_000) {
-    indexedCache = { value: api.countMagnets(), at: Date.now() };
-  }
+  if (indexedCountCache.value == null) syncIndexedCount();
   const m = process.memoryUsage();
   const { hit, miss } = runtimeStats.cache;
   const total = hit + miss;
@@ -313,7 +332,7 @@ function collectStats() {
     heapMB: +(m.heapUsed / 1048576).toFixed(1),
     rssMB: +(m.rss / 1048576).toFixed(1),
     processes: searchExecutor.size,
-    indexed: indexedCache.value,
+    indexed: indexedCountCache.value ?? 0,
     nextSyncAt: runtimeStats.sync.nextAt,
     lastSyncAt: runtimeStats.sync.lastAt,
     syncing: runtimeStats.sync.running,
@@ -439,6 +458,8 @@ const syncTimer = setInterval(async () => {
     // 只有真的补录了新行才清缓存——否则每小时白白冲掉全部搜索结果
     if (added > 0) {
       searchCache.clear();
+      // 行数增加，刷新内存中的总数
+      syncIndexedCount();
       log.ok(`增量同步完成，补录 ${added} 行，已清空搜索缓存`);
     } else if (!r.skipped) {
       log.system('增量同步完成，无新增行');
