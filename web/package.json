@@ -9,8 +9,9 @@
     "preview": "vite preview"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "liuzixin",
+  "license": "MIT",
+  "private": true,
   "type": "module",
   "dependencies": {
   }

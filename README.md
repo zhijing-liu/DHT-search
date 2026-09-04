@@ -198,6 +198,10 @@ DHT-search/
    # 或
    bun install                 # Bun 路径（bunfig.toml 已跳过 better-sqlite3）
    ```
+
+   > ⚠️ **npm 与 Bun 共用同一个 `node_modules`，切换包管理器后请重新安装依赖**：
+   > `bun install` 会跳过并**移除** `better-sqlite3`（Bun 运行时用内置 `bun:sqlite`，不需要它）；
+   > 而以 Node 跑源码 / 测试时需要它，此时执行 `npm install better-sqlite3` 恢复即可。
 4. 构建前端（首次部署需执行一次；产物已存在时可跳过）：
    ```bash
    npm run build:web           # web/ → public/（Vite + Tailwind）

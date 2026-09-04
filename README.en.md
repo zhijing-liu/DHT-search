@@ -192,6 +192,10 @@ Path resolution priority: **explicit argument > config.js > module default** (co
    # or
    bun install                 # Bun path (bunfig.toml skips better-sqlite3)
    ```
+
+   > ⚠️ **npm and Bun share the same `node_modules`; re-install after switching package managers**:
+   > `bun install` skips and **removes** `better-sqlite3` (the Bun runtime uses the built-in `bun:sqlite` and doesn't need it);
+   > running the source / tests on Node does need it — restore with `npm install better-sqlite3`.
 4. Build the frontend (once for first deployment; skip if `public/` already exists):
    ```bash
    npm run build:web           # web/ → public/ (Vite + Tailwind)
