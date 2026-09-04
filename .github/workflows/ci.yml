@@ -5,6 +5,10 @@ on:
     branches: [master, main]
   pull_request:
 
+# 最小权限：只读仓库内容即可完成测试
+permissions:
+  contents: read
+
 jobs:
   node:
     name: Node ${{ matrix.node }} on ${{ matrix.os }}
@@ -15,8 +19,8 @@ jobs:
         node: [20, 22]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
       - name: Install dependencies
@@ -34,7 +38,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
