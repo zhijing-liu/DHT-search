@@ -247,17 +247,23 @@ pm2 delete  <name>    # 删除
 ```
 
 ### 单文件 exe（bun build --compile）
-在开发机上打包一次，目标机器**无需安装 Bun / Node 与任何依赖**。两步走：
+在开发机上打包一次，目标机器**无需安装 Bun / Node 与任何依赖**。
+
+**一键出包**（推荐）：
 
 ```bash
-npm run build:exe        # 需 Bun ≥ 1.2.17：build:web & bun 打包 + 收尾（产物输出 dist/）
-npm run pack:zip         # 纯压缩：dist/ → release/DHT-Search-v<版本号>.zip
+npm run build:zip        # = build:exe & pack:zip，产物 release/DHT-Search-v<版本号>.zip
 ```
 
-- `build:exe` 在 package.json 中用 `&` 把 `build:web` 链在 `bun scripts/build-exe.mjs` 之前，
-  一条命令完成：前端构建 → exe 编译 → 同步 public → 复制 config.js / README.md → 创建空 data/；
-- `pack:zip` 只做压缩，不做任何构建；zip 内含 `DHT-Search/` 顶层目录，解压即得完整交付结构
-  （空的 `data/` 目录也会保留）。
+`build:zip` 在 package.json 中用 `&` 串联两个阶段，也可单独调用：
+
+| 命令 | 做什么 | 产物 |
+|------|--------|------|
+| `npm run build:exe` | 前端构建（`build:web`）→ exe 编译 → 同步 public → 复制 config.js / README.md → 创建空 data/ | `dist/` 完整交付目录 |
+| `npm run pack:zip` | 纯压缩，不做任何构建 | `release/DHT-Search-v<版本号>.zip` |
+
+- `build:exe` 同样以 `&` 把 `build:web` 链在 `bun scripts/build-exe.mjs` 之前（需 Bun ≥ 1.2.17）；
+- `pack:zip` 只做压缩；zip 内含 `DHT-Search/` 顶层目录，解压即得完整交付结构（空的 `data/` 目录也会保留）。
 
 `dist/` 即完整交付目录：
 
