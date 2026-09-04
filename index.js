@@ -269,6 +269,8 @@ app.post('/api/reindex', apiHandler(async (_req, res) => {
   } finally {
     endReindex();
   }
+  // 重建完成，索引基数已变，让自动同步节拍从此时顺延一个周期
+  endSync(0, SYNC_INTERVAL_MS);
   // 索引内容已变更，清空搜索缓存避免返回旧结果
   searchCache.clear();
   // 行数已彻底变化，刷新内存中的总数（重建完成、最终值已落库）
@@ -286,7 +288,8 @@ app.post('/api/sync', apiHandler((_req, res) => {
   try {
     ({ skipped, added } = api.syncIncremental());
   } finally {
-    endSync(added);
+    // 传周期，让自动同步节拍从本次手动同步顺延一个周期（否则 nextAt 不变）
+    endSync(added, SYNC_INTERVAL_MS);
   }
   // 确实补录了新行才清缓存；无新增时不必让已有缓存白白失效
   if (added > 0) {
