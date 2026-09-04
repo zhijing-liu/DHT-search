@@ -184,7 +184,7 @@ Path resolution priority: **explicit argument > config.js > module default** (co
 
 1. **Source DB**: `data/magnet.db` must exist and contain a `magnets` table (written by an external DHT crawler). Startup fails otherwise.
 2. **Runtime** (either one):
-   - **Node**: needs `better-sqlite3` (native C++ module; `npm install` prebuilds/compiles automatically). Node ≥ 14.8 (top-level await).
+   - **Node**: needs `better-sqlite3` (native C++ module; `npm install` prebuilds/compiles automatically). Node ≥ 20 (top-level await); **22 / 24 LTS recommended** (Node 20 went EOL 2026-04 and is no longer tested in CI).
    - **Bun**: `bun:sqlite` built-in, no native compilation. The root `bunfig.toml` sets `[install] optional = false` so `bun install` skips `optionalDependencies`' better-sqlite3 automatically; npm users are unaffected and get it installed.
 3. Install dependencies:
    ```bash
