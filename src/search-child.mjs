@@ -22,11 +22,8 @@ import { buildSearchApi } from './db.js';
 
 const indexPath = resolveDbPath(
   // 优先用主进程经环境变量传来的实际索引路径（见 searchPool.js），
-  // 否则回退到与主进程相同的默认解析链。
-  process.env.DHT_SEARCH_INDEX_DB_PATH ??
-    CONFIG.indexDbPath ??
-    process.env.DHT_INDEX_DB_PATH ??
-    DEFAULT_INDEX_DB_PATH
+  // 否则与主进程一致：取 config.js 的 indexDbPath（CONFIG 恒非空，env 兜底永不生效）
+  process.env.DHT_SEARCH_INDEX_DB_PATH ?? CONFIG.indexDbPath ?? DEFAULT_INDEX_DB_PATH
 );
 
 /**

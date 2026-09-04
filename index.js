@@ -41,7 +41,8 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-const PORT = Number(CONFIG.port) || Number(process.env.PORT) || 3000;
+// 端口唯一来源是 config.js（env 兜底永不生效，已移除，见 config.js 顶部说明）
+const PORT = Number(CONFIG.port) || 3000;
 
 const api = createMagnetDb({ sync: false });
 
@@ -157,7 +158,14 @@ function apiHandler(fn, status = 500, defaultMessage = INTERNAL_ERROR) {
     Promise.resolve()
       .then(() => fn(req, res))
       .catch((err) => {
-        if (!res.headersSent) res.status(status).json({ error: err?.message || defaultMessage });
+        if (res.headersSent) return;
+        // 错误对象自带合法 status（如搜索排队满 / 排队超时标记的 503）时优先使用，
+        // 让「服务过载」与「客户端错误 / 内部错误」在状态码上可区分
+        const code =
+          Number.isInteger(err?.status) && err.status >= 400 && err.status < 600
+            ? err.status
+            : status;
+        res.status(code).json({ error: err?.message || defaultMessage });
       });
   };
 }
@@ -251,9 +259,9 @@ app.get('/api/search', apiHandler(async (req, res) => {
       logCancelled();
       return;
     }
-    throw e; // 交给 apiHandler 统一返回 500
+    throw e; // 交给 apiHandler 统一处理：默认 500，排队满/超时经 err.status 升级为 503
   }
-}, 400));
+}));
 
 /** 手动全量重建影子索引（在 worker 线程中执行，重建期间检索仍可用） */
 app.post('/api/reindex', apiHandler(async (_req, res) => {
@@ -405,7 +413,9 @@ app.post('/api/hot/filter', apiHandler((req, res) => {
 
 /** 删除热词过滤词（query: ?term=） */
 app.delete('/api/hot/filter', apiHandler((req, res) => {
-  const term = String(req.query.term ?? '').trim().toLowerCase();
+  // req.query 的值可能是数组（?term=a&term=b），取首个，避免 String() 拼成 "a,b"
+  const raw = Array.isArray(req.query.term) ? req.query.term[0] : req.query.term;
+  const term = String(raw ?? '').trim().toLowerCase();
   if (!term) {
     return res.status(400).json({ error: 'term 不能为空' });
   }

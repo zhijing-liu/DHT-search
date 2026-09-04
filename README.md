@@ -151,7 +151,7 @@ DHT-search/
 | `allowedClients` | 见下 | 允许访问的客户端地址清单（仅 `ip-whitelist` 模式生效）：支持精确 IPv4/IPv6 与 CIDR（如 `192.168.0.0/16`、`2001:db8::/32`）。默认含 `127.0.0.1`、`::1` 及 `10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`fc00::/7`、`fe80::/10` 等内网 / 本机范围 |
 | `trustProxy` | `false` | 是否信任前置反代（nginx 等）的 `X-Forwarded-For` 来取真实客户端 IP：`false`（默认）取 TCP 对端，适合直连；反代场景需设为 `true` / `'loopback'` / 具体子网，否则白名单会误判 |
 
-路径解析优先级：**显式参数 > config.js > 环境变量（`DHT_DB_PATH` / `DHT_INDEX_DB_PATH`）> 模块默认值**。
+路径解析优先级：**显式参数 > config.js > 模块默认值**（config.js 的值恒非空，服务代码不读取 `DHT_DB_PATH` / `DHT_INDEX_DB_PATH` 环境变量；`scripts/` 下的脚本仍直接读取 `DHT_INDEX_DB_PATH`）。
 
 ## 六、安装与前置条件
 

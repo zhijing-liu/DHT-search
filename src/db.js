@@ -181,8 +181,10 @@ function orderSqlFor({ sortBy, order }) {
  */
 export function normalizeSearchQuery(raw = {}) {
   const source = raw ?? {};
+  // HTTP 查询串的值可能是数组（?q=a&q=b），取首个而不是静默丢弃为空串
+  const rawQuery = Array.isArray(source.query) ? source.query[0] : source.query;
   return {
-    query: typeof source.query === 'string' ? source.query.trim() : '',
+    query: typeof rawQuery === 'string' ? rawQuery.trim() : '',
     sortBy: SORT_COLUMNS.includes(source.sortBy) ? source.sortBy : undefined,
     order: String(source.order).toLowerCase() === 'asc' ? 'asc' : 'desc',
     by: source.by === 'hash' ? 'hash' : 'fts',
@@ -525,8 +527,8 @@ function syncIndex(db, src, onFlush) {
  * 打开影子索引库并构建/同步索引，返回查询句柄。
  *
  * @param {Object|string} [options] 源库路径字符串，或 { source, indexDbPath }
- * @param {string} [options.source]      源库路径，默认 process.env.DHT_DB_PATH 或 data/magnet.db
- * @param {string} [options.indexDbPath] 影子索引库路径，默认 process.env.DHT_INDEX_DB_PATH 或 data/dht.search.db
+ * @param {string} [options.source]      源库路径，默认 config.js 的 SOURCE_DB_PATH（data/magnet.db）
+ * @param {string} [options.indexDbPath] 影子索引库路径，默认 config.js 的 INDEX_DB_PATH（data/dht.search.db）
  * @param {boolean} [options.sync=true]  打开时是否执行同步（全量重建 / 增量补录）；
  *        传 false 则只建立连接不建索引，供 reindex worker 使用
  */
@@ -714,12 +716,13 @@ export function buildSearchApi(dbRO) {
 
 export function createMagnetDb(options = {}) {
   const opts = typeof options === 'string' ? { source: options } : options;
-  // 优先级：调用方显式传入 > config.js > 环境变量 > 模块内默认值
+  // 优先级：调用方显式传入 > config.js > 模块内默认值。
+  // config.js 的值恒非空，原 env 兜底分支永不生效，已移除（见 config.js 顶部说明）
   const sourcePath = resolveDbPath(
-    opts.source ?? CONFIG.sourceDbPath ?? process.env.DHT_DB_PATH ?? DEFAULT_DB_PATH
+    opts.source ?? CONFIG.sourceDbPath ?? DEFAULT_DB_PATH
   );
   const indexPath = resolveDbPath(
-    opts.indexDbPath ?? CONFIG.indexDbPath ?? process.env.DHT_INDEX_DB_PATH ?? DEFAULT_INDEX_DB_PATH
+    opts.indexDbPath ?? CONFIG.indexDbPath ?? DEFAULT_INDEX_DB_PATH
   );
 
   fs.mkdirSync(path.dirname(path.resolve(indexPath)), { recursive: true });
@@ -1011,8 +1014,7 @@ export function createMagnetDb(options = {}) {
         begin();
         try {
           if (mode === 'full') return rebuildSync(wrapped);
-          let acc = 0;
-          return syncIncrementalSync(({ rows }) => wrapped({ done: (acc += rows), total: 0 }));
+          return syncIncrementalSync((p) => wrapped({ done: p.done, total: p.total }));
         } finally {
           runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 };
         }
@@ -1032,10 +1034,11 @@ export function createMagnetDb(options = {}) {
    * 与 reindex() 互斥（reindexPromise 非空）：重建期间跳过本轮，下一周期再试。
    * 不触发全量重建——tokenizer 变更等结构性变更交由重启或手动 reindex 处理。
    *
-   * 注意：这里透传给 populate 的回调签名是 { rows }（每批落库行数），不是 { done, total }；
-   * 需要整体进度的场景请用 reindex() 的 onProgress。
+   * 注意：回调签名是 { rows, done, total }——rows 为本批落库行数（兼容旧调用方），
+   * done/total 为累计进度；total 是预先算出的 id 跨度（源库有删除空洞时略大于实际行数），
+   * 供 worker / SSE 把增量同步进度推给前端进度条。
    *
-   * @param {(p: { rows: number }) => void} [onFlush] 每批落库后回调
+   * @param {(p: { rows: number, done: number, total: number }) => void} [onFlush] 每批落库后回调
    * @returns {{ skipped: boolean, added: number }} 本轮是否因重建而跳过、补录的 id 跨度
    */
   /** 增量补录核心（不清空，只补录新增）；供 worker / 同进程调用，互斥由 runIndex 负责 */
@@ -1045,7 +1048,13 @@ export function createMagnetDb(options = {}) {
       const last = Number(getMeta(db, 'last_rowid') ?? '0');
       const max = maxSourceId(src);
       if (max <= last) return { skipped: false, added: 0 };
-      populate(db, scanById(src, { from: last, size: REBUILD_BATCH }), onFlush);
+      // 预先算出 id 跨度作为进度 total，随每批上报 done/total（进度条用）
+      const expect = max - last;
+      let acc = 0;
+      populate(db, scanById(src, { from: last, size: REBUILD_BATCH }), ({ rows }) => {
+        acc += rows;
+        onFlush?.({ rows, done: acc, total: expect });
+      });
       setMeta(db, 'last_rowid', String(max));
       optimizeFts(db);
       checkpointWAL(db);

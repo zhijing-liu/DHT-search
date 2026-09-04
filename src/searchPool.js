@@ -231,8 +231,13 @@ export class SearchExecutor {
         reject(new Error('服务正在关闭'));
         return;
       }
-      if (this.queue.length >= this.queueMax) {
-        reject(Object.assign(new Error('搜索队列已满，请稍后重试'), { code: 'QUEUE_FULL' }));
+      // queueMax=0 语义为「不排队」：仅当有空闲槽位或还能扩容时立即执行，否则快速失败。
+      // （旧实现 `queue.length >= 0` 恒真，会把所有请求无差别拒绝）
+      const canRunNow =
+        this.pool.some((s) => !s.busy && !s.dead) || this.pool.length < this.maxProcesses;
+      const saturated = this.queueMax === 0 ? !canRunNow : this.queue.length >= this.queueMax;
+      if (saturated) {
+        reject(Object.assign(new Error('搜索队列已满，请稍后重试'), { code: 'QUEUE_FULL', status: 503 }));
         return;
       }
       // 统一收口：清排队定时器 + 防止重复 settle
@@ -253,7 +258,7 @@ export class SearchExecutor {
       if (this.queueTimeoutMs > 0) {
         task.timer = setTimeout(() => {
           this._dequeue(task);
-          task.reject(Object.assign(new Error('搜索排队超时'), { code: 'QUEUE_TIMEOUT' }));
+          task.reject(Object.assign(new Error('搜索排队超时'), { code: 'QUEUE_TIMEOUT', status: 503 }));
         }, this.queueTimeoutMs);
       }
       this.queue.push(task);

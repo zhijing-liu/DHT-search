@@ -185,15 +185,15 @@
         <span class="font-semibold">运行状态</span>
         <span id="statsStatus" class="text-muted text-[11px] whitespace-nowrap">连接中…</span>
       </div>
-      <div class="flex flex-col gap-0.5">
-        <div class="flex items-baseline justify-between gap-2.5 leading-[1.65]"><span class="text-muted whitespace-nowrap">缓存占用</span><b id="stCache" class="font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2.5 leading-[1.65]"><span class="text-muted whitespace-nowrap">缓存条目</span><b id="stEntries" class="font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2.5 leading-[1.65]"><span class="text-muted whitespace-nowrap">命中率</span><b id="stHitRate" class="font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2.5 leading-[1.65]"><span class="text-muted whitespace-nowrap">堆内存</span><b id="stHeap" class="font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2.5 leading-[1.65]"><span class="text-muted whitespace-nowrap">RSS</span><b id="stRss" class="font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2.5 leading-[1.65]"><span class="text-muted whitespace-nowrap">搜索进程</span><b id="stProcs" class="font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2.5 leading-[1.65]"><span class="text-muted whitespace-nowrap">已索引</span><b id="stIndexed" class="font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2.5 leading-[1.65]"><span class="text-muted whitespace-nowrap">下次同步</span><b id="stNextSync" class="font-medium tabular-nums whitespace-nowrap">—</b></div>
+      <div class="flex flex-col gap-0.5 text-[11px] max-[560px]:text-[10px]">
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">缓存占用</span><b id="stCache" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">缓存条目</span><b id="stEntries" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">命中率</span><b id="stHitRate" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">堆内存</span><b id="stHeap" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">RSS</span><b id="stRss" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">搜索进程</span><b id="stProcs" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">已索引</span><b id="stIndexed" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">下次同步</span><b id="stNextSync" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
       </div>
       <div id="reindexProgress" class="flex flex-col gap-[5px] mt-[7px] pt-[7px] border-t border-line" hidden>
         <div class="h-[5px] overflow-hidden bg-canvas rounded-full"><div id="reindexBarFill" class="w-0 h-full rounded-full grad-brand transition-[width] duration-300"></div></div>

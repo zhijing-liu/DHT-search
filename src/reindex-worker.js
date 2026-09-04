@@ -31,10 +31,9 @@ try {
     const indexed = api.rebuildSync((p) => parentPort.postMessage({ type: 'progress', ...p }));
     parentPort.postMessage({ ok: true, indexed });
   } else {
-    let done = 0;
-    const r = api.syncIncrementalSync(({ rows }) => {
-      done += rows;
-      parentPort.postMessage({ type: 'progress', done, total: 0 });
+    // 增量同步：onFlush 自带 done/total（total 为预先算出的 id 跨度），直接转发
+    const r = api.syncIncrementalSync((p) => {
+      parentPort.postMessage({ type: 'progress', done: p.done, total: p.total });
     });
     parentPort.postMessage({ ok: true, result: r });
   }

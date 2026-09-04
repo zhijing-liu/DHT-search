@@ -419,10 +419,15 @@ function matchSuggestions(q, max = 8) {
     else if (term.includes(query)) groups.include.push(it);
     else if (isFuzzyMatch(term, query)) groups.fuzzy.push(it);
   }
+  // 组间按优先级（完全相等 > 前缀 > 包含 > 模糊），组内按热度排序。
+  // 不能把四组拼接后再统一 sort——那样会按热度打散全部条目，分组优先级失效。
   const byHot = (a, b) => b.doc_count - a.doc_count || b.occurrences - a.occurrences;
-  return [...groups.exact, ...groups.prefix, ...groups.include, ...groups.fuzzy]
-    .sort(byHot)
-    .slice(0, max);
+  return [
+    ...groups.exact.sort(byHot),
+    ...groups.prefix.sort(byHot),
+    ...groups.include.sort(byHot),
+    ...groups.fuzzy.sort(byHot),
+  ].slice(0, max);
 }
 
 /** 渲染提示下拉列表 */
@@ -828,14 +833,17 @@ function renderStats(d) {
   el.stIndexed.textContent = d.indexed.toLocaleString('zh-CN');
   renderCountdown();
 
-  // 重建进度条：仅重建中且总数已知时显示
-  const bar = d.reindex && d.reindex.running && d.reindex.total > 0;
+  // 进度条：统一由 indexing 状态机驱动（覆盖全量重建 full 与增量同步 incremental），
+  // 总数已知才显示；增量同步的 total 是 id 跨度（源库有删除空洞时略大于实际行数）
+  const prog = d.indexing && d.indexing.running ? d.indexing : null;
+  const bar = !!(prog && prog.total > 0);
   el.reindexProgress.hidden = !bar;
   if (bar) {
-    const pct = (d.reindex.done / d.reindex.total) * 100;
+    const pct = Math.min(100, (prog.done / prog.total) * 100);
+    const label = prog.mode === 'incremental' ? '同步' : '重建';
     el.reindexBarFill.style.width = `${pct.toFixed(1)}%`;
     el.reindexText.textContent =
-      `${d.reindex.done.toLocaleString('zh-CN')} / ${d.reindex.total.toLocaleString('zh-CN')}（${pct.toFixed(1)}%）`;
+      `${label} ${prog.done.toLocaleString('zh-CN')} / ${prog.total.toLocaleString('zh-CN')}（${pct.toFixed(1)}%）`;
   }
 
   el.statsStatus.textContent = d.initializing
