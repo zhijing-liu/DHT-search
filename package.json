@@ -5,6 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "dev:node": "nodemon index.js",
+    "dev:bun": "bun --watch index.js",
     "dev:web": "npm --prefix web run dev",
     "build:web": "npm --prefix web run build",
     "smoke": "node test/smoke.mjs",
@@ -21,15 +23,18 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@tailwindcss/vite": "^4.3.3",
     "chalk": "^6.0.0",
     "drizzle-orm": "^0.45.2",
     "express": "^5.2.1",
     "lru-cache": "^11.5.2",
-    "@tailwindcss/vite": "^4.3.3",
     "tailwindcss": "^4.3.3",
     "vite": "^8.2.2"
   },
   "optionalDependencies": {
     "better-sqlite3": "^13.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
   }
 }

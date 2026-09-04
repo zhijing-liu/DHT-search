@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite'
 import tailwindcss from '@tailwindcss/vite'
-import { WEB_BASE_PATH } from '../config.js'
+import { PORT, WEB_BASE_PATH } from '../config.js'
 
 /**
  * 部署前缀 -> vite base：
@@ -27,8 +27,9 @@ export default defineConfig({
     proxy: {
       // 前端统一用相对路径（fetch('api/search')），dev 期只需一条转发规则；
       // SSE（/api/stats/stream）由 http-proxy 原生流式透传
+      // target 端口与 config.js 的 PORT 保持一致，后端换端口时无需再改这里
       '/api': {
-        target: 'http://localhost:3000',
+        target: `http://localhost:${PORT}`,
         changeOrigin: true,
       },
     },
