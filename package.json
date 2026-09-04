@@ -5,6 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "dev:web": "npm --prefix web run dev",
+    "build:web": "npm --prefix web run build",
     "smoke": "node test/smoke.mjs",
     "test": "node test/smoke.mjs",
     "seed:filter": "node scripts/seed-filter.mjs",

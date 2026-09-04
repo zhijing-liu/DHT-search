@@ -1,6 +1,8 @@
 node_modules/
 dist/
 dist-**/
+# 前端构建产物：源码在 web/，由 `cd web && npm run build` 输出并覆盖此目录
+public/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

@@ -1,0 +1,117 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------
+   主题令牌：与原 public/css/styles.css 的 :root 一一对应。
+   注意不要命名为 --color-cyan / --color-blue 等，会覆盖 Tailwind 内置调色板。
+   工具类形态：bg-canvas / bg-surface / bg-card / border-line / text-fg /
+              text-muted / bg-brand / text-brand2 / bg-accent
+   ------------------------------------------------------------------ */
+@theme {
+  --color-canvas: #0b1120;   /* 原 --bg       页面渐变底色 */
+  --color-surface: #111827;  /* 原 --bg-2     浮层/面板底色 */
+  --color-card: #1f2937;     /* 原 --card     卡片底色 */
+  --color-line: #334155;     /* 原 --border   描边 */
+  --color-fg: #f9fafb;       /* 原 --text     主文字 */
+  --color-muted: #94a3b8;    /* 原 --muted    次要文字 */
+  --color-brand: #6366f1;    /* 原 --primary  品牌主色 */
+  --color-brand2: #22d3ee;   /* 原 --primary-2 强调青 */
+  --color-accent: #3b82f6;   /* 原 --accent   聚焦/高亮蓝 */
+
+  --font-sans: "PingFang SC", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* ------------------------------------------------------------------
+   复用型自定义 utility：仅收录「工具类无法表达」的原生声明
+   ------------------------------------------------------------------ */
+
+/* 主按钮渐变（同步索引 / 确定 / 激活页码等） */
+@utility grad-brand {
+  background-image: linear-gradient(135deg, var(--color-brand), var(--color-accent));
+}
+
+/* 危险操作渐变（重建索引 / 危险确认） */
+@utility grad-danger {
+  background-image: linear-gradient(135deg, #ef4444, #dc2626);
+}
+
+/* 原生 select 下拉箭头（16px，位置 right 10px）——用于「大小范围」 */
+@utility select-caret {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='4 6 8 10 12 6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 16px;
+}
+
+/* 原生 select 下拉箭头（14px，位置 right 6px）——用于「每页条数」 */
+@utility select-caret-sm {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='4 5 7 8 10 5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  background-size: 14px;
+}
+
+/* 细滚动条：结果区 / 热词区 / 黑名单列表 / 详情文件树 复用 */
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+
+  &::-webkit-scrollbar {
+    width: 8px;
+  }
+  &::-webkit-scrollbar-thumb {
+    background: var(--color-line);
+    border-radius: 4px;
+  }
+}
+
+/* ------------------------------------------------------------------
+   base 兜底
+   ------------------------------------------------------------------ */
+@layer base {
+  /* 兜底：Tailwind 的 flex/inline-flex 等 display 工具类会盖掉 UA 的
+     [hidden]{display:none}，导致 JS 里 el.xxx.hidden = bool 失效。
+     页面有十余处依赖该属性控制显隐（结果区/热词区/蒙层/抽屉/建议下拉…）。
+     dialog 靠 [open] 控制显隐、本身不带 hidden 属性，不受影响。 */
+  [hidden] {
+    display: none !important;
+  }
+
+  /* 弹窗改为普通定位层（非原生 <dialog>），无需 dialog:modal 居中兜底 */
+
+  /* 统一下拉选项面板配色，覆盖浏览器默认蓝底白字 */
+  option {
+    background-color: var(--color-card);
+    color: var(--color-fg);
+    padding: 8px 12px;
+    font-size: 14px;
+  }
+  option:checked,
+  option:hover {
+    background-color: var(--color-accent);
+    color: #fff;
+  }
+
+  /* 页码跳转输入框：去掉数字步进箭头 */
+  input[type="number"] {
+    appearance: textfield;
+    -moz-appearance: textfield;
+
+    &::-webkit-outer-spin-button,
+    &::-webkit-inner-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+  }
+}
+
+/* ------------------------------------------------------------------
+   触屏设备没有 hover，运行状态抽屉永远展不开 → 直接常显。
+   Tailwind 无对应变体，保留这一条作为 .stats-hud 的唯一钩子类名。
+   ------------------------------------------------------------------ */
+@media (hover: none) {
+  .stats-hud {
+    transform: none;
+  }
+}

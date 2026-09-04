@@ -123,11 +123,16 @@ let _toastHost = null;
 export function showToast(msg) {
   if (!_toastHost) {
     _toastHost = document.createElement('div');
-    _toastHost.className = 'app-toast-host';
+    _toastHost.className =
+      'fixed top-[18px] left-1/2 -translate-x-1/2 z-[9999] flex flex-col gap-2 pointer-events-none';
     document.body.appendChild(_toastHost);
   }
   const t = document.createElement('div');
-  t.className = 'app-toast';
+  t.className =
+    'bg-surface/95 text-white border border-white/[0.14] px-[18px] py-2.5 rounded-[10px] ' +
+    'text-sm leading-[1.4] shadow-[0_8px_24px_rgba(0,0,0,0.35)] ' +
+    'opacity-0 -translate-y-2 transition-[opacity,transform] duration-200 ' +
+    '[&.show]:opacity-100 [&.show]:translate-y-0';
   t.textContent = msg;
   _toastHost.appendChild(t);
   requestAnimationFrame(() => t.classList.add('show'));

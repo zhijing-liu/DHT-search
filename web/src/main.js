@@ -1,4 +1,5 @@
 /** 注册自定义元素（<magnet-card> / <magnet-files> / <result-list> / <dht-sort-group>） */
+import './styles/app.css';
 import './components.js';
 import {
   getRpcConfig,
@@ -7,6 +8,44 @@ import {
   formatBytes,
   formatCountdown,
 } from './util.js';
+
+/* ------------------------------------------------------------------ */
+/* 动态创建元素的 Tailwind 类（必须是完整字面量，否则会被 Tailwind 摇掉） */
+/* ------------------------------------------------------------------ */
+
+/** 空状态提示 */
+const EMPTY_CLASS = 'text-muted text-center py-10 max-[480px]:py-6';
+/** 热词气泡 */
+const HOT_CHIP_CLASS =
+  'inline-flex items-center rounded-full border border-line bg-card text-fg text-sm cursor-pointer ' +
+  'px-4 py-2 transition-[border-color,background-color,transform] duration-150 ' +
+  'hover:border-accent hover:bg-accent/10 hover:-translate-y-px ' +
+  'max-[480px]:px-3 max-[480px]:py-1.5 max-[480px]:text-[13px]';
+/** 热词气泡右侧的「加入黑名单」关闭按钮 */
+const CHIP_CLOSE_CLASS =
+  'inline-flex items-center justify-center ml-1.5 size-4 rounded-full text-muted cursor-pointer ' +
+  'transition-colors hover:text-red-400 hover:bg-red-400/15';
+/** 黑名单条目 */
+const BL_ITEM_CLASS = 'flex-none flex items-center justify-between gap-2 px-2 py-1.5 border border-line rounded-lg bg-surface';
+const BL_TERM_CLASS = 'text-[13px] overflow-hidden text-ellipsis whitespace-nowrap';
+const BL_REMOVE_CLASS =
+  'shrink-0 inline-flex items-center justify-center size-[22px] rounded-full border-0 bg-transparent ' +
+  'text-muted cursor-pointer transition-colors hover:text-red-400 hover:bg-red-400/[0.12]';
+/** 输入框下拉建议项 */
+const SUG_ITEM_CLASS =
+  'flex items-center justify-between gap-3 px-3.5 py-2.5 cursor-pointer text-sm text-fg ' +
+  'transition-colors hover:bg-brand/[0.16] [&.active]:bg-brand/[0.16]';
+const SUG_TERM_CLASS =
+  'overflow-hidden text-ellipsis whitespace-nowrap ' +
+  '[&_mark]:bg-transparent [&_mark]:text-brand2 [&_mark]:font-semibold';
+const SUG_COUNT_CLASS = 'shrink-0 text-xs text-muted whitespace-nowrap';
+/** 分页按钮：数字页 / 上一页下一页图标按钮 */
+const PAGE_BTN_CLASS =
+  'min-w-9 rounded-lg border border-line bg-card text-fg cursor-pointer transition-colors ' +
+  'enabled:hover:border-accent disabled:opacity-40 disabled:cursor-not-allowed ' +
+  '[&.active]:grad-brand [&.active]:border-transparent [&.active]:text-white';
+const PAGE_NAV_CLASS = 'inline-flex items-center justify-center size-9 p-0 box-border';
+const PAGE_DOTS_CLASS = 'text-muted px-1.5 py-2';
 
 const state = {
   query: '',
@@ -46,6 +85,7 @@ const el = {
   sortGroup: document.getElementById('sortGroup'),
   settingsBtn: document.getElementById('settingsBtn'),
   settingsDialog: document.getElementById('settingsDialog'),
+  settingsClose: document.getElementById('settingsClose'),
   rpcUrl: document.getElementById('rpcUrl'),
   rpcSecret: document.getElementById('rpcSecret'),
   reindexBtn: document.getElementById('reindexBtn'),
@@ -159,7 +199,7 @@ function renderItem(item) {
 /** 渲染空状态提示 */
 function renderEmpty(message) {
   const empty = document.createElement('p');
-  empty.className = 'empty';
+  empty.className = EMPTY_CLASS;
   empty.textContent = message;
   el.results.appendChild(empty);
 }
@@ -186,7 +226,7 @@ function renderHotWords(items) {
   el.hotWords.replaceChildren();
   if (!items.length) {
     const empty = document.createElement('p');
-    empty.className = 'empty';
+    empty.className = EMPTY_CLASS;
     empty.textContent = '暂无热词数据';
     el.hotWords.appendChild(empty);
     return;
@@ -194,13 +234,13 @@ function renderHotWords(items) {
   for (const it of items) {
     const chip = document.createElement('button');
     chip.type = 'button';
-    chip.className = 'hot-chip';
+    chip.className = HOT_CHIP_CLASS;
     chip.textContent = it.term;
     if (state.editMode) {
       chip.title = `点击右侧 × 将「${it.term}」加入黑名单`;
       chip.classList.add('editing');
       const close = document.createElement('span');
-      close.className = 'chip-close';
+      close.className = CHIP_CLOSE_CLASS;
       close.setAttribute('aria-label', `将「${it.term}」加入黑名单`);
       close.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
       close.addEventListener('click', (e) => {
@@ -259,13 +299,13 @@ function renderBlacklist(items) {
   el.blacklistEmpty.hidden = filtered.length > 0;
   for (const it of filtered) {
     const li = document.createElement('li');
-    li.className = 'bl-item';
+    li.className = BL_ITEM_CLASS;
     const term = document.createElement('span');
-    term.className = 'bl-term';
+    term.className = BL_TERM_CLASS;
     term.textContent = it.term;
     const remove = document.createElement('button');
     remove.type = 'button';
-    remove.className = 'bl-remove';
+    remove.className = BL_REMOVE_CLASS;
     remove.setAttribute('aria-label', `将「${it.term}」移出黑名单`);
     remove.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
     remove.addEventListener('click', () => removeFromBlacklist(it.term));
@@ -393,9 +433,9 @@ function renderSuggestions(items) {
   const frag = document.createDocumentFragment();
   items.forEach((it, i) => {
     const row = document.createElement('div');
-    row.className = 'suggestion-item';
+    row.className = SUG_ITEM_CLASS;
     const term = document.createElement('span');
-    term.className = 'sug-term';
+    term.className = SUG_TERM_CLASS;
     const idx = String(it.term).toLowerCase().indexOf(query);
     if (idx >= 0) {
       const mark = document.createElement('mark');
@@ -409,7 +449,7 @@ function renderSuggestions(items) {
       term.textContent = it.term;
     }
     const count = document.createElement('span');
-    count.className = 'sug-count';
+    count.className = SUG_COUNT_CLASS;
     count.textContent = `${formatCount(it.doc_count)} 条`;
     row.append(term, count);
     row.addEventListener('mousedown', (e) => {
@@ -426,10 +466,11 @@ function renderSuggestions(items) {
   box.hidden = false;
 }
 
-/** 按 activeSuggestion 高亮当前建议项，并保证可见 */
+/** 按 activeSuggestion 高亮当前建议项，并保证可见。
+ *  建议行已无语义类名，直接用容器的子元素集合定位（下拉内只有建议行一种子元素）。 */
 function setActiveRow() {
-  const rows = el.suggestions.querySelectorAll('.suggestion-item');
-  rows.forEach((row, i) => row.classList.toggle('active', i === activeSuggestion));
+  const rows = el.suggestions.children;
+  Array.from(rows).forEach((row, i) => row.classList.toggle('active', i === activeSuggestion));
   const cur = rows[activeSuggestion];
   if (cur) cur.scrollIntoView({ block: 'nearest' });
 }
@@ -488,13 +529,15 @@ function renderPager(totalPages) {
 
   const mkBtn = (label, page, opts = {}) => {
     const b = document.createElement('button');
+    // 先拼好完整类名再一次性赋值：原实现先 add('page-nav')、再 className='page-btn'，
+    // 后者会覆盖前者，导致上一页/下一页拿不到 36×36 的方形图标按钮样式
     if (opts.icon) {
       b.innerHTML = opts.icon;
-      b.classList.add('page-nav');
+      b.className = `${PAGE_BTN_CLASS} ${PAGE_NAV_CLASS}`;
     } else {
       b.textContent = label;
+      b.className = `${PAGE_BTN_CLASS} px-2.5 py-2`;
     }
-    b.className = 'page-btn';
     b.setAttribute('aria-label', opts.ariaLabel || label);
     if (opts.active) b.classList.add('active');
     if (opts.disabled) {
@@ -521,7 +564,7 @@ function renderPager(totalPages) {
   for (const p of pages) {
     if (p - prev > 1) {
       const dots = document.createElement('span');
-      dots.className = 'dots';
+      dots.className = PAGE_DOTS_CLASS;
       dots.textContent = '…';
       el.pager.appendChild(dots);
     }
@@ -830,7 +873,16 @@ function stopStatsStream() {
   lastStats = null;
 }
 
-el.settingsBtn.addEventListener('click', () => el.settingsDialog.showModal());
+el.settingsBtn.addEventListener('click', openSettings);
+
+function openSettings() { el.settingsDialog.hidden = false; }
+function closeSettings() {
+  el.settingsDialog.hidden = true;
+  // 关闭时兜底保存 RPC 配置（原 dialog 'close' 事件职责）
+  saveRpcConfig({ url: el.rpcUrl.value, secret: el.rpcSecret.value });
+}
+el.settingsClose.addEventListener('click', closeSettings);
+el.settingsDialog.querySelector('[data-close="settings"]').addEventListener('click', closeSettings);
 
 /* ---------- 运行状态悬浮窗开关（选择持久化到 localStorage） ---------- */
 
@@ -863,7 +915,7 @@ function initRpcSettings() {
   el.rpcUrl.addEventListener('change', save);
   el.rpcSecret.addEventListener('change', save);
   // 关闭弹窗时兜底保存，避免只在输入框内输入但未失焦就关闭导致丢值
-  el.settingsDialog.addEventListener('close', save);
+  // （已移至 closeSettings() 中执行）
 }
 initRpcSettings();
 
@@ -891,16 +943,25 @@ function finishConfirm(result) {
 
 function initConfirmDialog() {
   el.confirmCancel.addEventListener('click', () => {
-    el.confirmDialog.close();
+    el.confirmDialog.hidden = true;
     finishConfirm(false);
   });
   el.confirmOk.addEventListener('click', () => {
-    el.confirmDialog.close();
+    el.confirmDialog.hidden = true;
     finishConfirm(true);
   });
-  // ESC 关闭视为取消（dialog 默认会触发 cancel 事件并自动关闭）
-  el.confirmDialog.addEventListener('cancel', () => finishConfirm(false));
 }
+
+// 全局 Esc：还原原生 dialog 的关闭行为（内层 confirm 优先于 settings）
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (!el.confirmDialog.hidden) {
+    el.confirmDialog.hidden = true;
+    finishConfirm(false);
+  } else if (!el.settingsDialog.hidden) {
+    closeSettings();
+  }
+});
 
 /** 弹出确认框，返回 Promise<boolean>；danger 为 true 时「确定」按钮呈红色 */
 function confirmAction(message, { danger = false } = {}) {
@@ -908,7 +969,7 @@ function confirmAction(message, { danger = false } = {}) {
   el.confirmOk.classList.toggle('danger', danger);
   return new Promise((resolve) => {
     confirmResolve = resolve;
-    el.confirmDialog.showModal();
+    el.confirmDialog.hidden = false;
   });
 }
 initConfirmDialog();
