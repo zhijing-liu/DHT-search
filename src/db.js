@@ -20,7 +20,7 @@
  *   searchMagnets()  —— 检索（FTS5 模糊 / infohash 精确），支持分页与排序
  *   normalizeSearchQuery() —— 检索参数归一化，HTTP 层与数据层共用（幂等）
  *   normalizeKeyword()     —— 热词 / 过滤词归一化，HTTP 层与数据层共用
- *   reindex()        —— 全量重建影子索引（异步；Node 走 worker 线程，Bun 退化为同进程）
+ *   reindex()        —— 全量重建影子索引（异步；Node 走 worker 线程，Bun 走子进程）
  *   rebuildSync()    —— 同上但在当前进程内同步执行（供 worker / 脚本使用）
  *   close()          —— 关闭连接
  *
@@ -32,6 +32,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
+import { fork } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { log } from './logger.js';
 import { runtimeStats } from './stats.js';
 import { clampInt, normalizeKeyword } from './util.js';
@@ -305,8 +307,10 @@ const REBUILD_BATCH = 2000;
  * 注：对中文字符（V8 内部按 2 字节存储）会低估约一倍，属于偏安全的方向。
  */
 const REBUILD_BATCH_BYTES = 16 * 1024 * 1024;
-/** reindex worker 入口（与 db.js 同目录） */
+/** reindex worker 入口（与 db.js 同目录）；worker 线程与子进程两种模式共用 */
 const REINDEX_WORKER_URL = new URL('./reindex-worker.js', import.meta.url);
+/** fork 的 modulePath 需要字符串路径而非 URL，预先换算一次 */
+const REINDEX_WORKER_PATH = fileURLToPath(REINDEX_WORKER_URL);
 
 /**
  * 按 id 升序分段扫描源表，逐行 yield（流式，不物化整表）。
@@ -868,6 +872,72 @@ export function createMagnetDb(options = {}) {
     });
   }
 
+  /**
+   * 派生子进程执行索引维护（Bun 主路径专用）。
+   *
+   * Bun 对 node:worker_threads 覆盖不全（resourceLimits 不生效、terminate() 无法
+   * 中断卡在原生调用里的同步语句），若退化为「同进程同步重建」会把事件循环整个
+   * 卡死——重建/同步期间页面与检索全部无响应。child_process 在 Bun 下可用
+   * （检索子进程池 searchPool.js 即基于 fork），故这里以独立子进程执行索引维护：
+   *   - 主进程事件循环零阻塞，页面 / 检索全程可用；
+   *   - 超时 / 异常直接 SIGKILL 子进程，由操作系统回收，主进程不受影响；
+   *   - 参数经环境变量 DHT_REINDEX_JOB（JSON）传入，进度/结果经 IPC 回传，
+   *     消息协议与 worker 线程完全一致（见 reindex-worker.js）。
+   * @param {'incremental'|'full'} mode  'incremental'=只补录不清空；'full'=清空重建
+   * @param {(p: { done: number, total: number }) => void} [onProgress] 进度回调
+   */
+  function spawnIndexChild(mode, onProgress) {
+    return new Promise((resolve, reject) => {
+      const child = fork(REINDEX_WORKER_PATH, [], {
+        stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+        env: {
+          ...process.env,
+          DHT_REINDEX_JOB: JSON.stringify({ sourcePath, indexPath, mode }),
+        },
+      });
+      reindexWorker = child;
+
+      let settled = false;
+      let timer = null;
+      const settle = (ok, value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        reindexWorker = null;
+        if (!ok) {
+          // 终态即终止：SIGKILL 由操作系统回收，正在执行的同步 SQLite 语句也随之中断
+          try { child.kill('SIGKILL'); } catch { /* 已退出 */ }
+        }
+        (ok ? resolve : reject)(value);
+      };
+
+      if (REINDEX_TIMEOUT_MS > 0) {
+        timer = setTimeout(
+          () => settle(false, new Error(`索引维护超时（${REINDEX_TIMEOUT_MS}ms）`)),
+          REINDEX_TIMEOUT_MS
+        );
+      }
+      // progress 多次 → 用 on 持续监听
+      child.on('message', (msg) => {
+        if (msg?.type === 'progress') {
+          onProgress?.(msg);
+          return;
+        }
+        if (msg?.ok) {
+          // full 模式回执 indexed 数字；incremental 模式回执 { skipped, added }
+          settle(true, mode === 'full' ? msg.indexed : msg.result);
+        } else {
+          settle(false, new Error(msg?.error || 'index failed'));
+        }
+      });
+      // 终态事件 → 用 once，触发一次即自动移除，监听干净
+      child.once('error', (err) => settle(false, err));
+      child.once('exit', (code) => {
+        if (!settled) settle(false, new Error(`索引子进程异常退出（code=${code}）`));
+      });
+    });
+  }
+
   /** 已索引条数（与检索结果一致） */
   function countMagnets() {
     return Number(dbRO.select({ total: count() }).from(magnetsDocs).get()?.total ?? 0);
@@ -970,8 +1040,8 @@ export function createMagnetDb(options = {}) {
   /**
    * 全量重建影子索引。
    * - Node 环境：在独立 worker 线程执行，不阻塞事件循环，worker OOM 只杀 worker。
-   * - Bun 环境：node:worker_threads 覆盖不全、resourceLimits 不生效，退化为同进程
-   *   同步重建（仍保持 Promise 形态，调用方无需关心差异）。
+   * - Bun 环境：node:worker_threads 覆盖不全、resourceLimits 不生效，改为独立
+   *   子进程执行（见 spawnIndexChild），同样不阻塞事件循环。
    * @param {(p: { done: number, total: number }) => void} [onProgress] 进度回调
    * @returns {Promise<number>} 索引文档数
    */
@@ -986,7 +1056,8 @@ export function createMagnetDb(options = {}) {
 
   /**
    * 统一的索引维护入口：把「启动同步 / 手动·定时同步 / 重建」收口为同一个 Promise，
-   * 由独立 worker 线程执行（Node），保证主线程零阻塞、任意时刻只有一个维护操作在跑。
+   * 由独立 worker 线程（Node）或子进程（Bun）执行，保证主线程零阻塞、
+   * 任意时刻只有一个维护操作在跑。
    * @param {'incremental'|'full'} mode  'incremental'=只补录不清空；'full'=清空重建
    * @param {(p:{done:number,total:number})=>void} [onProgress] 进度回调
    * @returns {Promise<number|{skipped:boolean,added:number}>}
@@ -1008,17 +1079,14 @@ export function createMagnetDb(options = {}) {
       onProgress?.(p);
     };
     if (isBun) {
-      // Bun 对 worker_threads 覆盖不全、resourceLimits 不生效，退化为同进程同步执行
-      indexingPromise = (async () => {
-        await new Promise((r) => setTimeout(r, 0)); // 让出事件循环，贴近异步语义
-        begin();
-        try {
-          if (mode === 'full') return rebuildSync(wrapped);
-          return syncIncrementalSync((p) => wrapped({ done: p.done, total: p.total }));
-        } finally {
-          runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 };
-        }
-      })().finally(() => { indexingPromise = null; });
+      // Bun 对 worker_threads 覆盖不全（resourceLimits 不生效、terminate 无法中断
+      // 原生调用），同进程同步执行又会把事件循环整个卡死 → 派生独立子进程执行
+      //（见 spawnIndexChild），主进程零阻塞，页面 / 检索全程可用
+      begin();
+      indexingPromise = spawnIndexChild(mode, wrapped)
+        .then((r) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; return r; })
+        .catch((e) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; throw e; })
+        .finally(() => { indexingPromise = null; });
       return indexingPromise;
     }
     begin();
@@ -1076,7 +1144,11 @@ export function createMagnetDb(options = {}) {
   /** 关闭连接 */
   function close() {
     if (reindexWorker) {
-      reindexWorker.terminate();
+      // Node 模式是 worker 线程（terminate()），Bun 模式是子进程（SIGKILL）
+      if (typeof reindexWorker.terminate === 'function') reindexWorker.terminate();
+      else {
+        try { reindexWorker.kill('SIGKILL'); } catch { /* 已退出 */ }
+      }
       reindexWorker = null;
     }
     closeDb(rdb);

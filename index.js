@@ -263,7 +263,7 @@ app.get('/api/search', apiHandler(async (req, res) => {
   }
 }));
 
-/** 手动全量重建影子索引（在 worker 线程中执行，重建期间检索仍可用） */
+/** 手动全量重建影子索引（在 worker 线程 / 子进程中执行，重建期间检索仍可用） */
 app.post('/api/reindex', apiHandler(async (_req, res) => {
   log.user('手动触发全量索引重建');
   beginReindex();

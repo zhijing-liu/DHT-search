@@ -41,7 +41,7 @@ export const WEB_BASE_PATH = '';
  */
 export const MAX_RESULTS = 2000;
 
-/** reindex 全量重建的 V8 老生代堆上限（MB），仅 Node worker 生效；Bun 退化为同进程同步重建 */
+/** reindex 全量重建的 V8 老生代堆上限（MB），仅 Node worker 线程生效；Bun 走子进程执行，堆由操作系统兜底 */
 export const REINDEX_MAX_OLD_SPACE_MB = 2048;
 
 /** reindex 超时（毫秒），0 表示不限时；超时后 worker 会被终止，主进程不受影响 */
