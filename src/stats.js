@@ -18,6 +18,10 @@ export const runtimeStats = {
   reindex: { running: false, done: 0, total: 0 },
   /** 增量同步节拍 */
   sync: { running: false, lastAt: null, lastAdded: 0, nextAt: null },
+  /** 索引维护中（启动同步 / 手动·定时同步 / 重建 统一状态机，由 db.js 直接赋值） */
+  indexing: { running: false, mode: null, done: 0, total: 0 },
+  /** 启动初始化中（仅首次启动同步期间为 true） */
+  initializing: false,
   /** 搜索结果缓存命中统计（累计值） */
   cache: { hit: 0, miss: 0 },
 };

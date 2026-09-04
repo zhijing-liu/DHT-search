@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { sql } from 'drizzle-orm';
 import { createMagnetDb, normalizeSearchQuery } from '../src/db.js';
+import { runtimeStats } from '../src/stats.js';
 import { MAX_LIMIT } from '../src/store.js';
 import { openDatabase, setPragma, execRaw, closeDb } from '../src/db-driver.js';
 
@@ -18,16 +19,18 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SMOKE_DB = path.join(HERE, 'data', 'smoke.db');
 const SMOKE_INDEX = path.join(HERE, 'data', 'smoke.search.db');
 
+const DATA_DIR = path.dirname(SMOKE_DB);
 const cleanup = () => {
-  for (const f of [SMOKE_DB, SMOKE_INDEX]) {
-    for (const s of ['', '-wal', '-shm']) {
-      // best-effort：Windows 上偶发文件锁未释放，忽略以免影响最终断言汇总
-      try {
-        fs.rmSync(f + s, { force: true });
-      } catch {
-        /* 文件可能被运行时短暂锁定，忽略 */
+  // 通配删除 test/data/smoke*.db*：既清源库/影子索引，也清各 section 的独立索引库
+  try {
+    for (const f of fs.readdirSync(DATA_DIR)) {
+      if (/^smoke.*\.db(-\w+)?$/.test(f)) {
+        // best-effort：Windows 上偶发文件锁未释放，忽略以免影响最终断言汇总
+        try { fs.rmSync(path.join(DATA_DIR, f), { force: true }); } catch {}
       }
     }
+  } catch {
+    /* test/data 尚不存在时 readdirSync 抛 ENOENT，忽略（随后 mkdir 创建） */
   }
 };
 cleanup();
@@ -125,6 +128,16 @@ writeSource((src) => {
 });
 
 const openApi = () => createMagnetDb({ source: SMOKE_DB, indexDbPath: SMOKE_INDEX });
+
+// 各 section 用独立影子索引库，互不干扰（文件名前缀 smoke，会被 cleanup 通配删除）
+const idxFor = (n) => path.join(DATA_DIR, `smoke.idx${n}.db`);
+
+// 读取源库当前行数（模拟「另一应用」写入后的真实规模）
+const countSource = () => {
+  let c = 0;
+  writeSource((s) => { c = s.prepare('SELECT count(*) AS c FROM magnets').get().c; });
+  return c;
+};
 
 console.log('\n[1] 总条数统计');
 {
@@ -448,6 +461,95 @@ console.log('\n[11] 热词过滤（keyword_filter）');
     api.removeKeywordFilter('brunette');
     assert.ok(api.topKeywords().some((k) => k.term === 'brunette'));
   });
+  api.close();
+}
+
+console.log('\n[12] 启动同步不阻塞（sync:false）+ syncIncremental 异步补录');
+{
+  const api = createMagnetDb({ source: SMOKE_DB, indexDbPath: idxFor(12), sync: false });
+  check('sync:false 启动不索引：countMagnets 为 0', () => {
+    assert.equal(api.countMagnets(), 0);
+  });
+  check('sync:false 启动索引为空：搜索无命中', () => {
+    assert.equal(api.searchMagnets({ query: 'brunette' }).total, 0);
+  });
+  const srcCount = countSource();
+  await check('await syncIncremental() 返回 {skipped:false, added=id跨度}', async () => {
+    const r = await api.syncIncremental();
+    assert.equal(r.skipped, false);
+    // added 是 id 跨度（max-last），源库含已删除空洞时可能 > 实际行数，故只需 >= 行数
+    assert.ok(r.added >= srcCount, `added=${r.added} 应不小于实际行数 ${srcCount}`);
+  });
+  check('syncIncremental 后索引与源库一致（count 相等、ubuntu 命中）', () => {
+    assert.equal(api.countMagnets(), srcCount);
+    assert.equal(api.searchMagnets({ query: 'ubuntu' }).total, 1);
+  });
+  await check('无新增再 syncIncremental 返回 added=0', async () => {
+    const r = await api.syncIncremental();
+    assert.equal(r.skipped, false);
+    assert.equal(r.added, 0);
+  });
+  api.close();
+}
+
+console.log('\n[13] reindex 异步化 + indexing 状态机 + 进度回传');
+{
+  const api = createMagnetDb({ source: SMOKE_DB, indexDbPath: idxFor(13), sync: false });
+  let sawRunning = false;
+  let sawProgress = false;
+  const indexed = await api.reindex((p) => {
+    if (typeof p?.done === 'number' && typeof p?.total === 'number') sawProgress = true;
+    if (runtimeStats.indexing.running === true) sawRunning = true;
+  });
+  check('reindex() 返回索引文档数（数字）', () => assert.equal(indexed, countSource()));
+  check('reindex 过程中 indexing.running 被置为 true', () => assert.ok(sawRunning));
+  check('reindex 回传了 done/total 进度', () => assert.ok(sawProgress));
+  check('reindex 完成后 indexing.running 复位为 false', () => {
+    assert.equal(runtimeStats.indexing.running, false);
+  });
+  check('reindex 后索引有效（ubuntu 命中）', () => {
+    assert.equal(api.searchMagnets({ query: 'ubuntu' }).total, 1);
+  });
+  api.close();
+}
+
+console.log('\n[14] 单实例互斥：重建进行中增量被归一化为 skipped');
+{
+  const api = createMagnetDb({ source: SMOKE_DB, indexDbPath: idxFor(14), sync: false });
+  // 先发起 reindex（不 await），立即并行发起 syncIncremental（不 await）
+  const fullP = api.reindex();
+  const incP = api.syncIncremental();
+  const [idx, sync] = await Promise.all([fullP, incP]);
+  check('reindex 仍正常完成（返回数字）', () => assert.equal(typeof idx, 'number'));
+  check('重建进行中发起的 syncIncremental 被跳过：skipped=true、added=0', () => {
+    assert.equal(sync.skipped, true);
+    assert.equal(sync.added, 0);
+  });
+  check('互斥后索引最终与源库一致（reindex 结果生效）', () => {
+    assert.equal(api.countMagnets(), countSource());
+  });
+  api.close();
+}
+
+console.log('\n[15] worker 错误传播：重建失败 reject 且 indexing 复位');
+{
+  // 构造「表存在但缺列」的畸形源库：主进程 createMagnetDb 只校验表存在故不会崩，
+  // 但 worker 内 rebuildSync 的 scanById 会因缺列抛错，从而验证 reject + 状态机复位。
+  const BAD_SRC = path.join(DATA_DIR, 'bad-source.db');
+  {
+    const s = openDatabase(BAD_SRC);
+    setPragma(s, 'journal_mode', 'WAL');
+    execRaw(s, 'CREATE TABLE magnets (id INTEGER PRIMARY KEY)');
+    closeDb(s);
+  }
+  const api = createMagnetDb({ source: BAD_SRC, indexDbPath: idxFor(15), sync: false });
+  await check('reindex() 因源库缺列而 reject', async () => {
+    await assert.rejects(api.reindex());
+  });
+  check('失败后 indexing.running 复位为 false（不卡状态机）', () => {
+    assert.equal(runtimeStats.indexing.running, false);
+  });
+  fs.rmSync(BAD_SRC, { force: true });
   api.close();
 }
 

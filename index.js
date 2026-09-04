@@ -43,7 +43,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const PORT = Number(CONFIG.port) || Number(process.env.PORT) || 3000;
 
-const api = createMagnetDb();
+const api = createMagnetDb({ sync: false });
 
 /* ------------------------------------------------------------------ */
 /* 已索引总数内存缓存（事件驱动）                                      */
@@ -280,13 +280,15 @@ app.post('/api/reindex', apiHandler(async (_req, res) => {
 }));
 
 /** 增量同步最新索引（按 last_rowid 仅补录源库新增行，秒级；与重建互斥） */
-app.post('/api/sync', apiHandler((_req, res) => {
+app.post('/api/sync', apiHandler(async (_req, res) => {
   log.user('手动触发增量同步');
   let skipped = false;
   let added = 0;
   beginSync();
   try {
-    ({ skipped, added } = api.syncIncremental());
+    const r = await api.syncIncremental();
+    skipped = r.skipped;
+    added = r.added;
   } finally {
     // 传周期，让自动同步节拍从本次手动同步顺延一个周期（否则 nextAt 不变）
     endSync(added, SYNC_INTERVAL_MS);
@@ -340,6 +342,8 @@ function collectStats() {
     lastSyncAt: runtimeStats.sync.lastAt,
     syncing: runtimeStats.sync.running,
     reindex: runtimeStats.reindex,
+    initializing: runtimeStats.initializing,
+    indexing: runtimeStats.indexing,
   };
 }
 
@@ -448,8 +452,18 @@ const SYNC_INTERVAL_MS = (() => {
   const v = Number(CONFIG.syncIntervalMs);
   return Number.isFinite(v) && v > 0 ? v : 3600000;
 })();
-// 启动时 createMagnetDb() 内部已同步过一次，据此建立同步节拍（供面板显示倒计时）
+// 启动时 createMagnetDb({ sync:false }) 不再阻塞主线程，同步节拍照常建立
 initSyncClock(SYNC_INTERVAL_MS);
+// 启动同步丢进 worker 后台增量补录，不阻塞主线程、页面立即可响应；
+// 期间标记 initializing，完成后刷新总数缓存。
+runtimeStats.initializing = true;
+api.syncIncremental()
+  .then((r) => { if (r && r.added > 0) syncIndexedCount(); })
+  .catch((e) => log.error(`启动同步失败: ${e?.message || e}`))
+  .finally(() => {
+    runtimeStats.initializing = false;
+    syncIndexedCount(); // 无论成败都刷新总数，反映当前索引状态
+  });
 const syncTimer = setInterval(async () => {
   let added = 0;
   beginSync();

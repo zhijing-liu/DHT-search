@@ -33,6 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { log } from './logger.js';
+import { runtimeStats } from './stats.js';
 import { clampInt, normalizeKeyword } from './util.js';
 import {
   isBun,
@@ -269,6 +270,24 @@ function tableExists(db, name) {
 function buildFts(db) {
   db.run(sql`DROP TABLE IF EXISTS ${sql.raw(FTS_TABLE)}`);
   db.run(sql`CREATE VIRTUAL TABLE ${sql.raw(FTS_TABLE)} USING fts5(
+    name, files, content='', tokenize=${sql.raw(`'${TOKENIZER}'`)}
+  )`);
+}
+
+/** 确保索引表（副本表 + FTS5 虚表）存在（空表）。createMagnetDb 初始化时始终调用，
+ *  使 sync:false 或 worker 内打开的全新索引库也能被安全读取 / 增量写入，
+ *  不必先跑一次全量重建。全量重建时 fullRebuild 会 DROP+CREATE 覆盖它们。 */
+function ensureSchema(db) {
+  db.run(sql`CREATE TABLE IF NOT EXISTS ${sql.raw(DOCS_TABLE)} (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    infohash TEXT,
+    magnet TEXT,
+    files TEXT,
+    totalSize INTEGER NOT NULL DEFAULT 0,
+    fetchedAt INTEGER NOT NULL DEFAULT 0
+  )`);
+  db.run(sql`CREATE VIRTUAL TABLE IF NOT EXISTS ${sql.raw(FTS_TABLE)} USING fts5(
     name, files, content='', tokenize=${sql.raw(`'${TOKENIZER}'`)}
   )`);
 }
@@ -732,6 +751,10 @@ export function createMagnetDb(options = {}) {
     created_at INTEGER NOT NULL DEFAULT 0
   )`);
 
+  // 索引表始终确保存在（空表）：即便 sync:false / worker 内打开的全新索引库，
+  // 也能被安全地读取（返回空结果）与增量写入，而不会 no such table 崩溃。
+  ensureSchema(db);
+
   // 源库只读打开（构建时读取），并校验表存在 / 提示 WAL 模式
   const src = openSourceRO(sourcePath);
   try {
@@ -786,13 +809,17 @@ export function createMagnetDb(options = {}) {
   const REINDEX_TIMEOUT_MS = clampInt(CONFIG.reindexTimeoutMs, 0, 0, Number.MAX_SAFE_INTEGER);
 
   let reindexWorker = null;
-  let reindexPromise = null;
+  let indexingPromise = null;
 
-  /** 派生 worker 线程执行重建（仅 Node 路径使用） */
-  function spawnReindexWorker(onProgress) {
+  /**
+   * 派生 worker 线程执行索引维护（通用，仅 Node 路径使用）。
+   * @param {'incremental'|'full'} mode  'incremental'=只补录不清空；'full'=清空重建
+   * @param {(p: { done: number, total: number }) => void} [onProgress] 进度回调
+   */
+  function spawnIndexWorker(mode, onProgress) {
     return new Promise((resolve, reject) => {
       const worker = new Worker(REINDEX_WORKER_URL, {
-        workerData: { sourcePath, indexPath },
+        workerData: { sourcePath, indexPath, mode },
         // 堆触顶时 worker 会以 ERR_WORKER_OUT_OF_MEMORY 退出，只杀 worker，主进程不受影响
         resourceLimits: { maxOldGenerationSizeMb: clampInt(CONFIG.reindexMaxOldSpaceMb, 2048, 256, 65536) },
         stdout: true,
@@ -807,27 +834,33 @@ export function createMagnetDb(options = {}) {
         settled = true;
         if (timer) clearTimeout(timer);
         reindexWorker = null;
-        if (!ok) worker.terminate();
+        if (!ok) worker.terminate(); // 终态即终止，监听器随之回收
         (ok ? resolve : reject)(value);
       };
 
       if (REINDEX_TIMEOUT_MS > 0) {
         timer = setTimeout(
-          () => settle(false, new Error(`reindex 超时（${REINDEX_TIMEOUT_MS}ms）`)),
+          () => settle(false, new Error(`索引维护超时（${REINDEX_TIMEOUT_MS}ms）`)),
           REINDEX_TIMEOUT_MS
         );
       }
+      // progress 多次 → 用 on 持续监听
       worker.on('message', (msg) => {
         if (msg?.type === 'progress') {
           onProgress?.(msg);
           return;
         }
-        if (msg?.ok) settle(true, msg.indexed);
-        else settle(false, new Error(msg?.error || 'reindex failed'));
+        if (msg?.ok) {
+          // full 模式回执 indexed 数字；incremental 模式回执 { skipped, added }
+          settle(true, mode === 'full' ? msg.indexed : msg.result);
+        } else {
+          settle(false, new Error(msg?.error || 'index failed'));
+        }
       });
-      worker.on('error', (err) => settle(false, err));
-      worker.on('exit', (code) => {
-        if (!settled) settle(false, new Error(`reindex 进程异常退出（code=${code}）`));
+      // 终态事件 → 用 once，触发一次即自动移除，监听干净
+      worker.once('error', (err) => settle(false, err));
+      worker.once('exit', (code) => {
+        if (!settled) settle(false, new Error(`索引 worker 异常退出（code=${code}）`));
       });
     });
   }
@@ -939,22 +972,59 @@ export function createMagnetDb(options = {}) {
    * @param {(p: { done: number, total: number }) => void} [onProgress] 进度回调
    * @returns {Promise<number>} 索引文档数
    */
-  function reindex(onProgress) {
-    // 已有重建在跑则复用同一个 promise（注意：第二个调用方的 onProgress 不会生效）
-    if (reindexPromise) return reindexPromise;
-    if (isBun) {
-      reindexPromise = (async () => {
-        await new Promise((r) => setTimeout(r, 0)); // 让出事件循环，贴近异步语义
-        return rebuildSync(({ done, total }) => onProgress?.({ done, total }));
-      })().finally(() => {
-        reindexPromise = null;
-      });
-      return reindexPromise;
+  /**
+   * 全量重建影子索引（清空重建）。
+   * @param {(p:{done:number,total:number})=>void} [onProgress]
+   * @returns {Promise<number>} 索引文档数
+   */
+  async function reindex(onProgress) {
+    return runIndex('full', onProgress);
+  }
+
+  /**
+   * 统一的索引维护入口：把「启动同步 / 手动·定时同步 / 重建」收口为同一个 Promise，
+   * 由独立 worker 线程执行（Node），保证主线程零阻塞、任意时刻只有一个维护操作在跑。
+   * @param {'incremental'|'full'} mode  'incremental'=只补录不清空；'full'=清空重建
+   * @param {(p:{done:number,total:number})=>void} [onProgress] 进度回调
+   * @returns {Promise<number|{skipped:boolean,added:number}>}
+   */
+  function runIndex(mode, onProgress) {
+    // 单实例互斥：已有维护在跑则复用。incremental 请求统一归一化为 { skipped, added }
+    // （被 full 重建占用时视为跳过，避免 syncTimer / 手动同步拿到 rebuild 返回的数字）。
+    if (indexingPromise) {
+      if (mode === 'incremental') {
+        return indexingPromise
+          .then((r) => (typeof r === 'number' ? { skipped: true, added: 0 } : r))
+          .catch(() => ({ skipped: true, added: 0 }));
+      }
+      return indexingPromise;
     }
-    reindexPromise = spawnReindexWorker(onProgress).finally(() => {
-      reindexPromise = null;
-    });
-    return reindexPromise;
+    const begin = () => { runtimeStats.indexing = { running: true, mode, done: 0, total: 0 }; };
+    const wrapped = (p) => {
+      runtimeStats.indexing = { running: true, done: p.done, total: p.total, mode };
+      onProgress?.(p);
+    };
+    if (isBun) {
+      // Bun 对 worker_threads 覆盖不全、resourceLimits 不生效，退化为同进程同步执行
+      indexingPromise = (async () => {
+        await new Promise((r) => setTimeout(r, 0)); // 让出事件循环，贴近异步语义
+        begin();
+        try {
+          if (mode === 'full') return rebuildSync(wrapped);
+          let acc = 0;
+          return syncIncrementalSync(({ rows }) => wrapped({ done: (acc += rows), total: 0 }));
+        } finally {
+          runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 };
+        }
+      })().finally(() => { indexingPromise = null; });
+      return indexingPromise;
+    }
+    begin();
+    indexingPromise = spawnIndexWorker(mode, wrapped)
+      .then((r) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; return r; })
+      .catch((e) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; throw e; })
+      .finally(() => { indexingPromise = null; });
+    return indexingPromise;
   }
 
   /**
@@ -968,9 +1038,8 @@ export function createMagnetDb(options = {}) {
    * @param {(p: { rows: number }) => void} [onFlush] 每批落库后回调
    * @returns {{ skipped: boolean, added: number }} 本轮是否因重建而跳过、补录的 id 跨度
    */
-  function syncIncremental(onFlush) {
-    // 重建进行中（reindexPromise 非空）则跳过本轮，与 reindex 互斥
-    if (reindexPromise) return { skipped: true, added: 0 };
+  /** 增量补录核心（不清空，只补录新增）；供 worker / 同进程调用，互斥由 runIndex 负责 */
+  function syncIncrementalSync(onFlush) {
     const src = openSourceRO(sourcePath);
     try {
       const last = Number(getMeta(db, 'last_rowid') ?? '0');
@@ -984,6 +1053,15 @@ export function createMagnetDb(options = {}) {
     } finally {
       src.close();
     }
+  }
+
+  /**
+   * 运行期增量补录（不清空）。走统一 runIndex：单实例互斥、可经 worker 异步执行。
+   * @param {(p:{done:number,total:number})=>void} [onProgress]
+   * @returns {Promise<{skipped:boolean, added:number}>}
+   */
+  async function syncIncremental(onProgress) {
+    return runIndex('incremental', onProgress);
   }
 
   /** 关闭连接 */
@@ -1010,6 +1088,7 @@ export function createMagnetDb(options = {}) {
     removeKeywordFilter,
     reindex,
     syncIncremental,
+    syncIncrementalSync,
     rebuildSync,
     close,
   };

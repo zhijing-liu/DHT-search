@@ -838,11 +838,13 @@ function renderStats(d) {
       `${d.reindex.done.toLocaleString('zh-CN')} / ${d.reindex.total.toLocaleString('zh-CN')}（${pct.toFixed(1)}%）`;
   }
 
-  el.statsStatus.textContent = d.reindex && d.reindex.running
-    ? '正在重建索引…'
-    : d.syncing
-      ? '正在同步索引…'
-      : '每 3 秒自动刷新';
+  el.statsStatus.textContent = d.initializing
+    ? '索引初始化中…（后台同步索引，可正常使用）'
+    : d.reindex && d.reindex.running
+      ? '正在重建索引…'
+      : d.syncing
+        ? '正在同步索引…'
+        : '每 3 秒自动刷新';
 }
 
 function startStatsStream() {
