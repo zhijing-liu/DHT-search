@@ -21,6 +21,8 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { createMagnetDb, normalizeSearchQuery, normalizeKeyword } from './src/db.js';
 import { createSearchExecutor } from './src/searchPool.js';
+import { createAccessControl } from './src/accessControl.js';
+import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY } from './config.js';
 import { CONFIG } from './src/store.js';
 import { LRUCache } from 'lru-cache';
 import { log } from './src/logger.js';
@@ -92,6 +94,18 @@ const searchCacheSweep = setInterval(() => searchCache.purgeStale(), 60_000);
 if (typeof searchCacheSweep.unref === 'function') searchCacheSweep.unref();
 
 const app = express();
+
+// 信任前置反向代理（nginx 等）时设为 true / 'loopback' / 具体子网，
+// 才能从 X-Forwarded-For 拿到真实客户端 IP 用于白名单比对；
+// 默认 false：直连场景取 TCP 对端地址，安全且正确。
+if (TRUST_PROXY) app.set('trust proxy', TRUST_PROXY);
+
+// 接入层访问控制（IP / 网段白名单）：放在最前，整站（前端页面 + 所有 API +
+// 写接口）统一由白名单把关。mode 为 'off' 或白名单为空时不限制。
+app.use(createAccessControl({
+  mode: ACCESS_CONTROL_MODE ?? 'off',
+  allowed: ALLOWED_CLIENTS ?? [],
+}));
 
 /**
  * 请求日志中间件：所有来自用户（或前端）主动发起的操作统一标记为 [USER]。

@@ -13,6 +13,7 @@
     "test": "node test/smoke.mjs",
     "seed:filter": "node scripts/seed-filter.mjs",
     "verify:driver": "node test/verify-driver.mjs",
+    "test:access": "node test/access-control.mjs",
     "start:pm2:node": "pm2 start ecosystem.config.node.json",
     "start:pm2:bun": "pm2 start ecosystem.config.bun.json",
     "stop:pm2": "pm2 stop dht-search-node dht-search-bun",
