@@ -1,5 +1,11 @@
 # DHT Search
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+![Runtime](https://img.shields.io/badge/runtime-Node%20%7C%20Bun-brightgreen)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)
+
+**简体中文** | [English](README.en.md)
+
 基于 **SQLite FTS5 全文检索**的磁力链接（magnet / torrent）搜索引擎，配套一个 Vite + Tailwind 构建的检索界面。
 
 ## 一、项目简介
@@ -484,3 +490,28 @@ DHT-Search\
 | 搜索一直转圈没结果 | 确认黑窗还开着（程序在运行）；确认索引已建完；仍不行可在设置面板点「重建索引」 |
 | 想让外网的朋友也能访问 | 在路由器上做端口映射（把外网端口转到这台电脑的 3000 端口），并把对方的公网 IP 加入 `ALLOWED_CLIENTS`。**不建议**关闭白名单直接暴露公网 |
 | 黑窗里出现红色错误文字 | 把报错文字截图或抄下来，对照本文档检查配置；解决不了连同报错一起反馈给开发者 |
+
+## 十四、数据来源与开源致谢
+
+本项目的磁力数据由开源项目 [**p2pspider**](https://github.com/thejordanprice/p2pspider) 对 BitTorrent DHT 网络的抓取结果引入，特此说明与致谢：
+
+- [p2pspider](https://github.com/thejordanprice/p2pspider) 是一个基于 Node.js 的 BitTorrent DHT 爬虫（实现 BEP 0005 / 0003 / 0010 / 0009），以 **MIT License** 开源发布；
+- 本项目**不包含** p2pspider 的任何代码，仅消费其抓取产出的数据库文件（`data/magnet.db`）；
+- 本项目及发布包**不分发任何抓取数据**（`data/` 目录不随安装包分发，需使用者自行准备），这也呼应了 p2pspider 作者「请勿将抓取的数据分享到互联网」的请求；
+- 感谢 [thejordanprice](https://github.com/thejordanprice) 及开源社区的工作。
+
+## 十五、免责声明与开源协议
+
+### 免责声明
+
+- 本项目仅对 DHT 网络（BitTorrent 公开分布式哈希表）中**公开广播**的资源元数据（磁力链接、文件名、文件大小等）建立索引，**不存储、不提供、不托管任何内容文件本身**；
+- 抓取结果中可能包含敏感、违法违规或受版权保护的内容索引，**使用者应遵守所在国家 / 地区的法律法规**，不得将本项目用于任何侵犯他人知识产权或其他合法权益的用途；
+- 本项目按「现状」提供，不含任何明示或默示的担保；因使用本项目产生的任何问题，由使用者自行承担。
+
+### 开源协议
+
+本项目以 [MIT License](./LICENSE) 开源发布：
+
+- 任何人可免费使用、复制、修改、合并、发布、分发本项目软件及副本，惟须在软件及副本中保留原版权声明与许可声明；
+- 衍生 / 二次分发时请一并保留本 README 中的数据来源致谢（开源精神）；
+- 本项目依赖（express / drizzle-orm / better-sqlite3 / archiver / lru-cache / chalk 等）均为 MIT / BSD / Apache-2.0 等宽松协议，无 copyleft 传染问题。
