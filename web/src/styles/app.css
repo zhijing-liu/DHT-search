@@ -80,6 +80,18 @@
 
   /* 弹窗改为普通定位层（非原生 <dialog>），无需 dialog:modal 居中兜底 */
 
+  /* 结果卡片「查看全部文件」仍是原生 <dialog>：
+     UA 的 dialog:modal 居中实现各浏览器不一致，且卡片 hover 的
+     translateY 会让固定定位后代偏移；这里显式固定定位 + 视口居中兜底。 */
+  dialog {
+    position: fixed;
+    inset: 0;
+    z-index: 1001; /* 页面其它覆盖层为 z-1000 */
+    margin: auto;
+    max-width: calc(100vw - 12px);
+    max-height: calc(100vh - 12px);
+  }
+
   /* 统一下拉选项面板配色，覆盖浏览器默认蓝底白字 */
   option {
     background-color: var(--color-card);
@@ -114,4 +126,14 @@
   .stats-hud {
     transform: none;
   }
+}
+
+/* ------------------------------------------------------------------
+   结果卡片「查看全部文件」原生 <dialog> 修正
+   ------------------------------------------------------------------ */
+/* 弹窗打开瞬间指针仍在卡片上（hover:-translate-y-0.5 生效），transform
+   会给 fixed 定位的 dialog 建立非视口包含块导致偏位；
+   置于无 layer 顶层，优先级高于工具类，打开时先解除卡片位移。 */
+magnet-card:has(dialog[open]) {
+  transform: none;
 }
