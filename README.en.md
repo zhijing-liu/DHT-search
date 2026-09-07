@@ -184,7 +184,7 @@ Path resolution priority: **explicit argument > config.js > module default** (co
 
 1. **Source DB**: `data/magnet.db` must exist and contain a `magnets` table (written by an external DHT crawler). Startup fails otherwise.
 2. **Runtime** (either one):
-   - **Node**: needs `better-sqlite3` (native C++ module; `npm install` prebuilds/compiles automatically). Node ≥ 14.8 (top-level await).
+   - **Node**: needs `better-sqlite3` (native C++ module; `npm install` prebuilds/compiles automatically). Node ≥ 20 (top-level await); **22 / 24 LTS recommended** (Node 20 went EOL 2026-04 and is no longer tested in CI).
    - **Bun**: `bun:sqlite` built-in, no native compilation. The root `bunfig.toml` sets `[install] optional = false` so `bun install` skips `optionalDependencies`' better-sqlite3 automatically; npm users are unaffected and get it installed.
 3. Install dependencies:
    ```bash
@@ -192,6 +192,10 @@ Path resolution priority: **explicit argument > config.js > module default** (co
    # or
    bun install                 # Bun path (bunfig.toml skips better-sqlite3)
    ```
+
+   > ⚠️ **npm and Bun share the same `node_modules`; re-install after switching package managers**:
+   > `bun install` skips and **removes** `better-sqlite3` (the Bun runtime uses the built-in `bun:sqlite` and doesn't need it);
+   > running the source / tests on Node does need it — restore with `npm install better-sqlite3`.
 4. Build the frontend (once for first deployment; skip if `public/` already exists):
    ```bash
    npm run build:web           # web/ → public/ (Vite + Tailwind)

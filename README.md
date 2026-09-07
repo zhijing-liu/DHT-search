@@ -188,7 +188,7 @@ DHT-search/
 
 1. **源库前置**：`data/magnet.db` 必须存在且包含 `magnets` 表（由外部 DHT 爬虫写入）。不存在或表缺失时启动会报错。
 2. **运行时**（二选一）：
-   - **Node**：需 `better-sqlite3`（C++ 原生模块，`npm install` 会自动尝试预编译/本地编译）。要求 Node ≥ 14.8（支持顶层 await）。
+   - **Node**：需 `better-sqlite3`（C++ 原生模块，`npm install` 会自动尝试预编译/本地编译）。要求 Node ≥ 20（支持顶层 await），**推荐 22 / 24 LTS**（Node 20 已于 2026-04 EOL，CI 不再测试）。
    - **Bun**：`bun:sqlite` 内置，无需原生编译。仓库根的 `bunfig.toml` 已配置
      `[install] optional = false`，`bun install` 会自动跳过 `optionalDependencies` 里的
      `better-sqlite3`，无需手工处理；Node 用户用 `npm install` 不受影响，仍会正常装入。
@@ -198,6 +198,10 @@ DHT-search/
    # 或
    bun install                 # Bun 路径（bunfig.toml 已跳过 better-sqlite3）
    ```
+
+   > ⚠️ **npm 与 Bun 共用同一个 `node_modules`，切换包管理器后请重新安装依赖**：
+   > `bun install` 会跳过并**移除** `better-sqlite3`（Bun 运行时用内置 `bun:sqlite`，不需要它）；
+   > 而以 Node 跑源码 / 测试时需要它，此时执行 `npm install better-sqlite3` 恢复即可。
 4. 构建前端（首次部署需执行一次；产物已存在时可跳过）：
    ```bash
    npm run build:web           # web/ → public/（Vite + Tailwind）

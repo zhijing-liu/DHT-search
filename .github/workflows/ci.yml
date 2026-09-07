@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# 最小权限：只读仓库内容即可完成测试
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: Node ${{ matrix.node }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install dependencies
+        run: npm install
+      # better-sqlite3 是 optionalDependencies：安装失败时 npm 会静默跳过（exit 0），
+      # 错误被推迟到运行时。这里显式回拉一次并打开脚本输出，失败即在此步骤可见。
+      - name: Ensure better-sqlite3 (native, optional deps are silently skipped on failure)
+        run: node -e "require('better-sqlite3')" || npm install better-sqlite3 --foreground-scripts
+      - name: Verify FTS5 availability
+        run: node -e "const db=require('better-sqlite3')(':memory:');db.exec('CREATE VIRTUAL TABLE t USING fts5(x)');console.log('better-sqlite3 + FTS5 OK')"
+      - name: Driver feasibility checks
+        run: npm run verify:driver
+      - name: Smoke tests
+        run: npm test
+
+  bun:
+    name: Bun on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: bun install
+      - name: Smoke tests
+        run: bun test/smoke.mjs

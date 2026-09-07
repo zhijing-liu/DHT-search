@@ -1,7 +1,7 @@
 {
   "name": "DHT-search",
   "version": "1.0.0",
-  "description": "",
+  "description": "A self-hosted magnet link search engine built on SQLite FTS5. Dual Node/Bun runtime, background incremental indexing, on-demand search child processes, and one-command single-file exe packaging.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -22,9 +22,30 @@
     "stop:pm2": "pm2 stop dht-search-node dht-search-bun",
     "logs:pm2": "pm2 logs"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "bittorrent",
+    "dht",
+    "magnet",
+    "search-engine",
+    "sqlite",
+    "fts5",
+    "full-text-search",
+    "nodejs",
+    "bun",
+    "express",
+    "self-hosted",
+    "torrent"
+  ],
+  "author": "liuzixin",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhijing-liu/DHT-search.git"
+  },
+  "homepage": "https://github.com/zhijing-liu/DHT-search#readme",
+  "bugs": {
+    "url": "https://github.com/zhijing-liu/DHT-search/issues"
+  },
   "type": "module",
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

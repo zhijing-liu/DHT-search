@@ -1,0 +1,102 @@
+name: Release
+
+# 推送 v* 形式的 tag 时触发：自动构建 exe + 打包 zip，并发布为 GitHub Release。
+# 用法：
+#   git tag v1.0.0
+#   git push <remote> v1.0.0
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 创建 Release 与上传资产需要写权限
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish (${{ github.ref_name }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      # build:exe 链条同时需要两个运行时：
+      #   node —— npm 脚本 / Vite 前端构建 / pack-zip（archiver）
+      #   bun  —— bun build --compile 产出单文件 exe
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Set version from tag
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}" -replace '^v', ''
+          Add-Content -Path $env:GITHUB_ENV -Value "DHT_PACK_VERSION=$v"
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Install web dependencies
+        run: npm install --prefix web
+
+      - name: Build exe
+        run: npm run build:exe
+
+      - name: Pack zip
+        run: npm run pack:zip
+
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "release/*.zip")) {
+            Write-Error "打包失败：release/ 目录下没有 ZIP 文件"
+            exit 1
+          }
+          Get-ChildItem "release/*.zip" | ForEach-Object {
+            Write-Host ("✅ 产物: {0}（{1:N1} MB）" -f $_.Name, ($_.Length / 1MB))
+          }
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zip = Get-ChildItem "release/*.zip" | Select-Object -First 1
+          if (-not $zip) { Write-Error "release/ 下没有 zip 产物"; exit 1 }
+
+          # 按提交记录自动生成变更说明（创建与更新共用同一份，重跑时描述随之刷新）
+          $notes = (gh api "repos/$env:GITHUB_REPOSITORY/releases/generate-notes" -f tag_name=$tag |
+            ConvertFrom-Json).body
+
+          # 将 #数字 引用替换为显式链接（显示为 "PR #42"，避免纯 #42 对新手不够直观；
+          # GitHub 网页端本可自动转换，但 API / 第三方镜像 / 纯文本阅读场景下不会）
+          $notes = $notes -replace '#(\d+)', "[PR #`$1](https://github.com/$env:GITHUB_REPOSITORY/pull/`$1)"
+
+          # 末尾追加构建信息，便于用户反馈问题时定位
+          $buildInfo = @"
+
+---
+
+**构建信息 / Build Info**
+- 版本: $tag
+- 平台: Windows x64（GitHub Actions）
+- 运行时: Node $(node -v) / Bun $(bun --version)
+- 构建时间(UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))
+"@
+          $notes += $buildInfo
+
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            # Release 已存在（如重跑）：同步标题 / 描述，并覆盖上传资产
+            gh release edit $tag --title "DHT Search $tag" --notes $notes
+            gh release upload $tag $zip.FullName --clobber
+          } else {
+            gh release create $tag $zip.FullName --title "DHT Search $tag" --notes $notes
+          }
+          Write-Host "已发布: $tag → $($zip.Name)"

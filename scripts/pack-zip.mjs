@@ -26,8 +26,11 @@ if (!fs.existsSync(path.join(DIST, exeName))) {
   process.exit(1);
 }
 
+// 版本号优先取 DHT_PACK_VERSION（CI 发版工作流由 tag 注入，保证 zip 名与 Release 版本一致），
+// 本地直接运行则回退到 package.json 的 version
 const { version } = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-const zipName = `DHT-Search-v${version}.zip`;
+const effectiveVersion = process.env.DHT_PACK_VERSION ?? version;
+const zipName = `DHT-Search-v${effectiveVersion}.zip`;
 fs.mkdirSync(RELEASE, { recursive: true });
 const outPath = path.join(RELEASE, zipName);
 if (fs.existsSync(outPath)) fs.rmSync(outPath);

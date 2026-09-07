@@ -24,3 +24,12 @@ data/*
 src/data/*
 test/data/*
 release/
+
+# 多包管理器共存：权威锁文件是 package-lock.json，
+# bun / pnpm 在本机安装时会重新生成各自的锁文件，忽略以免误提交
+bun.lock
+pnpm-lock.yaml
+pnpm-workspace.yaml
+
+# 个人本机脚本
+update.bat
