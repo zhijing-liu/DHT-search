@@ -13,6 +13,56 @@
 import { log } from './logger.js';
 
 /**
+ * 拒绝页（整页内联，无外部资源）：白名单挡下时给用户可读的页面，而非裸 403 文本。
+ * @param {string} rawIp 客户端地址（仅作文本展示，已做 HTML 转义）
+ */
+function deniedPage(rawIp) {
+  const ip = String(rawIp ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>403 · 访问被拒绝</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0d1117; color: #e6edf3;
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    padding: 24px;
+  }
+  .card {
+    max-width: 520px; width: 100%; padding: 32px 28px; border-radius: 14px;
+    background: #161b22; border: 1px solid #30363d;
+  }
+  .code { color: #ff7b72; font-weight: 700; font-size: 22px; letter-spacing: 1px; }
+  h1 { font-size: 19px; margin: 10px 0 8px; }
+  p { color: #8b949e; }
+  .ip {
+    display: inline-block; margin: 14px 0 2px; padding: 4px 10px; border-radius: 8px;
+    background: #21262d; color: #c9d1d9; font-family: Consolas, "Courier New", monospace;
+    word-break: break-all;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="code">403</div>
+    <h1>访问被拒绝</h1>
+    <p>当前服务启用了 IP 白名单访问控制，您的地址不在允许列表内。</p>
+    <div class="ip">${ip || '未知地址'}</div>
+    <p style="margin-top:10px">如需访问，请联系管理员将该地址加入
+      <code>ALLOWED_CLIENTS</code> 后重试。</p>
+  </div>
+</body>
+</html>`;
+}
+
+/**
  * 归一化地址：小写、去空格；剥离 IPv4 映射 IPv6 前缀（::ffff:a.b.c.d -> a.b.c.d）；
  * 去掉 IPv6 字面量中可能携带的方括号与端口（[2001:db8::1]:3000 -> 2001:db8::1）。
  */
@@ -138,8 +188,9 @@ export function createAccessControl({ mode = 'off', allowed = [] } = {}) {
 
     // 开启但规则为空（典型为配置错误）：fail-closed，拒绝全部
     if (rules.length === 0) {
-      log.warn(`[ACCESS] 拒绝 ${req.ip || '(未知)'} ${req.method} ${req.originalUrl}（白名单为空）`);
-      return res.status(403).type('text/plain; charset=utf-8').send('403 Forbidden');
+      const ip0 = req.ip || req.socket?.remoteAddress || '';
+      log.warn(`[ACCESS] 拒绝 ${ip0 || '(未知)'} ${req.method} ${req.originalUrl}（白名单为空）`);
+      return res.status(403).type('text/html; charset=utf-8').send(deniedPage(ip0));
     }
 
     const rawIp = req.ip || req.socket?.remoteAddress || '';
@@ -148,7 +199,7 @@ export function createAccessControl({ mode = 'off', allowed = [] } = {}) {
     if (hit) return next();
 
     log.warn(`[ACCESS] 拒绝 ${rawIp || '(未知)'} ${req.method} ${req.originalUrl}`);
-    res.status(403).type('text/plain; charset=utf-8').send('403 Forbidden');
+    res.status(403).type('text/html; charset=utf-8').send(deniedPage(rawIp));
   };
 }
 
