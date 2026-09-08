@@ -1,6 +1,6 @@
 {
   "name": "DHT-search",
-  "version": "v1.2.0",
+  "version": "v1.3.0",
   "description": "A self-hosted magnet link search engine built on SQLite FTS5. Dual Node/Bun runtime, background incremental indexing, on-demand search child processes, and one-command single-file exe packaging.",
   "main": "index.js",
   "scripts": {
