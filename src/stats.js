@@ -87,12 +87,4 @@ export function endSync(added, intervalMs) {
   }
 }
 
-/**
- * 初始化同步节拍：启动时 createMagnetDb() 内部已同步过一次，据此推算下次同步时刻。
- * @param {number} [intervalMs] 同步周期；配 0（关闭自动同步）时 nextAt 为 null
- */
-export function initSyncClock(intervalMs) {
-  const now = Date.now();
-  runtimeStats.sync.lastAt = now;
-  runtimeStats.sync.nextAt = Number.isFinite(intervalMs) && intervalMs > 0 ? now + intervalMs : null;
-}
+

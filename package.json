@@ -1,12 +1,12 @@
 {
   "name": "DHT-search",
-  "version": "1.0.0",
+  "version": "v1.1.0",
   "description": "A self-hosted magnet link search engine built on SQLite FTS5. Dual Node/Bun runtime, background incremental indexing, on-demand search child processes, and one-command single-file exe packaging.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev:node": "nodemon index.js",
-    "dev:bun": "bun --watch index.js",
+    "start": "node scripts/win-codepage.cjs && node index.js",
+    "dev:node": "node scripts/win-codepage.cjs && nodemon index.js",
+    "dev:bun": "node scripts/win-codepage.cjs && bun --watch index.js",
     "dev:web": "npm --prefix web run dev",
     "build:web": "npm --prefix web run build",
     "build:exe": "npm run build:web & bun scripts/build-exe.mjs",
@@ -53,6 +53,7 @@
     "drizzle-orm": "^0.45.2",
     "express": "^5.2.1",
     "lru-cache": "^11.5.2",
+    "node-cron": "^3.0.3",
     "tailwindcss": "^4.3.3",
     "vite": "^8.2.2"
   },

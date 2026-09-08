@@ -814,8 +814,7 @@ export function createMagnetDb(options = {}) {
   setPragma(rdb, 'temp_store', 'MEMORY');
   const dbRO = createDrizzle(rdb);
 
-  // reindex worker 的堆上限与超时；超时传 0 表示不限时
-  const REINDEX_TIMEOUT_MS = clampInt(CONFIG.reindexTimeoutMs, 0, 0, Number.MAX_SAFE_INTEGER);
+  // reindex worker 的堆上限仅 Node 路径生效（见 spawnIndexWorker 的 resourceLimits）；Bun 走子进程，堆由操作系统兜底
 
   let reindexWorker = null;
   let indexingPromise = null;
@@ -837,22 +836,14 @@ export function createMagnetDb(options = {}) {
       reindexWorker = worker;
 
       let settled = false;
-      let timer = null;
       const settle = (ok, value) => {
         if (settled) return;
         settled = true;
-        if (timer) clearTimeout(timer);
         reindexWorker = null;
         if (!ok) worker.terminate(); // 终态即终止，监听器随之回收
         (ok ? resolve : reject)(value);
       };
 
-      if (REINDEX_TIMEOUT_MS > 0) {
-        timer = setTimeout(
-          () => settle(false, new Error(`索引维护超时（${REINDEX_TIMEOUT_MS}ms）`)),
-          REINDEX_TIMEOUT_MS
-        );
-      }
       // progress 多次 → 用 on 持续监听
       worker.on('message', (msg) => {
         if (msg?.type === 'progress') {
@@ -904,11 +895,9 @@ export function createMagnetDb(options = {}) {
       reindexWorker = child;
 
       let settled = false;
-      let timer = null;
       const settle = (ok, value) => {
         if (settled) return;
         settled = true;
-        if (timer) clearTimeout(timer);
         reindexWorker = null;
         if (!ok) {
           // 终态即终止：SIGKILL 由操作系统回收，正在执行的同步 SQLite 语句也随之中断
@@ -917,12 +906,6 @@ export function createMagnetDb(options = {}) {
         (ok ? resolve : reject)(value);
       };
 
-      if (REINDEX_TIMEOUT_MS > 0) {
-        timer = setTimeout(
-          () => settle(false, new Error(`索引维护超时（${REINDEX_TIMEOUT_MS}ms）`)),
-          REINDEX_TIMEOUT_MS
-        );
-      }
       // progress 多次 → 用 on 持续监听
       child.on('message', (msg) => {
         if (msg?.type === 'progress') {
@@ -1070,7 +1053,7 @@ export function createMagnetDb(options = {}) {
    */
   function runIndex(mode, onProgress) {
     // 单实例互斥：已有维护在跑则复用。incremental 请求统一归一化为 { skipped, added }
-    // （被 full 重建占用时视为跳过，避免 syncTimer / 手动同步拿到 rebuild 返回的数字）。
+    // （被 full 重建占用时视为跳过，避免手动增量同步拿到 rebuild 返回的数字）。
     if (indexingPromise) {
       if (mode === 'incremental') {
         return indexingPromise

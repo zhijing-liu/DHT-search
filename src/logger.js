@@ -8,6 +8,16 @@
  * 即可让 [SYSTEM] / [USER] / [cache] 这些标签列自然对齐。
  */
 import chalk from 'chalk';
+import { execSync } from 'node:child_process';
+
+// Windows 控制台默认代码页为 GBK(CP936)，会把 Node 以 UTF-8 写出的中文当成 GBK
+// 解码，导致日志里的中文乱码（如「鏀跺埌」）。首次加载即切到 UTF-8(CP65001)，
+// 让控制台按 UTF-8 解码 stdout 字节。非 Windows 或切换失败（服务/无控制台态）忽略。
+if (process.platform === 'win32') {
+  try {
+    execSync('chcp 65001 > nul', { stdio: 'ignore' });
+  } catch { /* 无控制台时忽略 */ }
+}
 
 const TAG = {
   SYSTEM: chalk.cyan('[SYSTEM]'),

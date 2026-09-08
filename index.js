@@ -19,11 +19,12 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
+import cron from 'node-cron';
 import { createMagnetDb, normalizeSearchQuery, normalizeKeyword } from './src/db.js';
 import { createSearchExecutor } from './src/searchPool.js';
 import { createAccessControl } from './src/accessControl.js';
 import { isCompiledExe } from './src/db-driver.js';
-import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY } from './src/settings.js';
+import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY, REINDEX_CRON } from './src/settings.js';
 import { CONFIG } from './src/store.js';
 import { LRUCache } from 'lru-cache';
 import { log } from './src/logger.js';
@@ -36,7 +37,6 @@ import {
   endReindex,
   beginSync,
   endSync,
-  initSyncClock,
 } from './src/stats.js';
 
 // 编译产物（bun --compile）内 import.meta.url 指向虚拟文件系统，静态资源目录
@@ -282,8 +282,8 @@ app.post('/api/reindex', apiHandler(async (_req, res) => {
   } finally {
     endReindex();
   }
-  // 重建完成，索引基数已变，让自动同步节拍从此时顺延一个周期
-  endSync(0, SYNC_INTERVAL_MS);
+  // 重建完成，索引基数已变（手动重建不再驱动自动同步节拍，节奏由 REINDEX_CRON 接管）
+  endSync(0);
   // 索引内容已变更，清空搜索缓存避免返回旧结果
   searchCache.clear();
   // 行数已彻底变化，刷新内存中的总数（重建完成、最终值已落库）
@@ -303,8 +303,8 @@ app.post('/api/sync', apiHandler(async (_req, res) => {
     skipped = r.skipped;
     added = r.added;
   } finally {
-    // 传周期，让自动同步节拍从本次手动同步顺延一个周期（否则 nextAt 不变）
-    endSync(added, SYNC_INTERVAL_MS);
+    // 更新同步状态（自动同步已取消，nextAt 不再被维护）
+    endSync(added);
   }
   // 确实补录了新行才清缓存；无新增时不必让已有缓存白白失效
   if (added > 0) {
@@ -461,15 +461,7 @@ const server = app.listen(PORT, () => {
   log.banner(PORT, CONFIG.maxResults);
 });
 
-// 运行期自动增量同步：默认每小时按 last_rowid 补录一次源库新增行
-// （config.js 的 SYNC_INTERVAL_MS 配 0 可关闭）；重建期间 syncIncremental 自动跳过本轮
-const SYNC_INTERVAL_MS = (() => {
-  const v = Number(CONFIG.syncIntervalMs);
-  return Number.isFinite(v) && v > 0 ? v : 3600000;
-})();
-// 启动时 createMagnetDb({ sync:false }) 不再阻塞主线程，同步节拍照常建立
-initSyncClock(SYNC_INTERVAL_MS);
-// 启动同步丢进 worker 后台增量补录，不阻塞主线程、页面立即可响应；
+// 启动同步：丢进后台增量补录，不阻塞主线程、页面立即可响应；
 // 期间标记 initializing，完成后刷新总数缓存。
 runtimeStats.initializing = true;
 api.syncIncremental()
@@ -479,31 +471,34 @@ api.syncIncremental()
     runtimeStats.initializing = false;
     syncIndexedCount(); // 无论成败都刷新总数，反映当前索引状态
   });
-const syncTimer = setInterval(async () => {
-  let added = 0;
-  beginSync();
-  try {
-    // syncIncremental 是同步函数，这里统一 await + try/catch：既兼容同步返回值，
-    // 也能拦住同步抛错，避免回调内未捕获异常直接终止进程
-    const r = await api.syncIncremental();
-    added = r.added;
-    // 只有真的补录了新行才清缓存——否则每小时白白冲掉全部搜索结果
-    if (added > 0) {
-      searchCache.clear();
-      // 行数增加，刷新内存中的总数
-      syncIndexedCount();
-      log.ok(`增量同步完成，补录 ${added} 行，已清空搜索缓存`);
-    } else if (!r.skipped) {
-      log.system('增量同步完成，无新增行');
+
+// 定时全量重建（唯一周期索引维护）：REINDEX_CRON 默认关闭，启用后在后台执行一次全量重建，
+// 主进程零阻塞，期间页面与检索仍可用；取代旧的每小时自动增量同步。
+let reindexTask = null;
+if (REINDEX_CRON && cron.validate(REINDEX_CRON)) {
+  reindexTask = cron.schedule(REINDEX_CRON, () => {
+    if (runtimeStats.reindex.running) {
+      log.warn('定时全量重建跳过：上一次重建仍在进行中');
+      return;
     }
-  } catch (err) {
-    log.error(`增量同步失败: ${err?.message || err}`);
-  } finally {
-    // 无论成败都推进同步节拍，面板倒计时才不会卡死
-    endSync(added, SYNC_INTERVAL_MS);
-  }
-}, SYNC_INTERVAL_MS);
-if (typeof syncTimer.unref === 'function') syncTimer.unref();
+    log.user(`定时全量重建触发（cron: ${REINDEX_CRON}）`);
+    beginReindex();
+    api.reindex(({ done, total }) => {
+      setReindexProgress(done, total);
+      log.progress(`重建进度 ${done}/${total}`);
+    })
+      .then((indexed) => {
+        searchCache.clear();
+        syncIndexedCount();
+        log.ok(`定时重建完成，累计 ${indexed} 条，已清空搜索缓存`);
+      })
+      .catch((e) => log.error(`定时重建失败: ${e?.message || e}`))
+      .finally(() => endReindex());
+  });
+  log.system(`已注册定时全量重建任务（cron: ${REINDEX_CRON}）`);
+} else if (REINDEX_CRON) {
+  log.warn(`REINDEX_CRON 表达式无效，已忽略: ${REINDEX_CRON}`);
+}
 
 // 重建索引（reindex）可能耗时较长且同步执行，关闭服务端超时避免请求被中断
 server.timeout = 0;
@@ -520,7 +515,7 @@ server.on('error', (err) => {
 function shutdown(signal) {
   log.shutdown(`收到 ${signal}，正在关闭服务并释放资源...`);
   clearInterval(searchCacheSweep);
-  clearInterval(syncTimer);
+  reindexTask?.stop();
   searchCache.clear();
   searchExecutor.terminateAll();
   api.close();

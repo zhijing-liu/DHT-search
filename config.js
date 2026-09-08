@@ -44,8 +44,13 @@ export const MAX_RESULTS = 2000;
 /** reindex 全量重建的 V8 老生代堆上限（MB），仅 Node worker 线程生效；Bun 走子进程执行，堆由操作系统兜底 */
 export const REINDEX_MAX_OLD_SPACE_MB = 2048;
 
-/** reindex 超时（毫秒），0 表示不限时；超时后 worker 会被终止，主进程不受影响 */
-export const REINDEX_TIMEOUT_MS = 0;
+/**
+ * 定时全量重建的 cron 表达式（标准 5 字段：分 时 日 月 周，如 '0 4 * * *' = 每天 04:00）。
+ * 空字符串（默认）表示关闭：不启用定时重建，仅依赖「启动首次建库 + 手动 /api/sync、/api/reindex」。
+ * 启用后，cron 是唯一的周期索引维护（取代旧的每小时自动增量同步）：到点在后台执行一次全量重建，
+ * 主进程零阻塞，期间页面与检索仍可用。
+ */
+export const REINDEX_CRON = '';
 
 /**
  * 搜索结果内存缓存上限（MB）。
@@ -56,9 +61,6 @@ export const SEARCH_CACHE_MAX_SIZE_MB = 32;
 
 /** 单条搜索缓存的存活时间（毫秒）—— 1 小时 */
 export const SEARCH_CACHE_TTL_MS = 60 * 60 * 1000;
-
-/** 运行期自动增量同步间隔（毫秒）—— 1 小时；配 0 可关闭（关闭后仅启动时同步一次） */
-export const SYNC_INTERVAL_MS = 60 * 60 * 1000;
 
 /**
  * 最大并发搜索进程数。
