@@ -24,7 +24,7 @@ import { createMagnetDb, normalizeSearchQuery, normalizeKeyword } from './src/db
 import { createSearchExecutor } from './src/searchPool.js';
 import { createAccessControl } from './src/accessControl.js';
 import { isCompiledExe } from './src/db-driver.js';
-import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY, REINDEX_CRON } from './src/settings.js';
+import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY, SYNC_CRON } from './src/settings.js';
 import { CONFIG } from './src/store.js';
 import { LRUCache } from 'lru-cache';
 import { log } from './src/logger.js';
@@ -282,7 +282,7 @@ app.post('/api/reindex', apiHandler(async (_req, res) => {
   } finally {
     endReindex();
   }
-  // 重建完成，索引基数已变（手动重建不再驱动自动同步节拍，节奏由 REINDEX_CRON 接管）
+  // 重建完成，索引基数已变（手动重建不再驱动自动同步节拍，节奏由 SYNC_CRON 接管）
   endSync(0);
   // 索引内容已变更，清空搜索缓存避免返回旧结果
   searchCache.clear();
@@ -472,32 +472,40 @@ api.syncIncremental()
     syncIndexedCount(); // 无论成败都刷新总数，反映当前索引状态
   });
 
-// 定时全量重建（唯一周期索引维护）：REINDEX_CRON 默认关闭，启用后在后台执行一次全量重建，
-// 主进程零阻塞，期间页面与检索仍可用；取代旧的每小时自动增量同步。
-let reindexTask = null;
-if (REINDEX_CRON && cron.validate(REINDEX_CRON)) {
-  reindexTask = cron.schedule(REINDEX_CRON, () => {
-    if (runtimeStats.reindex.running) {
-      log.warn('定时全量重建跳过：上一次重建仍在进行中');
+// 定时增量同步（唯一周期索引维护）：SYNC_CRON 默认每天 03:00，到点在后台执行一次
+// 增量补录（按 last_rowid 只灌源库新增行，秒级、几乎无写放大），主进程零阻塞。
+// 全量重建不再定时执行，只保留给启动建库（tokenizer 变更/索引为空）与手动 /api/reindex。
+let syncTask = null;
+if (SYNC_CRON && cron.validate(SYNC_CRON)) {
+  syncTask = cron.schedule(SYNC_CRON, async () => {
+    log.user(`定时增量同步触发（cron: ${SYNC_CRON}）`);
+    let skipped = false;
+    let added = 0;
+    beginSync();
+    try {
+      const r = await api.syncIncremental();
+      skipped = r.skipped;
+      added = r.added;
+    } catch (e) {
+      log.error(`定时增量同步失败: ${e?.message || e}`);
       return;
+    } finally {
+      endSync(added);
     }
-    log.user(`定时全量重建触发（cron: ${REINDEX_CRON}）`);
-    beginReindex();
-    api.reindex(({ done, total }) => {
-      setReindexProgress(done, total);
-      log.progress(`重建进度 ${done}/${total}`);
-    })
-      .then((indexed) => {
-        searchCache.clear();
-        syncIndexedCount();
-        log.ok(`定时重建完成，累计 ${indexed} 条，已清空搜索缓存`);
-      })
-      .catch((e) => log.error(`定时重建失败: ${e?.message || e}`))
-      .finally(() => endReindex());
+    // 确实补录了新行才清缓存；无新增时不必让已有缓存白白失效
+    if (added > 0) {
+      searchCache.clear();
+      syncIndexedCount();
+    }
+    if (skipped) {
+      log.warn('定时增量同步跳过（全量重建进行中）');
+    } else {
+      log.ok(`定时增量同步完成，补录 ${added} 行${added > 0 ? '，已清空搜索缓存' : ''}`);
+    }
   });
-  log.system(`已注册定时全量重建任务（cron: ${REINDEX_CRON}）`);
-} else if (REINDEX_CRON) {
-  log.warn(`REINDEX_CRON 表达式无效，已忽略: ${REINDEX_CRON}`);
+  log.system(`已注册定时增量同步任务（cron: ${SYNC_CRON}）`);
+} else if (SYNC_CRON) {
+  log.warn(`SYNC_CRON 表达式无效，已忽略: ${SYNC_CRON}`);
 }
 
 // 重建索引（reindex）可能耗时较长且同步执行，关闭服务端超时避免请求被中断
@@ -515,7 +523,7 @@ server.on('error', (err) => {
 function shutdown(signal) {
   log.shutdown(`收到 ${signal}，正在关闭服务并释放资源...`);
   clearInterval(searchCacheSweep);
-  reindexTask?.stop();
+  syncTask?.stop();
   searchCache.clear();
   searchExecutor.terminateAll();
   api.close();

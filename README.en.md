@@ -41,8 +41,8 @@ The index DB contains 4 kinds of objects:
 - `keyword_stats` / `keyword_filter`: hot-keyword stats and noise-word filter tables
 
 ### Sync Strategy
-- On startup, **incremental catch-up** by `last_rowid` (background only, never blocking service start or requests); there is no longer an "hourly auto incremental sync" at runtime — periodic maintenance is handled by a **scheduled full rebuild** (see `REINDEX_CRON`);
-- UPDATE / DELETE of existing rows in the source DB are not reflected automatically; trigger `POST /api/reindex` or wait for the next scheduled rebuild (the rebuild JOIN drops stale rows deleted from the source). Structural changes such as tokenizer changes are also handled by the full rebuild.
+- On startup, **incremental catch-up** by `last_rowid` (background only, never blocking service start or requests); there is no longer an "hourly auto incremental sync" at runtime — periodic maintenance is handled by a **scheduled incremental sync** (see `SYNC_CRON`; full rebuild is manual only);
+- UPDATE / DELETE of existing rows in the source DB are not reflected automatically; trigger a manual `POST /api/reindex` full rebuild (the rebuild JOIN drops stale rows deleted from the source). Structural changes such as tokenizer changes are also handled by that manual full rebuild.
 
 ### Dual Runtime (Node / Bun)
 `src/db-driver.js` picks the driver at runtime via `typeof Bun`; business code doesn't care:
@@ -146,7 +146,7 @@ DHT-search/
 - **Keyword blacklist**: user-maintained noise-word list (seed script / API / Web UI import-export), excluded from ranking and stats.
 - **Input suggestions**: tiered matching against hot keywords (exact > prefix > contains > fuzzy Levenshtein).
 - **Search cache**: in-process LRU storing serialized JSON strings (zero stringify on hit), byte-capped and TTL-expiring (default 32MB / 1h). Whole-set fetches (`limit=all`) bypass the cache.
-- **Online rebuild & scheduled maintenance**: full rebuild runs in a dedicated worker thread (Node) or child process (Bun) — **zero main-process blocking; pages and search stay available**; startup sync runs in the background and the service is up in seconds; runtime periodic maintenance is handled by the `REINDEX_CRON` scheduled full rebuild.
+- **Online rebuild & scheduled maintenance**: full rebuild runs in a dedicated worker thread (Node) or child process (Bun) — **zero main-process blocking; pages and search stay available**; startup sync runs in the background and the service is up in seconds; runtime periodic maintenance is handled by the `SYNC_CRON` scheduled incremental sync (full rebuild is manual only).
 - **Runtime status**: the settings panel receives a snapshot every 3s via SSE (`/api/stats/stream`): cache hit, heap, search-process count, indexed count, next-sync countdown, rebuild/sync progress.
 - **Access control**: edge IP / CIDR whitelist covering everything (pages + APIs + writes), proxy-aware.
 - **RPC push**: the "push" button on result cards sends magnet links via JSON-RPC 2.0 (`aria2.addUri`) to aria2 / Motrix; address & secret configured in Settings, secret sent as `token:` prefix per aria2 convention.
@@ -172,7 +172,7 @@ Every item ships with a default and comments in `config.js`; edit the correspond
 | `SEARCH_PROCESS_IDLE_MS` | `60000` | Idle reclaim delay (ms); `0` disables. **Only effective when `SEARCH_PROCESS_RECYCLE_IMMEDIATE = false`** |
 | `SEARCH_QUEUE_MAX` | `16` | Search wait-queue cap; excess queries fail fast when all processes are busy |
 | `SEARCH_QUEUE_TIMEOUT_MS` | `10000` | Queue timeout (ms); fail fast on expiry; `0` = unlimited |
-| `REINDEX_CRON` | `''` | Cron expression for scheduled full rebuild (5-field, e.g. `'0 4 * * *'` = daily 04:00); empty (default) disables it. When set, the cron becomes the sole periodic maintenance (replacing the old hourly auto-sync) |
+| `SYNC_CRON` | `''` | Cron expression for scheduled incremental sync (5-field, e.g. `'0 4 * * *'` = daily 04:00); disabled by default. When enabled it only appends new rows since `last_rowid` (seconds, no full rebuild) |
 | `ACCESS_CONTROL_MODE` | `'ip-whitelist'` | Access-control mode: `'ip-whitelist'` allows only `ALLOWED_CLIENTS`, others get 403; `'off'` disables (for localhost / proxy-auth setups). **On by default** |
 | `ALLOWED_CLIENTS` | see below | Client address list (only in `ip-whitelist` mode): exact IPv4/IPv6 and CIDR (e.g. `192.168.0.0/16`, `2001:db8::/32`). Defaults include `127.0.0.1`, `::1`, and private/link-local ranges `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10` |
 | `TRUST_PROXY` | `false` | Trust the reverse proxy's `X-Forwarded-For` for the real client IP: `false` (default) uses the TCP peer (direct connection); behind nginx set `true` / `'loopback'` / a subnet, otherwise the whitelist misjudges |
@@ -362,7 +362,7 @@ npm run smoke            # alias of test
 
 - **Startup**: the service listens first; index sync runs in the background (log: `[index] indexed N rows`); responsive immediately, no need to wait.
 - **Manual rebuild**: Web "Settings → Rebuild Index", or `POST /api/reindex`. Runs in a dedicated worker thread (Node) / child process (Bun); **pages and search stay available** (results may be temporarily incomplete during rebuild — inherent to online rebuilds). Manual sync via `POST /api/sync`.
-- **Incremental sync**: a one-time `last_rowid` catch-up runs on startup; there is no auto-sync at runtime. Periodic maintenance is the `REINDEX_CRON` scheduled full rebuild (disabled by default) which rebuilds once when its time comes.
+- **Scheduled incremental sync**: a `last_rowid` catch-up runs on startup; at runtime the `SYNC_CRON` job (disabled by default) appends new source rows in seconds. Full rebuild is manual only (`POST /api/reindex`).
 - **Performance tuning**: SQLite PRAGMAs (WAL, cache_size, mmap_size, temp_store etc.) are preset per scenario in `db.js`; usually no changes needed. For very large indexes, switch `optimizeFts()` back to step-wise merges to lower the optimize memory peak.
 
 ## 12. RPC Push (aria2 / Motrix)
@@ -452,7 +452,7 @@ Open `config.js` with **Notepad**, save, and **restart** (close the black window
 | Database elsewhere | `SOURCE_DB_PATH` | `export const SOURCE_DB_PATH = 'D:/mydb/magnet.db';` (use `/` not `\`) |
 | Allow more/fewer devices | `ALLOWED_CLIENTS` | add a line like `'192.168.1.100',` in the brackets |
 | Temporarily disable the IP whitelist | `ACCESS_CONTROL_MODE` | set to `'off'` (**never on public internet**) |
-| Scheduled rebuild time | `REINDEX_CRON` | cron expression (e.g. `'0 4 * * *'` for daily 04:00); empty `''` disables scheduled rebuild (startup sync + manual only) |
+| Scheduled incremental sync time | `SYNC_CRON` | cron expression (e.g. `'0 3 * * *'` for daily 03:00); disabled by default; empty `''` disables |
 
 Notes:
 
@@ -462,7 +462,7 @@ Notes:
 
 ### 13.7 Daily use & maintenance
 
-- **New data in the database**: a one-time catch-up runs on startup; for periodic auto-refresh configure `REINDEX_CRON` (e.g. `'0 4 * * *'`) for a daily off-peak full rebuild, or click "Sync" in the Settings panel to catch up now;
+- **New data in the database**: a catch-up runs on startup; at runtime you can configure `SYNC_CRON` (e.g. daily 03:00) to periodically append new rows, or click "Sync" in the Settings panel to catch up now. For UPDATE/DELETE on existing source rows, click "Rebuild Index" for a full refresh;
 - **Odd results / want a clean slate**: click "Rebuild Index" in Settings (usage unaffected during rebuild);
 - **Backup**: copy the whole folder. `data\dht.search.db` is a cache-like index and can be skipped; `magnet.db` is the raw data — **keep it**;
 - **Upgrade**: overwrite the exe with the new one; `data` and other files stay;

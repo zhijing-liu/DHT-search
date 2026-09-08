@@ -71,7 +71,7 @@ import {
   MAX_LIMIT,
   SORT_COLUMNS,
 } from './store.js';
-import { MAX_RESULTS } from './settings.js';
+import { MAX_RESULTS, SOURCE_READ_MMAP_MB } from './settings.js';
 
 /**
  * 排序 SQL 白名单。ORDER BY 的列名与方向无法参数化，故写死为常量按需取用，
@@ -240,8 +240,13 @@ function openSourceRO(sourcePath) {
   const src = openDatabase(sourcePath, { readonly: true });
   // 双重保险：连接层只读 + 引擎级禁止任何写入语句
   setPragma(src, 'query_only', 'ON');
-  // 全表顺序扫描不需要 mmap：扫过的页会全部计入 RSS，2GB 库下白白吃掉几百 MB
-  setPragma(src, 'mmap_size', 0);
+  // mmap（默认开启，config.js 的 SOURCE_READ_MMAP_MB 可调，0=关闭）：
+  // 顺序扫整表时，逐页 4KB 同步读让磁盘队列深度只有 1，SSD/NVMe 顺序带宽用不上；
+  // 开启后由内核大块预取，吞吐接近顺序读。代价是扫过的 mmap 页计入页缓存/工作集
+  //（可回收页），值越大预取窗口越大。
+  const mmapMb = Number(SOURCE_READ_MMAP_MB);
+  const mmapBytes = Number.isFinite(mmapMb) && mmapMb > 0 ? Math.floor(mmapMb) * 1024 * 1024 : 0;
+  setPragma(src, 'mmap_size', mmapBytes);
   setPragma(src, 'cache_size', -16000);
   return src;
 }
@@ -300,19 +305,32 @@ function ensureSchema(db) {
 
 const DOCS_COLUMNS = 'id, name, infohash, magnet, files, totalSize, fetchedAt';
 
-/** 每批写入事务的行数上限；分批改写以限制全量重建时的内存峰值 */
-const REBUILD_BATCH = 2000;
+/** 每批写入事务的行数上限；分批改写以限制全量重建时的内存峰值。
+ * 2000 → 5 万：源库行均 ~3.7KB，5 万行≈185MB 仍低于字节阈值，故批次基本由行数封顶。
+ * 「少而大」的事务把 COMMIT / WAL 自动 checkpoint / 进度消息的次数降一个量级
+ * （1.89M 行重建从 943 批降到约 38 批），磁盘顺序性更好。 */
+const REBUILD_BATCH = 50000;
 /**
  * 每批写入事务的字节上限（按 name + files 的字符数估算）。
  * 只按行数分批时，多文件种子的 files JSON 可达几十 KB，单批仍可能撑到几百 MB，
- * 故行数与字节数两个阈值先到先生效。
+ * 故行数与字节数两个阈值先到先生效（超大行场景由字节阈值兜底拆批，单行超大时
+ * 该行单独成批）。
  * 注：对中文字符（V8 内部按 2 字节存储）会低估约一倍，属于偏安全的方向。
  */
-const REBUILD_BATCH_BYTES = 16 * 1024 * 1024;
+const REBUILD_BATCH_BYTES = 256 * 1024 * 1024;
 /** reindex worker 入口（与 db.js 同目录）；worker 线程与子进程两种模式共用 */
 const REINDEX_WORKER_URL = new URL('./reindex-worker.js', import.meta.url);
 /** fork 的 modulePath 需要字符串路径而非 URL，预先换算一次 */
 const REINDEX_WORKER_PATH = fileURLToPath(REINDEX_WORKER_URL);
+
+/**
+ * 重建/同步过程追踪（临时调试用，排查重建卡住问题，定位后移除）：
+ * 设置环境变量 DHT_REINDEX_DEBUG=1 启用；fork 子进程会继承父进程 env，故两边都会输出。
+ */
+const TRACE_INDEXING = process.env.DHT_REINDEX_DEBUG === '1';
+const traceIndexing = (...args) => {
+  if (TRACE_INDEXING) console.log('[reindex]', ...args);
+};
 
 /**
  * 按 id 升序分段扫描源表，逐行 yield（流式，不物化整表）。
@@ -334,11 +352,13 @@ const REINDEX_WORKER_PATH = fileURLToPath(REINDEX_WORKER_URL);
 function* scanById(src, { from = 0, size = REBUILD_BATCH } = {}) {
   let cursor = from;
   for (;;) {
+    traceIndexing(`scanById 读源库: id>${cursor} limit=${size}`);
     const rows = allRows(
       src,
       `SELECT ${DOCS_COLUMNS} FROM ${TABLE} WHERE id > ? ORDER BY id LIMIT ?`,
       [cursor, size]
     );
+    traceIndexing(`scanById 读完成: rows=${rows.length}（id ${rows[0]?.id} ~ ${rows[rows.length - 1]?.id}）`);
     if (rows.length === 0) return;
     let last = cursor;
     for (const row of rows) {
@@ -396,7 +416,9 @@ function populate(db, rowsIterable, onFlush) {
 
   const flush = () => {
     if (!buf.length) return;
+    traceIndexing(`populate 写入批次开始: rows=${buf.length} kw=${kwMap.size}`);
     runBatch(buf, kwMap);
+    traceIndexing(`populate 写入批次完成: rows=${buf.length}`);
     onFlush?.({ rows: buf.length });
     buf = [];
     bytes = 0;
@@ -459,46 +481,69 @@ function checkpointWAL(db) {
  */
 function fullRebuild(db, src, onFlush) {
   const raw = db.$client ?? db.session?.client;
-  raw.transaction(() => {
-    buildFts(db);
-    db.run(sql`DROP TABLE IF EXISTS ${sql.raw(DOCS_TABLE)}`);
-    db.run(sql`CREATE TABLE ${sql.raw(DOCS_TABLE)} (
-      id INTEGER PRIMARY KEY,
-      name TEXT NOT NULL DEFAULT '',
-      infohash TEXT,
-      magnet TEXT,
-      files TEXT,
-      totalSize INTEGER NOT NULL DEFAULT 0,
-      fetchedAt INTEGER NOT NULL DEFAULT 0
-    )`);
-    // 热词统计表：全量重建时清空重建，随 populate 重新统计
-    db.run(sql`DROP TABLE IF EXISTS ${sql.raw(KEYWORD_TABLE)}`);
-    db.run(sql`CREATE TABLE ${sql.raw(KEYWORD_TABLE)} (
-      term TEXT PRIMARY KEY,
-      doc_count INTEGER NOT NULL DEFAULT 0,
-      occurrences INTEGER NOT NULL DEFAULT 0
-    )`);
-  })();
+  // 批量灌数据期的写盘策略（对全量重建安全，因为整份索引可整体重跑）：
+  //   - wal_autocheckpoint=0：灌数据期间禁用自动 checkpoint，所有新页先顺序追加到
+  //     WAL，末尾一次性 checkpoint 回主库——把「每批提交都随机回写主库」换成
+  //     「1 次大顺序回写」；代价是重建期 WAL 会涨到接近新数据体量（本机空间充足）。
+  //   - synchronous=OFF：跳过每提交一次的落盘等待；中途断电最多丢已提交事务、
+  //     不会损坏库，重跑即可。收尾先恢复 NORMAL 再 checkpoint，保证最终落盘 durable。
+  setPragma(raw, 'wal_autocheckpoint', 0);
+  setPragma(raw, 'synchronous', 'OFF');
+  try {
+    raw.transaction(() => {
+      buildFts(db);
+      db.run(sql`DROP TABLE IF EXISTS ${sql.raw(DOCS_TABLE)}`);
+      db.run(sql`CREATE TABLE ${sql.raw(DOCS_TABLE)} (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
+        infohash TEXT,
+        magnet TEXT,
+        files TEXT,
+        totalSize INTEGER NOT NULL DEFAULT 0,
+        fetchedAt INTEGER NOT NULL DEFAULT 0
+      )`);
+      // 热词统计表：全量重建时清空重建，随 populate 重新统计
+      db.run(sql`DROP TABLE IF EXISTS ${sql.raw(KEYWORD_TABLE)}`);
+      db.run(sql`CREATE TABLE ${sql.raw(KEYWORD_TABLE)} (
+        term TEXT PRIMARY KEY,
+        doc_count INTEGER NOT NULL DEFAULT 0,
+        occurrences INTEGER NOT NULL DEFAULT 0
+      )`);
+    })();
 
-  // 从 min(id) - 1 起扫：改前的全表扫描不带 WHERE，会包含所有行；
-  // 换成 keyset 后若从 0 起（id > 0）会静默漏掉 id <= 0 的行。
-  // id 是 rowid 时 min(id) 是一次 O(1) 查找，代价可忽略。
-  const minId = getRow(src, `SELECT min(id) AS m FROM ${TABLE}`)?.m;
-  populate(
-    db,
-    scanById(src, { from: minId == null ? 0 : Number(minId) - 1, size: REBUILD_BATCH }),
-    onFlush
-  );
+    // 从 min(id) - 1 起扫：改前的全表扫描不带 WHERE，会包含所有行；
+    // 换成 keyset 后若从 0 起（id > 0）会静默漏掉 id <= 0 的行。
+    // id 是 rowid 时 min(id) 是一次 O(1) 查找，代价可忽略。
+    const minId = getRow(src, `SELECT min(id) AS m FROM ${TABLE}`)?.m;
+    traceIndexing('fullRebuild: DDL 事务完成，开始灌数据 populate');
+    populate(
+      db,
+      scanById(src, { from: minId == null ? 0 : Number(minId) - 1, size: REBUILD_BATCH }),
+      onFlush
+    );
+    traceIndexing('fullRebuild: populate 完成，开始建二级索引');
 
-  // 二级索引放到灌数据之后建：空表建索引会让后续每条 INSERT 都维护两个 B-Tree，
-  // 写入慢 2~3 倍；先灌数据再建索引是批量排序构建，快得多。
-  db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_fetchedAt`)} ON ${sql.raw(DOCS_TABLE)}(fetchedAt)`);
-  db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`);
+    // 二级索引放到灌数据之后建：空表建索引会让后续每条 INSERT 都维护 B-Tree，
+    // 写入慢 2~3 倍；先灌数据再建索引是批量排序构建，快得多。
+    // 只建 totalSize 索引：fetchedAt 排序的唯一路径是「FTS JOIN 后 temp 排序」，
+    // 连接方向决定了该索引永不会被查询使用（反转驱动已实测 fetchedAt 反而更慢，
+    // 故只对 totalSize 开放），保留纯属白付构建/维护成本，已移除。
+    db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`);
+    traceIndexing('fullRebuild: 二级索引完成');
 
-  setMeta(db, 'tokenizer', TOKENIZER);
-  setMeta(db, 'last_rowid', String(maxSourceId(src)));
-  optimizeFts(db);
+    setMeta(db, 'tokenizer', TOKENIZER);
+    setMeta(db, 'last_rowid', String(maxSourceId(src)));
+    traceIndexing('fullRebuild: 开始 optimizeFts（可能耗时较长）');
+    optimizeFts(db);
+    traceIndexing('fullRebuild: optimizeFts 完成，开始 checkpointWAL');
+  } finally {
+    // 异常也要恢复持久化语义，避免后续运行时仍处于「不自动 checkpoint + 不落盘」状态
+    setPragma(raw, 'wal_autocheckpoint', 1000);
+    setPragma(raw, 'synchronous', 'NORMAL');
+  }
+  // 恢复后再做一次性 checkpoint，把重建期累积在 WAL 的页以 durable 方式写回主库并清空
   checkpointWAL(db);
+  traceIndexing('fullRebuild: 全部完成');
 }
 
 /**
@@ -827,14 +872,23 @@ export function createMagnetDb(options = {}) {
    */
   function spawnIndexWorker(mode, onProgress) {
     return new Promise((resolve, reject) => {
+      // Bun 1.4 实测可跑通 worker_threads，且 reindex-worker 的 postMessage 逐批实时回传
+      //（与 Node 一致）；但 resourceLimits 在 Bun 下不生效、stdout/stderr 选项语义与 Node
+      // 不同，故 Bun 只传 workerData，Node 保留 resourceLimits 兜底 OOM。不设 stdout/stderr
+      // → worker 直接继承父进程输出，避免「pipe 无人读 → 缓冲写满卡死 worker」的隐患。
       const worker = new Worker(REINDEX_WORKER_URL, {
         workerData: { sourcePath, indexPath, mode },
-        // 堆触顶时 worker 会以 ERR_WORKER_OUT_OF_MEMORY 退出，只杀 worker，主进程不受影响
-        resourceLimits: { maxOldGenerationSizeMb: clampInt(CONFIG.reindexMaxOldSpaceMb, 2048, 256, 65536) },
-        stdout: true,
-        stderr: true,
+        ...(isBun
+          ? {}
+          : {
+              // 堆触顶时 worker 会以 ERR_WORKER_OUT_OF_MEMORY 退出，只杀 worker，主进程不受影响
+              resourceLimits: {
+                maxOldGenerationSizeMb: clampInt(CONFIG.reindexMaxOldSpaceMb, 2048, 256, 65536),
+              },
+            }),
       });
       reindexWorker = worker;
+      if (mode === 'full') log.system(`索引 worker 线程已派生（mode=${mode}），等待进度消息`);
 
       let settled = false;
       const settle = (ok, value) => {
@@ -867,12 +921,10 @@ export function createMagnetDb(options = {}) {
   }
 
   /**
-   * 派生子进程执行索引维护（Bun 主路径专用）。
+   * 派生子进程执行索引维护（Bun 编译态 exe 专用 / DHT_INDEX_DRIVER=child 兜底）。
    *
-   * Bun 对 node:worker_threads 覆盖不全（resourceLimits 不生效、terminate() 无法
-   * 中断卡在原生调用里的同步语句），若退化为「同进程同步重建」会把事件循环整个
-   * 卡死——重建/同步期间页面与检索全部无响应。child_process 在 Bun 下可用
-   * （检索子进程池 searchPool.js 即基于 fork），故这里以独立子进程执行索引维护：
+   * 源码态 Bun 已改用 worker 线程（见 runIndex：worker 消息实时回传，fork IPC 会积压
+   * 到退出才冲刷）；编译态 exe 内 worker 打包行为未验证，仍走本子进程路径：
    *   - 主进程事件循环零阻塞，页面 / 检索全程可用；
    *   - 超时 / 异常直接 SIGKILL 子进程，由操作系统回收，主进程不受影响；
    *   - 参数经环境变量 DHT_REINDEX_JOB（JSON）传入，进度/结果经 IPC 回传，
@@ -894,6 +946,7 @@ export function createMagnetDb(options = {}) {
         ? spawn(process.execPath, [INDEX_WORKER_FLAG], { stdio, env })
         : fork(REINDEX_WORKER_PATH, [INDEX_WORKER_FLAG], { stdio, env });
       reindexWorker = child;
+      log.system(`索引子进程已派生 pid=${child.pid}（mode=${mode}），等待 IPC 回传`);
 
       let settled = false;
       const settle = (ok, value) => {
@@ -910,19 +963,27 @@ export function createMagnetDb(options = {}) {
       // progress 多次 → 用 on 持续监听
       child.on('message', (msg) => {
         if (msg?.type === 'progress') {
+          traceIndexing(`父进程收到子进程进度 pid=${child.pid} done=${msg.done}/${msg.total}`);
           onProgress?.(msg);
           return;
         }
         if (msg?.ok) {
+          traceIndexing(`父进程收到子进程成功终态 pid=${child.pid}`);
           // full 模式回执 indexed 数字；incremental 模式回执 { skipped, added }
           settle(true, mode === 'full' ? msg.indexed : msg.result);
         } else {
+          traceIndexing(`父进程收到子进程失败终态 pid=${child.pid} error=${msg?.error}`);
           settle(false, new Error(msg?.error || 'index failed'));
         }
       });
       // 终态事件 → 用 once，触发一次即自动移除，监听干净
-      child.once('error', (err) => settle(false, err));
+      child.once('error', (err) => {
+        log.error(`索引子进程 error 事件: ${err?.message || err}`);
+        settle(false, err);
+      });
       child.once('exit', (code) => {
+        traceIndexing(`子进程 exit 事件 pid=${child.pid} code=${code} settled=${settled}`);
+        if (!settled) log.error(`索引子进程已退出但终态消息未达父进程（code=${code}），Promise 将 reject`);
         if (!settled) settle(false, new Error(`索引子进程异常退出（code=${code}）`));
       });
     });
@@ -1016,18 +1077,26 @@ export function createMagnetDb(options = {}) {
   function rebuildSync(onProgress) {
     const s = openSourceRO(sourcePath);
     try {
-      // total 是常量：提前算一次即可。若放进 onFlush 回调，会随每个批次（REBUILD_BATCH
-      // 行）重复全表 count(*)，源库规模越大越慢，重建时间被放大约 N/REBUILD_BATCH 倍。
-      const total = Number(getRow(s, `SELECT count(*) AS c FROM ${TABLE}`)?.c ?? 0);
+      // total 只作进度参考：用 id 跨度估算（O(1)，只读首尾叶页），避免 count(*) 对
+      // 7GB 级源库做一整趟全表预扫。源库有删除空洞时 span 会略大于实际行数——
+      // 与增量补录 total 用 id 跨度的口径一致，进度最后差几个百分点不碍事。
+      traceIndexing('rebuildSync: 估算源库 total（min/max id）');
+      const ext = getRow(s, `SELECT min(id) AS lo, max(id) AS hi FROM ${TABLE}`);
+      const total = ext?.lo == null ? 0 : Number(ext.hi) - Number(ext.lo) + 1;
+      traceIndexing(`rebuildSync: total(span)=${total}`);
       let done = 0;
       fullRebuild(db, s, ({ rows }) => {
         done += rows;
         onProgress?.({ done, total });
       });
+      traceIndexing(`rebuildSync: 全量重建完成 done=${done}`);
     } finally {
       s.close();
     }
-    return Number(dbRO.all(sql`SELECT count(*) AS c FROM ${sql.raw(FTS_TABLE)}`)[0]?.c ?? 0);
+    traceIndexing('rebuildSync: 统计索引库 FTS 文档数');
+    const n = Number(dbRO.all(sql`SELECT count(*) AS c FROM ${sql.raw(FTS_TABLE)}`)[0]?.c ?? 0);
+    traceIndexing(`rebuildSync: 返回 indexed=${n}`);
+    return n;
   }
 
   /**
@@ -1078,19 +1147,17 @@ export function createMagnetDb(options = {}) {
       runtimeStats.indexing = { running: true, done: p.done, total: p.total, mode };
       onProgress?.(p);
     };
-    if (isBun) {
-      // Bun 对 worker_threads 覆盖不全（resourceLimits 不生效、terminate 无法中断
-      // 原生调用），同进程同步执行又会把事件循环整个卡死 → 派生独立子进程执行
-      //（见 spawnIndexChild），主进程零阻塞，页面 / 检索全程可用
-      begin();
-      indexingPromise = spawnIndexChild(mode, wrapped)
-        .then((r) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; return r; })
-        .catch((e) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; throw e; })
-        .finally(() => { indexingPromise = null; indexingMode = null; });
-      return indexingPromise;
-    }
+    // 执行载体选择：
+    //   - 默认走 worker 线程（Node 与 Bun 同路径）。实测 Bun 1.4 的 worker postMessage
+    //     逐批实时回传；而其 child_process fork IPC 会把消息积压到子进程退出才冲刷，
+    //     长耗时重建期间父进程收不到任何进度（表现为进度条卡在第一批）。
+    //   - Bun 编译态（bun build --compile）下 worker 打包行为未验证，且 exe 自拉起是
+    //     成熟路径，故仍走子进程（spawnIndexChild）。
+    //   - 兜底开关：DHT_INDEX_DRIVER=child 强制回到子进程路径，便于回退排查。
+    const driver = isCompiledExe || process.env.DHT_INDEX_DRIVER === 'child' ? 'child' : 'worker';
+    const spawn = driver === 'child' ? spawnIndexChild : spawnIndexWorker;
     begin();
-    indexingPromise = spawnIndexWorker(mode, wrapped)
+    indexingPromise = spawn(mode, wrapped)
       .then((r) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; return r; })
       .catch((e) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; throw e; })
       .finally(() => { indexingPromise = null; indexingMode = null; });

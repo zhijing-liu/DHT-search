@@ -38,11 +38,15 @@ import { INDEX_WORKER_FLAG } from './worker-flags.js';
 // 以环境变量为主判据而不是 parentPort：Bun 下 worker_threads 实现不完整，
 // 不能假设 parentPort 在非 worker 环境里一定为 null。
 const isWorkerThread = process.env.DHT_REINDEX_JOB == null;
+/** 过程追踪（临时调试用）：DHT_REINDEX_DEBUG=1 时在本执行体 stdout 输出明细 */
+const DBG = process.env.DHT_REINDEX_DEBUG === '1';
+const trace = (...args) => { if (DBG) console.log('[reindex-worker]', ...args); };
 
 function main() {
   const { sourcePath, indexPath, mode } = isWorkerThread
     ? workerData
     : JSON.parse(process.env.DHT_REINDEX_JOB || '{}');
+  trace(`执行体启动 mode=${mode} worker=${isWorkerThread} indexPath=${indexPath}`);
 
   /** 统一回传通道：worker 线程走 postMessage，子进程走 process.send */
   const post = (msg) => {
@@ -54,8 +58,14 @@ function main() {
   try {
     // sync: false —— 执行体只为维护索引而来，不必先跑一次增量同步
     api = createMagnetDb({ source: sourcePath, indexDbPath: indexPath, sync: false });
+    trace('createMagnetDb 打开完成，开始执行索引维护');
     if (mode === 'full') {
-      const indexed = api.rebuildSync((p) => post({ type: 'progress', ...p }));
+      trace('开始 rebuildSync（全量重建）');
+      const indexed = api.rebuildSync((p) => {
+        trace(`rebuildSync flush: done=${p.done}/${p.total} t=${Date.now()}`);
+        post({ type: 'progress', ...p });
+      });
+      trace(`rebuildSync 完成 indexed=${indexed}`);
       post({ ok: true, indexed });
     } else {
       // 增量同步：onFlush 自带 done/total（total 为预先算出的 id 跨度），直接转发
@@ -65,6 +75,7 @@ function main() {
       post({ ok: true, result: r });
     }
   } catch (err) {
+    trace(`执行体捕获异常: ${err?.message ?? String(err)}`);
     post({ ok: false, error: err?.message ?? String(err) });
   } finally {
     try {
@@ -72,6 +83,7 @@ function main() {
     } catch {
       /* 关闭失败不影响已经回传的结果 */
     }
+    trace('执行体退出');
     // 子进程模式：结果已发出，稍作停留让 IPC 帧冲刷完毕后自行退出，进程不残留
     if (!isWorkerThread) setTimeout(() => process.exit(0), 100);
   }
