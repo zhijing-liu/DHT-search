@@ -79,16 +79,16 @@ jobs:
           $notes = $notes -replace '#(\d+)', "[PR #`$1](https://github.com/$env:GITHUB_REPOSITORY/pull/`$1)"
 
           # 末尾追加构建信息，便于用户反馈问题时定位
-          $buildInfo = @"
-
----
-
-**构建信息 / Build Info**
-- 版本: $tag
-- 平台: Windows x64（GitHub Actions）
-- 运行时: Node $(node -v) / Bun $(bun --version)
-- 构建时间(UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))
-"@
+          $buildInfo = @(
+            '',
+            '---',
+            '',
+            '**构建信息 / Build Info**',
+            "- 版本: $tag",
+            '- 平台: Windows x64（GitHub Actions）',
+            "- 运行时: Node $(node -v) / Bun $(bun --version)",
+            "- 构建时间(UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))"
+          ) -join "`n"
           $notes += $buildInfo
 
           gh release view $tag 2>$null
