@@ -24,7 +24,7 @@ import { createMagnetDb, normalizeSearchQuery, normalizeKeyword } from './src/db
 import { createSearchExecutor } from './src/searchPool.js';
 import { createAccessControl } from './src/accessControl.js';
 import { isCompiledExe } from './src/db-driver.js';
-import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY, SYNC_CRON } from './src/settings.js';
+import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY, SYNC_CRON, WEB_BASE_PATH } from './src/settings.js';
 import { CONFIG } from './src/store.js';
 import { LRUCache } from 'lru-cache';
 import { log } from './src/logger.js';
@@ -121,6 +121,29 @@ if (typeof searchCacheSweep.unref === 'function') searchCacheSweep.unref();
 
 const app = express();
 
+/**
+ * WEB_BASE_PATH 作为整个 Express 服务的统一前缀（如 '/dht'）：
+ * 在路由层面前把 /dht/api/...、/dht/assets/...、/dht/index.html 等请求剥掉前缀，
+ * 于是后续所有 API / 静态 / 中间件都无需感知前缀即可统一工作；
+ * 不带前缀的根路径请求（旧直连/nginx 已剥前缀的转发）继续兼容。
+ * 入口统一：访问站点根 '/' 会被重定向到 `${PREFIX}/index.html`（见下）。
+ */
+const PREFIX = (() => {
+  const p = String(WEB_BASE_PATH ?? '').trim().replace(/^\/+|\/+$/g, '');
+  return p ? `/${p}` : '';
+})();
+if (PREFIX) {
+  app.use((req, _res, next) => {
+    const u = req.url;
+    if (u === PREFIX) {
+      req.url = '/'; // 例如 /dht -> /
+    } else if (u.startsWith(`${PREFIX}/`)) {
+      req.url = u.slice(PREFIX.length) || '/'; // 例如 /dht/api/x -> /api/x
+    }
+    next();
+  });
+}
+
 // 信任前置反向代理（nginx 等）时设为 true / 'loopback' / 具体子网，
 // 才能从 X-Forwarded-For 拿到真实客户端 IP 用于白名单比对；
 // 默认 false：直连场景取 TCP 对端地址，安全且正确。
@@ -175,8 +198,10 @@ function apiHandler(fn, status = 500, defaultMessage = INTERNAL_ERROR) {
   };
 }
 
-app.get('/', (_req, res) => res.redirect('/index.html'));
+// 站点根（或前缀根）统一落到 index.html；PREFIX='' 时行为与原来一致
+app.get('/', (_req, res) => res.redirect(`${PREFIX}/index.html`));
 
+// 静态资源与 API 一样经前缀剥除中间件后在此命中（不带前缀的直连路径也可用）
 app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
 

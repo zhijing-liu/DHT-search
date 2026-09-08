@@ -24,13 +24,13 @@ export const INDEX_DB_PATH = 'data/dht.search.db';
 export const PORT = 3000;
 
 /**
- * 前端静态资源部署前缀（vite build 的 base 路径）。
- * - 空字符串（默认）：资源按站点根引用（/assets/...），适合服务直接对外、或 nginx
- *   把后端「剥前缀」后放在站点根的场景；
- * - 设为 `/dht`（或 `/dht/`）：构建产物的 index.html 将以 /dht/assets/... 引用资源，
- *   适合服务被 nginx 等反代部署在子路径的场景（nginx 示例：
- *   `location /dht/ { proxy_pass http://127.0.0.1:3000/; }`，去掉尾斜杠即剥掉前缀）。
- * 本项只被 web/vite.config.js 读取，仅影响 `npm run build:web` 的构建结果，改后需重新构建。
+ * 整个 Express 服务的统一前缀（同时是 vite build 的 base 路径），如 '/dht'。
+ * - 空字符串（默认）：服务挂在站点根（/api/...、/assets/...），适合直接对外或经
+ *   nginx 等「剥前缀」反代转发到站点根的场景；
+ * - 设为 `/dht`（或 `/dht/`）：页面、静态资源与全部 API 都统一带此前缀访问
+ *   （/dht/、/dht/api/search、/dht/assets/...）。后端在路由层统一剥掉前缀
+ *   （见 index.js），无需额外反代；不带前缀的根路径会 302 到前缀下，兼容旧直连。
+ * 此前缀同时决定 `npm run build:web` 产物的资源引用前缀，改后需重新构建才生效。
  */
 export const WEB_BASE_PATH = '';
 
