@@ -1016,10 +1016,13 @@ export function createMagnetDb(options = {}) {
   function rebuildSync(onProgress) {
     const s = openSourceRO(sourcePath);
     try {
+      // total 是常量：提前算一次即可。若放进 onFlush 回调，会随每个批次（REBUILD_BATCH
+      // 行）重复全表 count(*)，源库规模越大越慢，重建时间被放大约 N/REBUILD_BATCH 倍。
+      const total = Number(getRow(s, `SELECT count(*) AS c FROM ${TABLE}`)?.c ?? 0);
       let done = 0;
       fullRebuild(db, s, ({ rows }) => {
         done += rows;
-        onProgress?.({ done, total: Number(getRow(s, `SELECT count(*) AS c FROM ${TABLE}`)?.c ?? 0) });
+        onProgress?.({ done, total });
       });
     } finally {
       s.close();
