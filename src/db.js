@@ -818,6 +818,7 @@ export function createMagnetDb(options = {}) {
 
   let reindexWorker = null;
   let indexingPromise = null;
+  let indexingMode = null; // 当前维护类型（'full' | 'incremental'），互斥复用时用于结果归一化
 
   /**
    * 派生 worker 线程执行索引维护（通用，仅 Node 路径使用）。
@@ -1052,17 +1053,24 @@ export function createMagnetDb(options = {}) {
    * @returns {Promise<number|{skipped:boolean,added:number}>}
    */
   function runIndex(mode, onProgress) {
-    // 单实例互斥：已有维护在跑则复用。incremental 请求统一归一化为 { skipped, added }
-    // （被 full 重建占用时视为跳过，避免手动增量同步拿到 rebuild 返回的数字）。
+    // 单实例互斥：已有维护在跑则复用。
+    // - incremental 请求被 full 占用时，归一化为 { skipped, added }（视为跳过），
+    //   避免手动增量同步误拿到 rebuild 返回的数字。
+    // - full 请求被 incremental 占用时，等其结束后再补跑一次真正的全量重建，
+    //   确保 full 始终返回文档数（数字），而非增量同步的 { skipped, added } 对象。
     if (indexingPromise) {
       if (mode === 'incremental') {
         return indexingPromise
           .then((r) => (typeof r === 'number' ? { skipped: true, added: 0 } : r))
           .catch(() => ({ skipped: true, added: 0 }));
       }
-      return indexingPromise;
+      if (indexingMode === 'full') return indexingPromise;
+      return indexingPromise.then(
+        () => runIndex('full', onProgress),
+        () => runIndex('full', onProgress)
+      );
     }
-    const begin = () => { runtimeStats.indexing = { running: true, mode, done: 0, total: 0 }; };
+    const begin = () => { indexingMode = mode; runtimeStats.indexing = { running: true, mode, done: 0, total: 0 }; };
     const wrapped = (p) => {
       runtimeStats.indexing = { running: true, done: p.done, total: p.total, mode };
       onProgress?.(p);
@@ -1075,14 +1083,14 @@ export function createMagnetDb(options = {}) {
       indexingPromise = spawnIndexChild(mode, wrapped)
         .then((r) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; return r; })
         .catch((e) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; throw e; })
-        .finally(() => { indexingPromise = null; });
+        .finally(() => { indexingPromise = null; indexingMode = null; });
       return indexingPromise;
     }
     begin();
     indexingPromise = spawnIndexWorker(mode, wrapped)
       .then((r) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; return r; })
       .catch((e) => { runtimeStats.indexing = { running: false, mode: null, done: 0, total: 0 }; throw e; })
-      .finally(() => { indexingPromise = null; });
+      .finally(() => { indexingPromise = null; indexingMode = null; });
     return indexingPromise;
   }
 
