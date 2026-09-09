@@ -37,7 +37,9 @@ import {
   endReindex,
   beginSync,
   endSync,
+  setNextSyncAt,
 } from './src/stats.js';
+import { nextCronTime } from './src/cron.js';
 
 // 编译产物（bun --compile）内 import.meta.url 指向虚拟文件系统，静态资源目录
 // 改取 exe 同目录的 public/；源码态行为不变
@@ -118,6 +120,36 @@ const searchCache = new LRUCache({
 // 后台定时清扫：即使条目从不被访问，超时后也能在下一轮被真正释放
 const searchCacheSweep = setInterval(() => searchCache.purgeStale(), 60_000);
 if (typeof searchCacheSweep.unref === 'function') searchCacheSweep.unref();
+
+/* ------------------------------------------------------------------ */
+/* 定时同步计划（cron 节拍的只读翻译）                                  */
+/* ------------------------------------------------------------------ */
+/**
+ * 只有非空且 node-cron 认可才算「已启用」：表达式非法时下面的注册阶段会告警
+ * 并不启用，这里保持一致，避免前端显示一个永远不会触发的倒计时。
+ */
+const SYNC_CRON_ON = Boolean(SYNC_CRON) && cron.validate(SYNC_CRON);
+/** 上次推算时刻；仅在推算无解（如 '0 0 30 2 *'）时用于重试节流 */
+let syncNextCheckedAt = 0;
+
+/**
+ * 下次同步时刻——cron 表达式的只读翻译：不是「上次 + 固定间隔」，而是按
+ * SYNC_CRON 重新求下一次触发点，因此与 node-cron 的实际节拍天然一致。
+ *
+ * 惰性重算：到点触发后（或系统休眠直接跨过触发点）缓存值即过期，下一帧重新
+ * 推算；推算无解时最多每 10 秒重试一次，不至于每帧都白算。
+ * @returns {number|null} 未启用 / 无法推算时为 null
+ */
+function getNextSyncAt(now = Date.now()) {
+  if (!SYNC_CRON_ON) return null;
+  const cur = runtimeStats.sync.nextAt;
+  const stale = cur == null ? now - syncNextCheckedAt > 10_000 : cur <= now;
+  if (stale) {
+    syncNextCheckedAt = now;
+    setNextSyncAt(nextCronTime(SYNC_CRON, new Date(now))?.getTime() ?? null);
+  }
+  return runtimeStats.sync.nextAt;
+}
 
 const app = express();
 
@@ -328,7 +360,7 @@ app.post('/api/sync', apiHandler(async (_req, res) => {
     skipped = r.skipped;
     added = r.added;
   } finally {
-    // 更新同步状态（自动同步已取消，nextAt 不再被维护）
+    // 记录本轮结果；nextAt 由 cron 独立维护，手动同步不挪动定时计划
     endSync(added);
   }
   // 确实补录了新行才清缓存；无新增时不必让已有缓存白白失效
@@ -376,7 +408,9 @@ function collectStats() {
     rssMB: +(m.rss / 1048576).toFixed(1),
     processes: searchExecutor.size,
     indexed: indexedCountCache.value ?? 0,
-    nextSyncAt: runtimeStats.sync.nextAt,
+    // 下次同步 = cron 的下一次触发点（未启用 / 无法推算时为 null）
+    nextSyncAt: getNextSyncAt(),
+    syncCron: SYNC_CRON_ON ? SYNC_CRON : '',
     lastSyncAt: runtimeStats.sync.lastAt,
     syncing: runtimeStats.sync.running,
     reindex: runtimeStats.reindex,
@@ -497,11 +531,11 @@ api.syncIncremental()
     syncIndexedCount(); // 无论成败都刷新总数，反映当前索引状态
   });
 
-// 定时增量同步（唯一周期索引维护）：SYNC_CRON 默认每天 03:00，到点在后台执行一次
+// 定时增量同步（唯一周期索引维护）：SYNC_CRON（默认关闭）到点在后台执行一次
 // 增量补录（按 last_rowid 只灌源库新增行，秒级、几乎无写放大），主进程零阻塞。
 // 全量重建不再定时执行，只保留给启动建库（tokenizer 变更/索引为空）与手动 /api/reindex。
 let syncTask = null;
-if (SYNC_CRON && cron.validate(SYNC_CRON)) {
+if (SYNC_CRON_ON) {
   syncTask = cron.schedule(SYNC_CRON, async () => {
     log.user(`定时增量同步触发（cron: ${SYNC_CRON}）`);
     let skipped = false;
@@ -528,7 +562,8 @@ if (SYNC_CRON && cron.validate(SYNC_CRON)) {
       log.ok(`定时增量同步完成，补录 ${added} 行${added > 0 ? '，已清空搜索缓存' : ''}`);
     }
   });
-  log.system(`已注册定时增量同步任务（cron: ${SYNC_CRON}）`);
+  const nextRun = nextCronTime(SYNC_CRON);
+  log.system(`已注册定时增量同步任务（cron: ${SYNC_CRON}${nextRun ? `，下次 ${nextRun.toLocaleString('zh-CN')}` : ''}）`);
 } else if (SYNC_CRON) {
   log.warn(`SYNC_CRON 表达式无效，已忽略: ${SYNC_CRON}`);
 }

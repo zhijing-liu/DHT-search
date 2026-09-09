@@ -62,6 +62,7 @@ export const SOURCE_READ_MMAP_MB = 2048;
  * 启用后，到点在后台按 last_rowid 只补录源库新增行（秒级、几乎无写放大），主进程零阻塞；
  * 不执行全量重建——重建只保留给启动建库与手动 /api/reindex（源库的 UPDATE/DELETE 不会
  * 被增量同步捕获，需要时手动重建一次即可）。
+ * 设置面板的「下次同步」倒计时即本表达式推算出的下一次触发点（见 src/cron.js）。
  */
 export const SYNC_CRON = '';
 

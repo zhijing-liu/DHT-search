@@ -74,17 +74,23 @@ export function beginSync() {
 
 /**
  * 同步结束（成功/失败都要调，建议放在 finally 中）。
- * @param {number} added      本轮补录行数；异常时为 0
- * @param {number} [intervalMs] 同步周期，用于推算下次触发时刻；不传则不改动 nextAt
+ * 刻意**不在这里推算下次时刻**：同步节拍已交给 cron（SYNC_CRON），下次触发点
+ * 由 cron 表达式单独推算（见 src/cron.js + index.js 的 getNextSyncAt），
+ * 手动同步也不该挪动 cron 计划，故此处只记录本轮结果。
+ * @param {number} added 本轮补录行数；异常时为 0
  */
-export function endSync(added, intervalMs) {
-  const now = Date.now();
+export function endSync(added) {
   runtimeStats.sync.running = false;
-  runtimeStats.sync.lastAt = now;
+  runtimeStats.sync.lastAt = Date.now();
   runtimeStats.sync.lastAdded = added;
-  if (Number.isFinite(intervalMs) && intervalMs > 0) {
-    runtimeStats.sync.nextAt = now + intervalMs;
-  }
+}
+
+/**
+ * 写入下次同步时刻：来源是 cron 表达式的推算值，而非「上次 + 固定间隔」。
+ * @param {number|null} at 时间戳；非有限值按 null 处理（未启用 / 无法推算）
+ */
+export function setNextSyncAt(at) {
+  runtimeStats.sync.nextAt = Number.isFinite(at) ? at : null;
 }
 
 

@@ -814,12 +814,19 @@ let lastStats = null;
 /** 本地倒计时节拍（仅弹窗打开期间运行） */
 let statsTick = null;
 
-/** 下次同步倒计时：服务端只推时间戳，相对时间在本地算 */
+/**
+ * 下次同步倒计时：服务端推的是「由 SYNC_CRON 推算出的下次触发时间戳」，
+ * 相对时间在本地逐秒重算（不依赖推送频率）；cron 未配置时即「未启用」。
+ */
 function renderCountdown() {
   if (!lastStats) return;
-  el.stNextSync.textContent = lastStats.nextSyncAt
-    ? `${formatCountdown(lastStats.nextSyncAt - Date.now())} 后`
-    : '未启用自动同步';
+  const { nextSyncAt, syncCron } = lastStats;
+  el.stNextSync.title = syncCron ? `自动同步 cron：${syncCron}` : '';
+  el.stNextSync.textContent = nextSyncAt
+    ? `${formatCountdown(nextSyncAt - Date.now())} 后`
+    : syncCron
+      ? '自动同步已启用'
+      : '未启用自动同步';
 }
 
 function renderStats(d) {

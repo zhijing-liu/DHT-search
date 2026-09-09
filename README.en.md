@@ -147,7 +147,7 @@ DHT-search/
 - **Input suggestions**: tiered matching against hot keywords (exact > prefix > contains > fuzzy Levenshtein).
 - **Search cache**: in-process LRU storing serialized JSON strings (zero stringify on hit), byte-capped and TTL-expiring (default 32MB / 1h). Whole-set fetches (`limit=all`) bypass the cache.
 - **Online rebuild & scheduled maintenance**: full rebuild runs in a dedicated worker thread (Node) or child process (Bun) — **zero main-process blocking; pages and search stay available**; startup sync runs in the background and the service is up in seconds; runtime periodic maintenance is handled by the `SYNC_CRON` scheduled incremental sync (full rebuild is manual only).
-- **Runtime status**: the settings panel receives a snapshot every 3s via SSE (`/api/stats/stream`): cache hit, heap, search-process count, indexed count, next-sync countdown, rebuild/sync progress.
+- **Runtime status**: the settings panel receives a snapshot every 3s via SSE (`/api/stats/stream`): cache hit, heap, search-process count, indexed count, next-sync countdown (the next fire time derived from `SYNC_CRON`, not "last run + fixed interval"), rebuild/sync progress.
 - **Access control**: edge IP / CIDR whitelist covering everything (pages + APIs + writes), proxy-aware.
 - **RPC push**: the "push" button on result cards sends magnet links via JSON-RPC 2.0 (`aria2.addUri`) to aria2 / Motrix; address & secret configured in Settings, secret sent as `token:` prefix per aria2 convention.
 
