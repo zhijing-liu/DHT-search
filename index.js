@@ -24,7 +24,7 @@ import { createMagnetDb, normalizeSearchQuery, normalizeKeyword } from './src/db
 import { createSearchExecutor } from './src/searchPool.js';
 import { createAccessControl } from './src/accessControl.js';
 import { isCompiledExe } from './src/db-driver.js';
-import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY, SYNC_CRON, WEB_BASE_PATH } from './src/settings.js';
+import { ACCESS_CONTROL_MODE, ALLOWED_CLIENTS, TRUST_PROXY, SYNC_CRON, SYNC_ON_START, WEB_BASE_PATH } from './src/settings.js';
 import { CONFIG } from './src/store.js';
 import { LRUCache } from 'lru-cache';
 import { log } from './src/logger.js';
@@ -520,16 +520,22 @@ const server = app.listen(PORT, () => {
   log.banner(PORT, CONFIG.maxResults);
 });
 
-// 启动同步：丢进后台增量补录，不阻塞主线程、页面立即可响应；
-// 期间标记 initializing，完成后刷新总数缓存。
-runtimeStats.initializing = true;
-api.syncIncremental()
-  .then((r) => { if (r && r.added > 0) syncIndexedCount(); })
-  .catch((e) => log.error(`启动同步失败: ${e?.message || e}`))
-  .finally(() => {
-    runtimeStats.initializing = false;
-    syncIndexedCount(); // 无论成败都刷新总数，反映当前索引状态
-  });
+// 启动同步：由 config.js 的 SYNC_ON_START 控制。
+// true：丢进后台增量补录，不阻塞主线程、页面立即可响应；
+//   期间标记 initializing，完成后刷新总数缓存。
+// false：跳过启动补录，索引维持上次退出时的状态（仍可手动 /api/sync 或等 SYNC_CRON）。
+if (SYNC_ON_START) {
+  runtimeStats.initializing = true;
+  api.syncIncremental()
+    .then((r) => { if (r && r.added > 0) syncIndexedCount(); })
+    .catch((e) => log.error(`启动同步失败: ${e?.message || e}`))
+    .finally(() => {
+      runtimeStats.initializing = false;
+      syncIndexedCount(); // 无论成败都刷新总数，反映当前索引状态
+    });
+} else {
+  log.system('SYNC_ON_START=false，已跳过启动增量同步');
+}
 
 // 定时增量同步（唯一周期索引维护）：SYNC_CRON（默认关闭）到点在后台执行一次
 // 增量补录（按 last_rowid 只灌源库新增行，秒级、几乎无写放大），主进程零阻塞。

@@ -173,6 +173,7 @@ Every item ships with a default and comments in `config.js`; edit the correspond
 | `SEARCH_QUEUE_MAX` | `16` | Search wait-queue cap; excess queries fail fast when all processes are busy |
 | `SEARCH_QUEUE_TIMEOUT_MS` | `10000` | Queue timeout (ms); fail fast on expiry; `0` = unlimited |
 | `SYNC_CRON` | `''` | Cron expression for scheduled incremental sync (5-field, e.g. `'0 4 * * *'` = daily 04:00); disabled by default. When enabled it only appends new rows since `last_rowid` (seconds, no full rebuild) |
+| `SYNC_ON_START` | `false` | Whether to run one incremental sync automatically at startup (background catch-up of new source rows). `false` skips it, leaving the index as it was on last shutdown (does not affect `SYNC_CRON`, manual `/api/sync`, or `/api/reindex`) |
 | `ACCESS_CONTROL_MODE` | `'ip-whitelist'` | Access-control mode: `'ip-whitelist'` allows only `ALLOWED_CLIENTS`, others get 403; `'off'` disables (for localhost / proxy-auth setups). **On by default** |
 | `ALLOWED_CLIENTS` | see below | Client address list (only in `ip-whitelist` mode): exact IPv4/IPv6 and CIDR (e.g. `192.168.0.0/16`, `2001:db8::/32`). Defaults include `127.0.0.1`, `::1`, and private/link-local ranges `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10` |
 | `TRUST_PROXY` | `false` | Trust the reverse proxy's `X-Forwarded-For` for the real client IP: `false` (default) uses the TCP peer (direct connection); behind nginx set `true` / `'loopback'` / a subnet, otherwise the whitelist misjudges |

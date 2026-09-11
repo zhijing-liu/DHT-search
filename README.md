@@ -177,6 +177,7 @@ DHT-search/
 | `SEARCH_QUEUE_MAX` | `16` | 搜索等待队列上限：进程全忙时新查询排队，超出快速失败 |
 | `SEARCH_QUEUE_TIMEOUT_MS` | `10000` | 排队超时（ms），超时快速失败；`0` 不限时 |
 | `SYNC_CRON` | `''` | 定时增量同步的 cron 表达式（标准 5 字段，如 `'0 4 * * *'` = 每天 04:00）；默认关闭，启用后到点只按 `last_rowid` 补录源库新增行（秒级），不做全量重建 |
+| `SYNC_ON_START` | `false` | 是否在服务启动时自动执行一次增量同步（后台补录源库新增行）；`false` 则启动跳过补录、索引维持上次退出时的状态（不影响 `SYNC_CRON` 与手动 `/api/sync`、`/api/reindex`） |
 | `ACCESS_CONTROL_MODE` | `'ip-whitelist'` | 访问控制模式：`'ip-whitelist'` 仅放行 `ALLOWED_CLIENTS` 中的 IP / 网段，其余 403；`'off'` 关闭（兼容纯本机 / 反代鉴权）。**默认开启** |
 | `ALLOWED_CLIENTS` | 见下 | 允许访问的客户端地址清单（仅 `ip-whitelist` 模式生效）：支持精确 IPv4/IPv6 与 CIDR（如 `192.168.0.0/16`、`2001:db8::/32`）。默认含 `127.0.0.1`、`::1` 及 `10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`fc00::/7`、`fe80::/10` 等内网 / 本机范围 |
 | `TRUST_PROXY` | `false` | 是否信任前置反代（nginx 等）的 `X-Forwarded-For` 来取真实客户端 IP：`false`（默认）取 TCP 对端，适合直连；反代场景需设为 `true` / `'loopback'` / 具体子网，否则白名单会误判 |
