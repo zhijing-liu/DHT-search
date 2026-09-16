@@ -482,20 +482,31 @@ function indexPass(db, src, { reset }, onFlush, timer = NOOP_TIMER) {
     }
 
     if (reset) {
-      // 二级索引在灌数据之后建（空表带索引会让每条 INSERT 都维护 B-Tree，慢 2~3 倍）；
-      // 只建 totalSize：fetchedAt 排序走「FTS JOIN 后临时排序」，该索引不会被查询使用
+      // 二级索引在灌数据之后建（空表带索引会让每条 INSERT 都维护 B-Tree，慢 2~3 倍）
+      //  - totalSize：按大小排序（两步法）使用，见 search/api.js 的 plainColSort
+      //  - lower(infohash)：hash 检索（?by=hash）走点查；无此索引会对 313 万行全表扫，
+      //    表达式索引同时服务前缀 LIKE。实测 EXPLAIN 由 SCAN 变为 COVERING INDEX 查找
+      //  - 刻意不建 fetchedAt 索引：两步法「WHERE m.id IN(...) ORDER BY m.fetchedAt」下
+      //    planner 永远走 TEMP B-TREE（宽词 21s→21s 零收益），加了只增写放大
       report('index');
-      timer.measure('index', () =>
-        db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`)
-      );
+      timer.measure('index', () => {
+        db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`);
+        db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_infohash_lower`)} ON ${sql.raw(DOCS_TABLE)}(lower(infohash))`);
+      });
       // 结构水位：只有整库重建成功走到这里才写，中途失败留在旧值，下次启动仍判定需重建
       setMeta(db, STATE_KEYS.tokenizer, TOKENIZER);
       setMeta(db, STATE_KEYS.filesFormat, INDEX_FORMAT);
       // 数据水位取源库当前 max：覆盖重建期间新增的行
       setMeta(db, STATE_KEYS.dataWatermark, String(maxSourceId(src)));
-    } else if (max > from) {
-      // 数据水位取扫描前的 max（本轮补录到的行）。只在真有新增时推进：写小会导致下次重扫
-      setMeta(db, STATE_KEYS.dataWatermark, String(max));
+    } else {
+      // 自修复：已存在但未触发整库重建的库（部署前建、INDEX_FORMAT 未变）可能缺新二级索引；
+      // IF NOT EXISTS 保证只对缺失索引建一次（建 313 万行索引是一次性开销），之后仅为目录探查
+      db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`);
+      db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_infohash_lower`)} ON ${sql.raw(DOCS_TABLE)}(lower(infohash))`);
+      if (max > from) {
+        // 数据水位取扫描前的 max（本轮补录到的行）。只在真有新增时推进：写小会导致下次重扫
+        setMeta(db, STATE_KEYS.dataWatermark, String(max));
+      }
     }
 
     // FTS 合并：重建一次彻底合并（optimize）；增量按「自上次合并后累计写入行数」节流做部分合并
