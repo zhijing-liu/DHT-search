@@ -1,6 +1,14 @@
 import { defineConfig } from 'vite'
 import tailwindcss from '@tailwindcss/vite'
-import { PORT, WEB_BASE_PATH } from '../config.js'
+
+// config.js 为本地私有配置（gitignore），CI / 干净检出时无此文件；
+// 缺失时回退到仓库随附的 config.example.js（公共默认），保证前端构建不中断。
+let PORT, WEB_BASE_PATH
+try {
+  ({ PORT, WEB_BASE_PATH } = await import('../config.js'))
+} catch {
+  ({ PORT, WEB_BASE_PATH } = await import('../config.example.js'))
+}
 
 /**
  * 部署前缀 -> vite base：

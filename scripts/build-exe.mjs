@@ -45,7 +45,10 @@ fs.cpSync(PUBLIC, path.join(DIST, 'public'), { recursive: true });
 console.log('[build-exe] 已同步 public/ → dist/public/');
 
 /* 3. 外置配置 / 说明文档 / 空数据目录 ------------------------------ */
-fs.copyFileSync(path.join(ROOT, 'config.js'), path.join(DIST, 'config.js'));
+// config.js 为本地私有配置（gitignore），干净检出时可能不存在；
+// 缺失时回退到 config.example.js（公共默认），保证 CI 构建仍可产出 dist/config.js
+const cfgSrc = fs.existsSync(path.join(ROOT, 'config.js')) ? 'config.js' : 'config.example.js';
+fs.copyFileSync(path.join(ROOT, cfgSrc), path.join(DIST, 'config.js'));
 fs.copyFileSync(path.join(ROOT, 'README.md'), path.join(DIST, 'README.md'));
 fs.mkdirSync(path.join(DIST, 'data'), { recursive: true });
 

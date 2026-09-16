@@ -33,3 +33,7 @@ pnpm-workspace.yaml
 
 # 个人本机脚本
 update.bat
+
+# 本地私有配置：含源库绝对路径 / IP 白名单 / 反代信任等，永不提交；
+# 公共模板见 config.example.js（部署时 cp config.example.js config.js 再按需修改）
+config.js

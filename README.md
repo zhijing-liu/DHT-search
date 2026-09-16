@@ -70,6 +70,14 @@ npm run build:web           # web/ → public/（Vite + Tailwind）
 
 ## 配置项（`config.js`）
 
+> **本地私有配置**：`config.js` 含本机私有项（源库绝对路径、IP 白名单、反代信任等），已被 `.gitignore` 忽略，**不会进入版本库**。仓库随附的 `config.example.js` 是公共默认模板；首次部署 / 本地开发请先复制：
+>
+> ```bash
+> cp config.example.js config.js   # 然后按需修改私有项
+> ```
+>
+> 新增 / 调整配置项请改 `config.example.js` 并提交；构建（`build:exe`）在仓库根缺失 `config.js` 时会自动用 `config.example.js` 兜底，故 CI 发版不受影响。
+
 所有配置项集中在 `config.js`，均为独立 `export const`，修改后重启服务生效。路径支持相对（基于项目根）或绝对路径。
 
 | 配置项 | 默认 | 说明 |
