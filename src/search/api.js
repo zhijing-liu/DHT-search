@@ -79,12 +79,6 @@ export function buildSearchApi(dbRO) {
     Number.isFinite(Number(MAX_RESULTS)) && Number(MAX_RESULTS) > 0 ? Number(MAX_RESULTS) : 20000;
 
   /**
-   * 匹配数超过该值才启用「索引反转驱动」排序：从二级索引倒序扫、逐个用 EXISTS 校验 FTS
-   * 匹配，凑够 LIMIT 个即停。匹配少时直接 JOIN 更快；超大匹配时 EXISTS 校验代价更高。
-   */
-  const INDEX_SCAN_MIN_TOTAL = 5000;
-
-  /**
    * 构造大小筛选片段（值已由 normalizeSearchQuery 校验为「有限非负」或 undefined）。
    * 无条件时返回空片段，调用方无需再判空。
    */
@@ -154,7 +148,7 @@ export function buildSearchApi(dbRO) {
         s.by === 'fts' && !hasSize
           ? sql`SELECT count(*) AS total FROM ${sql.raw(FTS_TABLE)} WHERE ${cond}`
           : sql`SELECT count(*) AS total ${fromWhere}`,
-      buildPage: (lim, off, useIndexScan = false) => {
+      buildPage: (lim, off) => {
         // 预取 rowid 再 JOIN：利用 FTS5 对 rowid 的有序输出提前终止。
         // 仅在「FTS + 无大小筛选 + 默认 id 排序」下可用（其余情况的排序键不是 rowid，
         // 或有大小筛选时预取行会被外层过滤掉导致结果偏少）。
@@ -168,22 +162,6 @@ export function buildSearchApi(dbRO) {
             ORDER BY m.id ${sql.raw(dir)}
           `;
         }
-        // 索引反转驱动：从 totalSize 索引倒序扫 docs、逐个用 EXISTS 校验 FTS 匹配，
-        // 凑够 LIMIT+OFFSET 个即停，避免「JOIN 全部匹配行 + 全量排序」。
-        // 只适用于 totalSize（fetchedAt 重复值多，反转会扫过大量同值行反而更慢；bm25 无索引）。
-        if (useIndexScan && s.by === 'fts' && !hasSize && s.sortBy === 'totalSize') {
-          const dir = s.order === 'asc' ? 'ASC' : 'DESC';
-          const col = s.sortBy;
-          return sql`
-            SELECT ${sql.raw(DOCS_SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m
-            WHERE EXISTS (
-              SELECT 1 FROM ${sql.raw(FTS_TABLE)}
-              WHERE ${cond} AND ${sql.raw(FTS_TABLE)}.rowid = m.id
-            )
-            ORDER BY m.${sql.raw(col)} ${sql.raw(dir)}, m.id ${sql.raw(dir)}
-            LIMIT ${lim} OFFSET ${off}
-          `;
-        }
         return sql`
           SELECT ${sql.raw(DOCS_SELECT_COLUMNS)} ${fromWhere}
           ${sql.raw(orderSqlFor(s))}
@@ -194,6 +172,8 @@ export function buildSearchApi(dbRO) {
       effLimit: s.limit,
       effOffset: s.offset,
       query: s.query, // 供调用方挑预览：mapRow 需要按关键词优先
+      cond,
+      s,
     };
   }
 
@@ -203,21 +183,54 @@ export function buildSearchApi(dbRO) {
    * @returns {{ total: number, limit: number|'all', offset: number, items: Array, truncated?: boolean }}
    */
   function searchMagnetsSync(options) {
-    const { buildCount, buildPage, wholeSet, effLimit, effOffset, query } = prepareSearch(options);
+    const { buildCount, buildPage, wholeSet, effLimit, effOffset, query, cond, s } = prepareSearch(options);
     const total = Number(dbRO.all(buildCount())[0]?.total ?? 0);
     // 预览按关键词优先挑：token 只算一次，本页所有行复用
     const tokens = queryTokens(query);
     const toItem = (row) => mapRow(row, tokens);
-    // 宽泛词才启用索引反转驱动（匹配占比高，凑 LIMIT 个就停比全量 JOIN + 排序划算）
-    const useIndexScan = total > INDEX_SCAN_MIN_TOTAL;
+    const hasSize = s.minSize !== undefined || s.maxSize !== undefined;
+
+    // 副本表普通列排序（totalSize / fetchedAt）走「两步法」，规避 SQLite 在 SELECT 含 files 大列时
+    // 改写执行计划、退化为「每候选行重跑一次完整 FTS 匹配」（宽泛词下整体数十秒）：
+    //   第一步只 SELECT id —— 触发 SQLite 对 IN(SELECT rowid FROM fts WHERE MATCH) 建自动索引，
+    //     沿排序列索引倒序扫描、O(1) 成员判定凑够 LIMIT 即停（实测 ~0.5s）；
+    //   第二步用本页 id 主键回查整行（含 files 预览），20 行主键查找代价可忽略。
+    // 仅 FTS + 无大小筛选时可用（大小筛选会先过滤匹配行，预取行再排序会偏少）。
+    const plainColSort = s.by === 'fts' && !hasSize && (s.sortBy === 'totalSize' || s.sortBy === 'fetchedAt');
+    if (total && plainColSort) {
+      const dir = s.order === 'asc' ? 'ASC' : 'DESC';
+      const col = s.sortBy;
+      const lim = wholeSet ? WHOLESET_CAP + 1 : effLimit;
+      const off = wholeSet ? 0 : effOffset;
+      const ids = dbRO
+        .all(sql`
+          SELECT m.id FROM ${sql.raw(DOCS_TABLE)} m
+          WHERE m.id IN (SELECT rowid FROM ${sql.raw(FTS_TABLE)} WHERE ${cond})
+          ORDER BY m.${sql.raw(col)} ${sql.raw(dir)}, m.id ${sql.raw(dir)}
+          LIMIT ${lim} OFFSET ${off}
+        `)
+        .map((r) => r.id);
+      const items = ids.length
+        ? dbRO
+            .all(sql`SELECT ${sql.raw(DOCS_SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m WHERE m.id IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})`)
+            .map(toItem)
+        : [];
+      if (wholeSet) {
+        const truncated = total > WHOLESET_CAP || items.length > WHOLESET_CAP;
+        if (items.length > WHOLESET_CAP) items.length = WHOLESET_CAP;
+        return { total, limit: 'all', offset: 0, items, truncated };
+      }
+      return { total, limit: effLimit, offset: effOffset, items };
+    }
+
     if (wholeSet) {
       // 一次性取到 CAP 上限，只排一次序（分批翻页会让带 bm25 的排序每轮重排一次匹配集）
-      const items = dbRO.all(buildPage(WHOLESET_CAP + 1, 0, useIndexScan)).map(toItem);
+      const items = dbRO.all(buildPage(WHOLESET_CAP + 1, 0)).map(toItem);
       const truncated = total > WHOLESET_CAP || items.length > WHOLESET_CAP;
       if (items.length > WHOLESET_CAP) items.length = WHOLESET_CAP;
       return { total, limit: 'all', offset: 0, items, truncated };
     }
-    const items = total ? dbRO.all(buildPage(effLimit, effOffset, useIndexScan)).map(toItem) : [];
+    const items = total ? dbRO.all(buildPage(effLimit, effOffset)).map(toItem) : [];
     return { total, limit: effLimit, offset: effOffset, items };
   }
 
