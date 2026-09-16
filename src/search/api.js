@@ -211,9 +211,15 @@ export function buildSearchApi(dbRO) {
         `)
         .map((r) => r.id);
       const items = ids.length
-        ? dbRO
-            .all(sql`SELECT ${sql.raw(DOCS_SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m WHERE m.id IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})`)
-            .map(toItem)
+        ? (() => {
+            // 第一步已按排序列定好 ids 顺序；第二步 IN(ids) 主键回查按 rowid 返回，
+            // 必须把行按 ids 顺序重排，否则 totalSize / fetchedAt 排序会退化成按 id 排序
+            const rows = dbRO.all(
+              sql`SELECT ${sql.raw(DOCS_SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m WHERE m.id IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})`
+            );
+            const byId = new Map(rows.map((r) => [r.id, mapRow(r, tokens)]));
+            return ids.map((id) => byId.get(id)).filter(Boolean);
+          })()
         : [];
       if (wholeSet) {
         const truncated = total > WHOLESET_CAP || items.length > WHOLESET_CAP;
