@@ -531,18 +531,61 @@ console.log('\n[14] 单实例互斥：重建进行中增量被归一化为 skipp
   api.close();
 }
 
-console.log('\n[15] worker 错误传播：重建失败 reject 且 indexing 复位');
+console.log('\n[15] 最新入库列表（listLatest，不经 FTS，固定按 id 倒序 = 表倒序）');
+{
+  const api = createMagnetDb({ source: SMOKE_DB, indexDbPath: idxFor(15) });
+  check('固定按 id 倒序：最新入库的（id=6）在最前，总数与源库一致', () => {
+    const r = api.listLatest();
+    assert.equal(r.total, api.countMagnets());
+    assert.equal(r.total, countSource());
+    assert.deepEqual(r.items.map((i) => i.id), [6, 4, 3, 2, 1]);
+  });
+  check('默认每批 30 条，返回行字段与检索一致（files 已解析为数组）', () => {
+    const r = api.listLatest();
+    assert.equal(r.limit, 30);
+    assert.deepEqual(Object.keys(r.items[0]).sort(), [
+      'fetchedAt', 'files', 'id', 'infohash', 'magnet', 'name', 'totalSize',
+    ]);
+    assert.ok(Array.isArray(r.items[0].files));
+  });
+  check('limit / offset 分页取最新一段', () => {
+    assert.deepEqual(api.listLatest({ limit: 2 }).items.map((i) => i.id), [6, 4]);
+    assert.deepEqual(api.listLatest({ limit: 2, offset: 2 }).items.map((i) => i.id), [3, 2]);
+  });
+  check('排序 / 过滤参数一律不生效（该接口只做分页，注入无效）', () => {
+    const r = api.listLatest({
+      sortBy: 'name; DROP TABLE magnets', order: 'asc', minSize: 1, maxSize: 1,
+    });
+    assert.deepEqual(r.items.map((i) => i.id), [6, 4, 3, 2, 1]);
+  });
+  check('limit 超限钳制到 MAX_LIMIT，非数值回退默认 30', () => {
+    assert.equal(api.listLatest({ limit: 99999 }).limit, MAX_LIMIT);
+    assert.equal(api.listLatest({ limit: 'abc' }).limit, 30);
+  });
+  check('offset 超出范围返回空数组但 total 不变', () => {
+    const r = api.listLatest({ offset: 999 });
+    assert.deepEqual(r.items, []);
+    assert.equal(r.total, countSource());
+  });
+  api.close();
+}
+
+// 放在最后一个：本段会主动制造 worker 失败并 terminate，Node 在进程退出阶段
+// 偶发 V8 fatal（DisposeIsolate），可能中断其后的任何断言，故不与其它用例竞争。
+console.log('\n[16] worker 错误传播：重建失败 reject 且 indexing 复位');
 {
   // 构造「表存在但缺列」的畸形源库：主进程 createMagnetDb 只校验表存在故不会崩，
   // 但 worker 内 rebuildSync 的 scanById 会因缺列抛错，从而验证 reject + 状态机复位。
-  const BAD_SRC = path.join(DATA_DIR, 'bad-source.db');
+  // 文件名必须以 smoke 开头：cleanup() 只按该前缀通配删除，否则上一轮遗留的文件
+  // 会让本轮的 CREATE TABLE 撞上「table magnets already exists」而中断整个测试。
+  const BAD_SRC = path.join(DATA_DIR, 'smoke.bad-source.db');
   {
     const s = openDatabase(BAD_SRC);
     setPragma(s, 'journal_mode', 'WAL');
     execRaw(s, 'CREATE TABLE magnets (id INTEGER PRIMARY KEY)');
     closeDb(s);
   }
-  const api = createMagnetDb({ source: BAD_SRC, indexDbPath: idxFor(15), sync: false });
+  const api = createMagnetDb({ source: BAD_SRC, indexDbPath: idxFor(16), sync: false });
   await check('reindex() 因源库缺列而 reject', async () => {
     await assert.rejects(api.reindex());
   });

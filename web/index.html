@@ -9,14 +9,38 @@
 <!-- 字号必须挂在 body 上：挂到 html 会让所有 rem 工具类（间距/圆角/尺寸）整体缩放，布局失真。
      preflight 已重置 body 的 margin。 -->
 <body class="font-sans text-[clamp(13px,calc(12px_+_0.3vw),15px)] text-fg h-screen flex flex-col overflow-hidden bg-[linear-gradient(160deg,var(--color-canvas),var(--color-surface))]">
-  <header class="flex-none flex items-baseline gap-3 px-6 py-4 border-b border-line bg-surface/60 max-[768px]:gap-2 max-[768px]:px-4 max-[768px]:py-3 max-[480px]:px-3 max-[480px]:py-2.5">
-    <span class="text-[clamp(18px,calc(16px_+_0.6vw),20px)] font-semibold text-brand2 max-[480px]:text-base">DHT Search</span>
-    <span class="text-xs text-muted max-[768px]:hidden">基于 FTS5 全文检索</span>
-    <span id="countBadge" class="ml-auto px-2.5 py-1 text-xs text-muted bg-brand/[0.12] border border-line rounded-lg whitespace-nowrap max-[768px]:text-[11px] max-[768px]:px-2 max-[768px]:py-0.5">加载中…</span>
+  <!-- 顶栏：三段式「品牌区 / 居中视图切换 / 右侧状态与操作」。
+       所有控件统一 36px 高（h-9）、10px 圆角，纵向 items-center 对齐，
+       避免此前 baseline 与 center 混用造成的参差。 -->
+  <header class="flex-none flex items-center gap-3 px-6 py-2.5 border-b border-line bg-surface/60 max-[768px]:gap-2 max-[768px]:px-4 max-[768px]:py-2 max-[480px]:px-3 max-[480px]:gap-1.5">
+    <div class="flex-none flex items-baseline gap-2.5 min-w-0">
+      <span class="text-[clamp(17px,calc(15px_+_0.5vw),19px)] font-semibold text-brand2 whitespace-nowrap">DHT Search</span>
+      <span class="text-xs text-muted whitespace-nowrap max-[900px]:hidden">基于 FTS5 全文检索</span>
+    </div>
+
+    <!-- 全局视图切换：搜索（关键词检索 + 热词） / 最新入库（固定 id 倒序、只有分页）
+         视图类型记在地址栏 hash 上（#latest 为最新入库，无 hash 即搜索），可刷新/分享/后退。
+         mx-auto 让切换器落在两侧之间的中线上（左右各分走一半空白） -->
+    <div class="mx-auto inline-flex items-stretch h-9 flex-none border border-line rounded-[10px] overflow-hidden bg-card" role="tablist" aria-label="视图切换">
+      <button id="tabSearch" type="button" role="tab" aria-selected="true"
+        class="inline-flex items-center px-3.5 border-0 border-r border-line bg-transparent text-muted text-[13px] font-medium whitespace-nowrap cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.05] [&.active]:bg-brand/[0.18] [&.active]:text-brand2 max-[480px]:px-2.5 max-[480px]:text-[12px]">搜索</button>
+      <button id="tabLatest" type="button" role="tab" aria-selected="false"
+        class="inline-flex items-center px-3.5 border-0 bg-transparent text-muted text-[13px] font-medium whitespace-nowrap cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.05] [&.active]:bg-brand/[0.18] [&.active]:text-brand2 max-[480px]:px-2.5 max-[480px]:text-[12px]">最新入库</button>
+    </div>
+
+    <div class="flex-none flex items-center gap-2 min-w-0">
+      <span id="countBadge"
+        class="inline-flex items-center h-9 px-3 rounded-[10px] border border-line bg-brand/[0.12] text-xs text-muted whitespace-nowrap tabular-nums max-[768px]:h-8 max-[768px]:px-2.5 max-[768px]:text-[11px] max-[520px]:hidden">加载中…</span>
+      <!-- 设置按钮放在顶栏右侧：它不属于检索条件，最新入库视图隐去整条检索栏时仍然可用 -->
+      <button id="settingsBtn" class="flex-none inline-flex items-center justify-center size-9 p-0 rounded-[10px] border border-line bg-card text-muted cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.08] max-[768px]:size-8" type="button" aria-label="设置" title="设置">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
   </header>
 
   <main class="flex-1 flex flex-col min-h-0 items-center w-full p-[clamp(12px,2vw,20px)] max-[480px]:p-[10px_8px]">
-    <section class="flex-none flex gap-2.5 flex-wrap items-stretch h-11 min-w-0 max-[768px]:h-auto max-[768px]:gap-2 max-[480px]:flex-col max-[480px]:items-stretch">
+    <!-- 检索栏（搜索框 + 排序 + 大小筛选）：整条都是检索视图专属，最新入库时整体隐去 -->
+    <section id="searchBar" class="flex-none flex gap-2.5 flex-wrap items-stretch h-11 min-w-0 max-[768px]:h-auto max-[768px]:gap-2 max-[480px]:flex-col max-[480px]:items-stretch">
       <div class="relative flex-none w-[40vw] min-w-0 h-full max-[768px]:h-10 max-[480px]:flex-1 max-[480px]:w-full">
         <input id="q" type="text" placeholder="输入关键词搜索" autocomplete="off"
           class="w-full h-full py-0 pr-10 pl-3.5 rounded-[10px] border border-line bg-card text-fg text-[15px] outline-none focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)] max-[480px]:pr-[38px] max-[480px]:pl-3" />
@@ -38,9 +62,6 @@
           <option value="gt100gb">&gt;100GB</option>
         </select>
       </div>
-      <button id="settingsBtn" class="inline-flex items-center justify-center w-11 h-full p-0 rounded-[10px] border border-line bg-card text-fg cursor-pointer transition-colors hover:bg-white/[0.08] max-[768px]:h-10 max-[480px]:self-end" type="button" aria-label="设置" title="设置">
-        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      </button>
     </section>
 
     <div id="settingsDialog" class="fixed inset-0 z-[1000] flex items-center justify-center p-4" hidden>
@@ -108,7 +129,7 @@
       </div>
     </div>
 
-    <section id="hotView" class="flex-1 min-h-0 w-full flex flex-col items-center overflow-hidden" hidden>
+    <section id="browseView" class="flex-1 min-h-0 w-full flex flex-col items-center overflow-hidden" hidden>
       <div class="flex-none w-full max-w-[1100px] flex items-center gap-3 mt-1.5 mb-1">
         <span class="text-[15px] font-semibold text-fg">热门关键词</span>
         <label class="inline-flex items-center gap-2 ml-auto cursor-pointer select-none text-muted text-[13px]" title="开启后可删除关键词 / 管理黑名单">
@@ -141,7 +162,8 @@
       </div>
     </section>
 
-    <!-- light DOM 容器：自定义元素默认 display:inline，必须显式给 display 才能成为滚动区 -->
+    <!-- light DOM 容器：自定义元素默认 display:inline，必须显式给 display 才能成为滚动区
+         （搜索结果与「最新入库」复用同一个列表容器与分页条，差别只在请求的接口与有无搜索框） -->
     <result-list id="results" class="w-full flex-1 min-h-0 flex flex-col gap-3.5 px-[clamp(8px,2vw,5vw)] py-2.5 overflow-y-auto scrollbar-thin" hidden></result-list>
 
     <button id="refreshBtn" class="fixed right-[18px] bottom-[10vh] z-50 flex-none inline-flex items-center justify-center size-11 p-0 rounded-full border border-line bg-surface text-fg shadow-[0_4px_14px_rgba(0,0,0,0.25)] cursor-pointer transition-[transform,filter] hover:brightness-110 hover:rotate-[40deg] active:rotate-[180deg]" type="button" aria-label="刷新搜索结果" title="刷新搜索结果" hidden>

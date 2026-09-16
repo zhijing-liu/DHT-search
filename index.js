@@ -5,6 +5,7 @@
  *   GET /index.html       -> 返回 public/index.html
  *   /public              -> 静态资源（app.js / styles.css）
  *   GET /api/search        -> FTS5 检索接口（复用 db.js）
+ *   GET /api/latest        -> 最新入库列表（按入库顺序从新到旧，与检索/热词独立）
  *
  * 接口约定（GET /api/search）：
  *   q        必填，搜索关键词
@@ -20,7 +21,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cron from 'node-cron';
-import { createMagnetDb, normalizeSearchQuery, normalizeKeyword } from './src/db.js';
+import { createMagnetDb, normalizeSearchQuery, normalizeLatestQuery, normalizeKeyword } from './src/db.js';
 import { createSearchExecutor } from './src/searchPool.js';
 import { createAccessControl } from './src/accessControl.js';
 import { isCompiledExe } from './src/db-driver.js';
@@ -251,38 +252,58 @@ function describeSearch(s) {
   return `q="${s.query}" 模式=${s.by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${s.sortBy ?? 'id'}/${s.order}`;
 }
 
-app.get('/api/search', apiHandler(async (req, res) => {
-  // 参数只归一化这一次：缓存键、worker 派参、日志描述全部由这一个对象派生。
-  // 注意 HTTP 参数名是 q，而领域字段名是 query，在此处完成这唯一的命名映射；
-  // req.query 的值可能是字符串也可能是数组，normalizeSearchQuery 统一收敛为安全类型。
-  const s = normalizeSearchQuery({ ...req.query, query: req.query.q });
-  if (!s.query) {
-    return res.status(400).json({ error: 'query 不能为空' });
-  }
+/**
+ * 「最新入库」缓存键：首元素用哨兵字符串而非查询词，与搜索键（首元素恒为查询词）
+ * 在结构上不可能相撞——两边数组长度也不同（8 vs 3）。
+ * 该接口只有分页，故键里只有 limit / offset（结果固定按 id 倒序）。
+ */
+function latestCacheKey(s) {
+  return JSON.stringify(['__latest__', s.limit, s.offset]);
+}
 
-  const key = searchCacheKey(s);
+/** 「最新入库」日志描述串 */
+function describeLatest(s) {
+  return `最新入库 limit=${s.limit} offset=${s.offset}`;
+}
+
+/**
+ * 查询类请求的统一执行管线（/api/search 与 /api/latest 共用）。
+ *
+ * 职责：查缓存 → 派发搜索子进程 → 客户端断开时取消 → 回写缓存与响应。
+ * 两个接口的差异只有「参数归一化、缓存键、子进程模式（params.mode）、是否可缓存」，
+ * 全部由调用方传入，本函数不感知具体业务。
+ *
+ * 为什么必须放进子进程执行：better-sqlite3 / bun:sqlite 是同步 API，
+ * 客户端断开时只有 SIGKILL 整个进程才能真正中断正在执行的同步 SQLite 查询
+ * （线程 terminate() 无效，见 src/searchPool.js 文件头）。
+ *
+ * @param {import('express').Request}  req
+ * @param {import('express').Response} res
+ * @param {object} opts
+ * @param {object}  opts.params     派发给搜索子进程的参数（已归一化；带 mode 时切换任务类型）
+ * @param {string}  opts.key        本次结果的缓存键（不同接口必须互不冲突）
+ * @param {string}  opts.describe   日志描述串
+ * @param {boolean} [opts.cacheable=true] 结果是否写入缓存（体量过大的整集拉取应传 false）
+ */
+async function runQuery(req, res, { params, key, describe, cacheable = true }) {
   const cached = searchCache.get(key);
   if (cached) {
     markCacheHit();
-    log.cache('HIT', describeSearch(s));
+    log.cache('HIT', describe);
     // 缓存里已是序列化好的 JSON 字符串，直接回写，省掉一次完整 stringify
     res.type('application/json');
     return res.send(cached);
   }
   markCacheMiss();
-  log.cache('MISS', describeSearch(s));
+  log.cache('MISS', describe);
 
-  // 把检索放进独立子进程执行；客户端断开时 SIGKILL 该进程，直接中断其正在执行的
-  // 同步 SQLite 查询——这是「关页面即停」唯一有效的手段（线程 terminate 无效，见 searchPool.js）。
-  // s 已归一化，且归一化是幂等的，子进程侧可直接使用。
-  const job = searchExecutor.run(s);
+  const job = searchExecutor.run(params);
 
   /** 客户端已断开：丢弃结果、不缓存、不响应（响应已无法送达） */
-  const logCancelled = () =>
-    log.cancel(`客户端断开，已取消检索 ${describeSearch(s)}`);
+  const logCancelled = () => log.cancel(`客户端断开，已取消检索 ${describe}`);
 
   let aborted = false;
-  // 客户端断开（关闭页面 / 中止请求 / 新一轮搜索取消旧请求）时：
+  // 客户端断开（关闭页面 / 中止请求 / 新一轮查询取消旧请求）时：
   // 1) 标记 aborted，避免正常分支再写响应 / 缓存；
   // 2) 立即 SIGKILL 该搜索子进程——由操作系统回收进程，其中正在执行的同步 SQLite 查询随之中断。
   // 用 req 的 close 而非仅靠 res 的 close：Express 5 下 res.close 在 keep-alive 正常响应完成后
@@ -306,9 +327,7 @@ app.get('/api/search', apiHandler(async (req, res) => {
       return;
     }
     const body = JSON.stringify(result);
-    // 整集拉取（limit=all）的结果体量远大于分页结果，不进缓存，
-    // 避免一次请求就把整个缓存预算吃掉
-    if (s.limit !== -1) searchCache.set(key, body);
+    if (cacheable) searchCache.set(key, body);
     try {
       res.type('application/json').send(body);
     } catch {
@@ -323,6 +342,38 @@ app.get('/api/search', apiHandler(async (req, res) => {
     }
     throw e; // 交给 apiHandler 统一处理：默认 500，排队满/超时经 err.status 升级为 503
   }
+}
+
+app.get('/api/search', apiHandler(async (req, res) => {
+  // 参数只归一化这一次：缓存键、worker 派参、日志描述全部由这一个对象派生。
+  // 注意 HTTP 参数名是 q，而领域字段名是 query，在此处完成这唯一的命名映射；
+  // req.query 的值可能是字符串也可能是数组，normalizeSearchQuery 统一收敛为安全类型。
+  const s = normalizeSearchQuery({ ...req.query, query: req.query.q });
+  if (!s.query) {
+    return res.status(400).json({ error: 'query 不能为空' });
+  }
+  await runQuery(req, res, {
+    params: s, // s 已归一化且归一化幂等，子进程侧可直接使用
+    key: searchCacheKey(s),
+    describe: describeSearch(s),
+    // 整集拉取（limit=all）的结果体量远大于分页结果，不进缓存，
+    // 避免一次请求就把整个缓存预算吃掉
+    cacheable: s.limit !== -1,
+  });
+}));
+
+/**
+ * 最新入库列表：直接遍历副本表，按 id 倒序（即表倒序 / 入库顺序从新到旧）返回一页。
+ * 与检索完全独立——没有关键词、不经过 FTS、不参与热词与相关度，也不提供排序与过滤。
+ * 参数只有分页：limit / offset
+ */
+app.get('/api/latest', apiHandler(async (req, res) => {
+  const s = normalizeLatestQuery(req.query);
+  await runQuery(req, res, {
+    params: { ...s, mode: 'latest' },
+    key: latestCacheKey(s),
+    describe: describeLatest(s),
+  });
 }));
 
 /** 手动全量重建影子索引（在 worker 线程 / 子进程中执行，重建期间检索仍可用） */

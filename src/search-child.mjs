@@ -59,12 +59,15 @@ function main() {
   setPragma(rdb, 'temp_store', 'MEMORY');
   const dbRO = createDrizzle(rdb);
 
-  const { searchMagnetsSync } = buildSearchApi(dbRO);
+  const { searchMagnetsSync, listLatestSync } = buildSearchApi(dbRO);
 
   process.on('message', (msg) => {
     const { id, params } = msg;
     try {
-      const result = searchMagnetsSync(params);
+      // params.mode 是唯一的任务类型开关（缺省为关键词检索）：
+      //   'latest' → 最新入库列表（不经过 FTS，按入库顺序从新到旧）
+      //   其他/缺省 → FTS5 模糊或 infohash 精确检索
+      const result = params?.mode === 'latest' ? listLatestSync(params) : searchMagnetsSync(params);
       process.send({ id, type: 'result', result });
     } catch (e) {
       process.send({

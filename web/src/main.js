@@ -45,9 +45,20 @@ const PAGE_BTN_CLASS =
   'enabled:hover:border-accent disabled:opacity-40 disabled:cursor-not-allowed ' +
   '[&.active]:grad-brand [&.active]:border-transparent [&.active]:text-white';
 const PAGE_NAV_CLASS = 'inline-flex items-center justify-center size-9 p-0 box-border';
-const PAGE_DOTS_CLASS = 'text-muted px-1.5 py-2';
+/** 数字页码：与上一页/下一页同为 36px 高的方型按钮（高度写死，避免被文字行高撑高） */
+const PAGE_NUM_CLASS = 'inline-flex items-center justify-center h-9 min-w-9 px-2 text-sm box-border';
+/** 省略号：与按钮同高、垂直居中 */
+const PAGE_DOTS_CLASS = 'inline-flex items-center justify-center h-9 px-1.5 text-muted box-border';
 
 const state = {
+  /**
+   * 当前视图：'search'（关键词检索 + 热词榜）| 'latest'（最新入库）。
+   * 两者是**整体切换**的两套视图，共用同一份结果列表、分页、排序与大小筛选，
+   * 差别只有：搜索走 /api/search（必须有关键词）、最新入库走 /api/latest（无搜索框，
+   * 按入库顺序倒序）；无关键词时搜索视图额外展示热词榜。
+   * 状态经地址栏的 view 参数区分（view=latest；缺省即 search），可刷新 / 分享 / 后退。
+   */
+  mode: 'search',
   query: '',
   page: 1,
   /** 每页条数（10-200，自由输入，由 #pageSize 控件控制） */
@@ -76,8 +87,6 @@ let reqSeq = 0;
 let abortController = null;
 /** 是否正在搜索（蒙层显示中）：用于阻止重复请求 */
 let isSearching = false;
-/** 浏览器前进/后退还原期间置 true，期间所有 URL 更新只 replaceState，不新增历史记录 */
-let suppressPush = false;
 
 const el = {
   q: document.getElementById('q'),
@@ -103,7 +112,10 @@ const el = {
   pagerInfo: document.getElementById('pagerInfo'),
   pageSize: document.getElementById('pageSize'),
   jumpPage: document.getElementById('jumpPage'),
-  hotView: document.getElementById('hotView'),
+  browseView: document.getElementById('browseView'),
+  tabSearch: document.getElementById('tabSearch'),
+  tabLatest: document.getElementById('tabLatest'),
+  searchBar: document.getElementById('searchBar'),
   editToggle: document.getElementById('editToggle'),
   hotWords: document.getElementById('hotWords'),
   blacklistPanel: document.getElementById('blacklistPanel'),
@@ -196,21 +208,26 @@ function renderItem(item) {
   return card;
 }
 
-/** 渲染空状态提示 */
-function renderEmpty(message) {
+/** 向指定容器渲染空状态提示 */
+function renderEmpty(container, message) {
   const empty = document.createElement('p');
   empty.className = EMPTY_CLASS;
   empty.textContent = message;
-  el.results.appendChild(empty);
+  container.appendChild(empty);
 }
 
-function renderResults(items) {
-  el.hotView.hidden = true;
+/**
+ * 渲染结果列表（搜索与「最新入库」共用同一容器与卡片）。
+ * @param {Array} items 后端返回的条目
+ * @param {boolean} [latest] 是否最新入库视图（仅空态文案不同）
+ */
+function renderResults(items, latest = false) {
+  el.browseView.hidden = true;
   el.results.hidden = false;
   el.refreshBtn.hidden = false;
   el.results.replaceChildren();
   if (!items.length) {
-    renderEmpty('没有找到匹配的结果');
+    renderEmpty(el.results, latest ? '暂无入库记录' : '没有找到匹配的结果');
     return;
   }
   const frag = document.createDocumentFragment();
@@ -260,15 +277,72 @@ function renderHotWords(items) {
   }
 }
 
-/** 渲染热词视图（无搜索内容时的默认视图，数据已就绪时调用） */
-function renderHotWordsView() {
+/* ---------- 视图切换（搜索 / 最新入库） ---------- */
+
+/**
+ * 把两份视图的差异同步到界面上。
+ *
+ * 两套视图共用同一套结果列表与分页，差别只有：
+ *   - 搜索走 /api/search：搜索框 + 排序 + 大小筛选 + 无关键词时的热词榜；
+ *   - 最新入库走 /api/latest：只是把表倒过来看——**只有分页，固定按 id 倒序**，
+ *     因此搜索框、排序组、大小筛选一律隐去。
+ */
+function syncModeUi() {
+  const latest = state.mode === 'latest';
+  el.tabSearch.classList.toggle('active', !latest);
+  el.tabLatest.classList.toggle('active', latest);
+  el.tabSearch.setAttribute('aria-selected', String(!latest));
+  el.tabLatest.setAttribute('aria-selected', String(latest));
+  // 检索栏（搜索框 + 排序 + 大小筛选）整条都是检索视图专属：最新入库没有关键词，
+  // 也不提供排序与过滤（固定 id 倒序＝表倒序），故整条隐去——设置按钮已移到顶栏，
+  // 不在这条里，所以不必再逐块控制显隐
+  // （输入框里的文本原样保留，切回搜索时可直接复用）
+  el.searchBar.hidden = latest;
+  if (latest) closeSuggestions();
+  const title = latest ? '刷新最新入库' : '刷新搜索结果';
+  el.refreshBtn.title = title;
+  el.refreshBtn.setAttribute('aria-label', title);
+}
+
+/** 切换视图（切换本身也是一次可后退的视图变更，记入浏览器历史） */
+function switchMode(mode) {
+  const next = mode === 'latest' ? 'latest' : 'search';
+  if (state.mode === next) return;
+  state.mode = next;
+  state.page = 1;
+  state.total = 0;
+  state.tokens = [];
+  // 最新入库不携带关键词（URL 里也就没有 q），故同步清空 state.query；
+  // 输入框 DOM 里的文本仍保留，切回搜索时会重新采用
+  if (next === 'latest') state.query = '';
+  syncModeUi();
+
+  if (next === 'latest') {
+    updateUrl('push'); // 先落 URL 再取数据：结果回来时 updateUrl 判等直接返回，不会重复压记录
+    fetchPage('replace');
+    return;
+  }
+  const q = el.q.value.trim();
+  if (q) {
+    state.query = q;
+    state.tokens = isInfohash(q) ? [] : extractTokens(q);
+    fetchPage('push');
+  } else {
+    updateUrl('push');
+    showBrowseView();
+  }
+}
+
+/** 渲染「搜索视图 + 无关键词」的浏览区：热词榜（编辑模式下附带黑名单面板） */
+function renderBrowseView() {
+  if (state.mode !== 'search') return; // 热词榜只属于搜索视图（双保险，调用方本已按 mode 分流）
   setLoading(false);
   el.pagerRow.hidden = true;
   el.pager.hidden = true;
   el.pagerInfo.textContent = '';
   el.results.hidden = true;
   el.refreshBtn.hidden = true;
-  el.hotView.hidden = false;
+  el.browseView.hidden = false;
   el.blacklistPanel.hidden = !state.editMode;
   renderHotWords(state.hotItems || []);
 }
@@ -345,13 +419,13 @@ async function removeFromBlacklist(term) {
   }
 }
 
-/** 无搜索内容时展示热词视图（数据未加载则先拉取） */
-function showHotWords() {
+/** 搜索视图、无关键词时展示浏览区（热词榜）；热词未加载则先拉取 */
+function showBrowseView() {
   if (state.hotItems === null) {
-    loadHotData();
+    loadHotData(); // 拉取完成后自行渲染，避免先闪一下「暂无热词数据」
     return;
   }
-  renderHotWordsView();
+  renderBrowseView();
 }
 
 /** 一次拉取热词榜：前 200 条作为默认视图，全部用于输入框下拉提示 */
@@ -366,7 +440,8 @@ async function loadHotData() {
     state.hotItems = [];
     state.hotSuggestions = [];
   }
-  if (!state.query) renderHotWordsView();
+  // 仅搜索视图、且当前无关键词时才以此为准渲染；最新入库视图不展示热词榜
+  if (state.mode === 'search' && !state.query) renderBrowseView();
 }
 
 /* ---------- 输入框下拉提示（搜索引擎式自动补全） ---------- */
@@ -541,7 +616,8 @@ function renderPager(totalPages) {
       b.className = `${PAGE_BTN_CLASS} ${PAGE_NAV_CLASS}`;
     } else {
       b.textContent = label;
-      b.className = `${PAGE_BTN_CLASS} px-2.5 py-2`;
+      // 数字页码与图标按钮同高同宽（方形）；三位数页码才允许被撑宽，避免数字被挤
+      b.className = `${PAGE_BTN_CLASS} ${PAGE_NUM_CLASS}`;
     }
     b.setAttribute('aria-label', opts.ariaLabel || label);
     if (opts.active) b.classList.add('active');
@@ -598,10 +674,21 @@ function cancelSearch() {
   showToast('已取消搜索');
 }
 
-/* ---------- 真服务端分页：每次查询/排序/翻页都从后端按页拉取 ---------- */
+/* ---------- 真服务端分页：两套视图共用同一条拉取/渲染/分页链路 ---------- */
 
-async function fetchPage(historyMode = 'replace') {
-  if (!state.query) return;
+/**
+ * 按当前页拉取一页结果并渲染（搜索与「最新入库」共用）。
+ *
+ * 两者的差别只有**接口与关键词**：搜索走 /api/search 且必须有关键词；
+ * 最新入库走 /api/latest、不传关键词（后端按入库顺序即 id 倒序返回）。
+ * 排序、大小筛选、每页条数、分页条、结果卡片全部复用同一套状态与渲染。
+ *
+ * @param {'push'|'replace'} [historyMode='push'] 本次视图变更是否记入浏览器历史。
+ *   默认 push：翻页/改每页条数等都应能被后退键还原（见 updateUrl 的说明）。
+ */
+async function fetchPage(historyMode = 'push') {
+  const latest = state.mode === 'latest';
+  if (!latest && !state.query) return; // 搜索视图无关键词时不请求（展示热词榜）
   const mySeq = ++reqSeq; // 丢弃过期响应，避免快速翻页时乱序覆盖
 
   // 取消上一次仍在进行的请求，避免重复/叠加请求
@@ -609,32 +696,31 @@ async function fetchPage(historyMode = 'replace') {
   abortController = new AbortController();
   const signal = abortController.signal;
 
-  const hashMode = isInfohash(state.query);
-  const by = hashMode ? 'hash' : undefined;
   const pageSize = state.pageSize;
   const offset = (state.page - 1) * pageSize;
 
-  const params = new URLSearchParams({
-    q: state.query,
-    sortBy: el.sortGroup.sortBy,
-    order: el.sortGroup.order,
-    limit: String(pageSize),
-    offset: String(offset),
-  });
-  if (by) params.set('by', by);
-  // 大小范围筛选：下拉框固定档位，转换为字节传给后端
-  const { minBytes, maxBytes } = getSizeRangeBytes();
-  if (Number.isFinite(minBytes)) params.set('minSize', String(minBytes));
-  if (Number.isFinite(maxBytes)) params.set('maxSize', String(maxBytes));
+  // 最新入库只要分页：接口固定按 id 倒序（表倒序）返回，不传关键词 / 排序 / 过滤
+  const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) });
+  if (!latest) {
+    params.set('q', state.query);
+    params.set('order', el.sortGroup.order);
+    // 排序键：空串表示默认排序（按 id），此时不传该参数
+    if (el.sortGroup.sortBy) params.set('sortBy', el.sortGroup.sortBy);
+    if (isInfohash(state.query)) params.set('by', 'hash');
+    // 大小范围筛选：下拉框固定档位，转换为字节传给后端
+    const { minBytes, maxBytes } = getSizeRangeBytes();
+    if (Number.isFinite(minBytes)) params.set('minSize', String(minBytes));
+    if (Number.isFinite(maxBytes)) params.set('maxSize', String(maxBytes));
+  }
 
   setLoading(true);
   try {
-    const resp = await fetch(`api/search?${params}`, { signal });
+    const resp = await fetch(`${latest ? 'api/latest' : 'api/search'}?${params}`, { signal });
     const data = await resp.json();
     if (mySeq !== reqSeq) return; // 已有更新的请求，丢弃本次
     if (!resp.ok) {
       setLoading(false);
-      showToast(`查询失败：${data.error || resp.status}`);
+      showToast(`${latest ? '加载' : '查询'}失败：${data.error || resp.status}`);
       return;
     }
 
@@ -642,14 +728,12 @@ async function fetchPage(historyMode = 'replace') {
     const total = Number(data.total) || 0;
     state.total = total;
 
-    renderResults(items);
+    renderResults(items, latest);
 
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
-    const from = total === 0 ? 0 : offset + 1;
-    const to = Math.min(offset + pageSize, total);
     setLoading(false);
     el.pagerRow.hidden = false;
-    el.pagerInfo.textContent = `共 ${total} 条结果`;
+    el.pagerInfo.textContent = latest ? `共 ${total} 条` : `共 ${total} 条结果`;
 
     renderPager(totalPages);
     updateUrl(historyMode);
@@ -665,41 +749,69 @@ async function fetchPage(historyMode = 'replace') {
 
 /* ---------- URL 状态同步 ---------- */
 
-/** 把当前 q / sortBy / order / page 写回地址栏，便于刷新保持与分享。
- *  historyMode='push' 时新增一条浏览器历史记录（搜索内容变化时）；
- *  'replace'（默认）仅改写 URL，不新增历史（排序/筛选/翻页等保持同查询的变更）。 */
-function updateUrl(historyMode = 'replace') {
-  if (suppressPush) historyMode = 'replace';
+/**
+ * 把当前视图状态写回地址栏，便于刷新保持、分享链接，以及用浏览器前进/后退来回切换。
+ *
+ * 状态分两处承载，各司其职：
+ *   - **hash**：视图类型（切换按钮）——`#latest` 为最新入库，无 hash 即搜索视图；
+ *   - **query**：该视图内的检索状态——q / sortBy / order / page / pageSize / sizeRange。
+ * 视图放 hash、其余放 query，两者互不干扰：切视图不必重排 query 参数，搜索链接也不会
+ * 因为一个视图参数而失效（旧链接无 hash，天然落在搜索视图）。
+ *
+ * historyMode='push'（默认）为每一次「可感知的视图变更」新增一条历史记录——
+ * 视图切换、关键词、排序、大小筛选、翻页、每页条数都算，于是后退键能一步步回到上一个视图；
+ * 'replace' 仅改写 URL 不记历史，只用于两类场景：
+ *   - 前进/后退还原（restoreFromUrl，否则历史栈原地打转，退不出去）；
+ *   - 原地重取（刷新按钮、同步/重建后的重搜），视图并未真正变化。
+ */
+function updateUrl(historyMode = 'push') {
   const params = new URLSearchParams();
-  if (state.query) params.set('q', state.query);
-  if (el.sortGroup.sortBy) params.set('sortBy', el.sortGroup.sortBy);
-  if (el.sortGroup.order !== 'desc') params.set('order', el.sortGroup.order);
+  // 关键词 / 排序 / 大小筛选都是检索视图专属的状态（最新入库固定 id 倒序、不做过滤），
+  // 故只在搜索视图下写入 URL；分页参数两套视图共用
+  if (state.mode === 'search') {
+    if (state.query) params.set('q', state.query);
+    if (el.sortGroup.sortBy) params.set('sortBy', el.sortGroup.sortBy);
+    if (el.sortGroup.order !== 'desc') params.set('order', el.sortGroup.order);
+    if (el.sizeRange.value !== 'all') params.set('sizeRange', el.sizeRange.value);
+  }
   if (state.page > 1) params.set('page', String(state.page));
   if (state.pageSize !== 20) params.set('pageSize', String(state.pageSize));
-  if (el.sizeRange.value !== 'all') params.set('sizeRange', el.sizeRange.value);
   const qs = params.toString();
-  const url = qs ? `?${qs}` : location.pathname;
-  if (historyMode === 'push') history.pushState(null, '', url);
-  else history.replaceState(null, '', url);
+  const hash = state.mode === 'latest' ? '#latest' : '';
+  // 一律以「含当前 pathname」的完整相对 URL 比较与写入：pushState 传 `?qs` 时浏览器
+  // 会自动补上当前路径，但字符串比较不会——不补路径的话「URL 未变」永远判不成立。
+  // 用 location.pathname 而非写死 '/' 也顺带保留了 WEB_BASE_PATH 反代子路径。
+  const next = `${location.pathname}${qs ? `?${qs}` : ''}${hash}`;
+  // 目标 URL 与当前完全一致时直接返回：点击已选中的排序、重复触发同一次查询
+  // 都没有产生新的视图，压一条重复记录只会让后退键多点一次空操作。
+  if (next === `${location.pathname}${location.search}${location.hash}`) return;
+  if (historyMode === 'push') history.pushState(null, '', next);
+  else history.replaceState(null, '', next);
 }
 
 /* ---------- 搜索 ---------- */
 
-async function doSearch(resetPage = true) {
+/**
+ * 发起一次检索。
+ * @param {boolean} [resetPage=true] 是否回到第 1 页（换关键词 / 改排序 / 改筛选都要回第 1 页）
+ * @param {'push'|'replace'} [historyMode='push'] 是否把这次变更记入浏览器历史。
+ *   默认 push——关键词、排序、大小筛选的变更都各自成为一条历史记录；
+ *   只有「原地重取」（刷新按钮、同步/重建后的重搜）才传 'replace'。
+ */
+async function doSearch(resetPage = true, historyMode = 'push') {
   // 蒙层显示中（请求进行中）忽略新的搜索触发，防止重复请求
   if (isSearching) return;
+  // 关键词检索只属于搜索视图：最新入库视图下没有搜索框，也不接受关键词
+  if (state.mode !== 'search') return;
   closeSuggestions();
   const newQuery = el.q.value.trim();
   syncClearBtn();
   if (!newQuery) {
-    // 没有搜索内容时展示热词视图
+    // 没有搜索内容时回到浏览区（热词榜）
     showToast('请输入搜索关键词');
-    showHotWords();
+    showBrowseView();
     return;
   }
-  // 仅当搜索内容相比上一次发生变化时，才新增一条浏览器历史记录；
-  // 排序 / 筛选 / 翻页 / 刷新等保持同一查询的变更只改写 URL，不新增历史记录
-  const queryChanged = newQuery !== state.query;
   if (resetPage) state.page = 1;
 
   state.query = newQuery;
@@ -708,8 +820,8 @@ async function doSearch(resetPage = true) {
   const hashMode = isInfohash(state.query);
   state.tokens = hashMode ? [] : extractTokens(state.query);
 
-  // 每次查询/排序变更都从后端按页拉取（真服务端分页）
-  await fetchPage(queryChanged ? 'push' : 'replace');
+  // 每次查询/排序/筛选变更都从后端按页拉取（真服务端分页）
+  await fetchPage(historyMode);
 }
 
 // 输入框值变化（失焦触发 change）：去除前后空格后有值则搜索，空值则回到热词视图
@@ -747,7 +859,7 @@ el.q.addEventListener('blur', () => setTimeout(closeSuggestions, 150));
 /* ---------- 排序交互 ---------- */
 
 el.sortGroup.addEventListener('sort-change', () => {
-  doSearch();
+  doSearch(); // 排序控件只属于搜索视图（最新入库视图下整块隐藏）
 });
 
 /* ---------- 重建索引 ---------- */
@@ -763,10 +875,12 @@ async function doReindex() {
       showToast(`重建失败：${data.error || resp.status}`);
       return;
     }
-    // 索引已更新，沿用当前关键词重搜（无关键词则仅提示）
+    // 索引已更新：沿用当前视图原地重取（replace，视图没变，不新增历史记录）
     state.total = 0;
-    if (state.query) {
-      await doSearch();
+    if (state.mode === 'latest') {
+      await fetchPage('replace'); // 最新入库：重取当前页（服务端缓存已被重建清空）
+    } else if (state.query) {
+      await doSearch(true, 'replace'); // 搜索：沿用当前关键词重搜
     } else {
       showToast(`索引已重建，共索引 ${data.indexed} 条`);
     }
@@ -792,8 +906,11 @@ async function doSync() {
       showToast(`同步失败：${data.error || resp.status}`);
       return;
     }
-    if (state.query) {
-      await doSearch();
+    // 补录的新行会出现在「最新入库」最前：沿用当前视图原地重取
+    if (state.mode === 'latest') {
+      await fetchPage('replace');
+    } else if (state.query) {
+      await doSearch(true, 'replace'); // 视图未变，不新增历史记录
     } else {
       await loadCount();
     }
@@ -946,8 +1063,11 @@ el.syncBtn.addEventListener('click', async () => {
 });
 el.cancelSearchBtn.addEventListener('click', cancelSearch);
 
-/* ---------- 悬浮刷新按钮：重新发起当前搜索请求（保留页码） ---------- */
-el.refreshBtn.addEventListener('click', () => doSearch(false));
+/* ---------- 悬浮刷新按钮：按当前视图原地重取（保留页码，不新增历史记录） ---------- */
+el.refreshBtn.addEventListener('click', () => {
+  if (state.mode === 'latest') fetchPage('replace');
+  else doSearch(false, 'replace');
+});
 
 /* ---------- DOM 二次确认弹窗（替代浏览器原生 confirm） ---------- */
 let confirmResolve = null;
@@ -1001,6 +1121,11 @@ el.editToggle.addEventListener('change', () => {
   if (state.editMode) fetchBlacklist();
   renderHotWords(state.hotItems || []);
 });
+
+/* ---------- 视图切换：搜索 / 最新入库 ---------- */
+
+el.tabSearch.addEventListener('click', () => switchMode('search'));
+el.tabLatest.addEventListener('click', () => switchMode('latest'));
 
 /* 黑名单前端过滤 */
 el.blacklistFilter.addEventListener('input', () => {
@@ -1086,10 +1211,14 @@ function applyPageSize(raw) {
 
 /* ---------- 从 URL 恢复视图（刷新/分享链接可还原；前进/后退亦可还原） ---------- */
 
-/** 读取地址栏参数（首次加载与浏览器前进/后退共用） */
+/**
+ * 读取地址栏状态（首次加载与浏览器前进/后退共用）。
+ * 视图类型取自 hash（`#latest`），视图内的检索状态取自 query string。
+ */
 function readUrlParams() {
   const params = new URLSearchParams(location.search);
   return {
+    view: location.hash.replace(/^#/, ''),
     q: params.get('q'),
     sortBy: params.get('sortBy'),
     order: params.get('order'),
@@ -1099,54 +1228,91 @@ function readUrlParams() {
   };
 }
 
-/** 把地址栏参数应用到控件与 state（不发起请求） */
+/**
+ * 把地址栏参数应用到控件与 state（不发起请求）。
+ *
+ * 地址栏是视图状态的唯一来源：**缺省的参数必须显式回落到默认值**。
+ * 视图切换 / 排序 / 筛选 / 翻页都会写入历史记录，后退时可能回到「没有该参数」的那一条，
+ * 若此时只是「有值才覆盖」，会残留上一份状态，造成界面与地址栏不一致。
+ */
 function applyUrlParams(p) {
-  if (p.q) el.q.value = p.q;
-  if (p.sortBy) el.sortGroup.sortBy = p.sortBy;
-  if (p.order) el.sortGroup.order = p.order;
-  if (p.page) state.page = Math.max(1, parseInt(p.page, 10) || 1);
-  if (p.pageSize) applyPageSize(p.pageSize);
-  if (p.sizeRange && SIZE_RANGES.some((r) => r.value === p.sizeRange)) {
-    el.sizeRange.value = p.sizeRange;
+  state.mode = p.view === 'latest' ? 'latest' : 'search';
+  el.q.value = p.q || '';
+  state.page = p.page ? Math.max(1, parseInt(p.page, 10) || 1) : 1;
+  applyPageSize(p.pageSize || null);
+  // 关键词 / 排序 / 大小筛选只属于搜索视图：最新入库的 URL 里没有它们，
+  // 还原时也就不要动这些控件，免得把用户先前设好的检索偏好清掉
+  if (state.mode === 'search') {
+    el.sortGroup.sortBy = p.sortBy || '';
+    el.sortGroup.order = p.order === 'asc' ? 'asc' : 'desc';
+    el.sizeRange.value = SIZE_RANGES.some((r) => r.value === p.sizeRange) ? p.sizeRange : 'all';
   }
   syncClearBtn();
+  syncModeUi();
 }
 
-/** 首次加载：从地址栏还原视图（不新增历史记录） */
+/** 首次加载：从地址栏还原视图（replace，不新增历史记录） */
 function initFromUrl() {
   const p = readUrlParams();
   applyUrlParams(p);
-  if (p.q) {
-    state.query = p.q; // 预置，避免首屏误判为「内容变化」而多压一条历史
-    doSearch(false); // 保留 URL 中的页码，不重置为第 1 页
+  state.query = p.q || '';
+  // 最新入库总有一页数据可看；搜索视图则只在有关键词时请求（否则展示热词榜）
+  if (state.mode === 'latest') {
+    fetchPage('replace'); // 保留 URL 中的页码
+    return;
+  }
+  if (state.query) {
+    doSearch(false, 'replace'); // 保留 URL 中的页码，不重置为第 1 页
   }
 }
 
-/** 浏览器前进/后退：还原地址栏对应的搜索视图，但不新增历史记录 */
+/**
+ * 浏览器前进/后退（或地址栏 hash 变化）：还原地址栏对应的视图。
+ * 还原本身不能算「新的视图变更」，故显式传 'replace'——否则每一次后退都会
+ * 重新 push 一条记录，历史栈原地打转，后退键永远退不出去。
+ */
 function restoreFromUrl() {
   const p = readUrlParams();
   applyUrlParams(p);
-  suppressPush = true; // 还原期间禁止新增历史，避免把前进/后退本身又压成记录
+  if (state.mode === 'latest') {
+    state.query = '';
+    state.tokens = [];
+    fetchPage('replace');
+    return;
+  }
   if (p.q) {
-    state.query = p.q; // 预置，使 fetchPage 不误判为「内容变化」
+    state.query = p.q;
     state.tokens = isInfohash(p.q) ? [] : extractTokens(p.q);
     fetchPage('replace');
-  } else {
-    state.query = '';
-    state.page = 1;
-    state.total = 0;
-    state.tokens = [];
-    showHotWords();
+    return;
   }
-  suppressPush = false;
+  state.query = '';
+  state.page = 1;
+  state.total = 0;
+  state.tokens = [];
+  showBrowseView();
 }
-window.addEventListener('popstate', restoreFromUrl);
+
+// 视图切换/翻页都会改写 URL 并留下历史记录：
+//   - popstate 覆盖前进/后退（含 hash 历史导航）；
+//   - hashchange 覆盖「手工改地址栏 hash 后回车」这类同文档跳转。
+// 两者可能对同一次导航都触发，故用 lastHandledUrl 去重，避免重复请求。
+let lastHandledUrl = null;
+function onLocationChange() {
+  const url = `${location.pathname}${location.search}${location.hash}`;
+  if (url === lastHandledUrl) return;
+  lastHandledUrl = url;
+  restoreFromUrl();
+}
+window.addEventListener('popstate', onLocationChange);
+window.addEventListener('hashchange', onLocationChange);
 initFromUrl();
 
 /* ---------- 输入框清空：清空/删空后同步 URL 并回到热词视图 ---------- */
 
-/** 输入框已为空：重置搜索状态、移除 URL 中的全部搜索参数、回到热词视图 */
+/** 输入框已为空：重置搜索状态、从 URL 中移除关键词、回到热词视图 */
 function handleInputCleared() {
+  if (state.mode !== 'search') return; // 最新入库视图没有搜索框，不会走到这里
   const hadSearch = !!state.query;
   // 取消可能仍在进行中的搜索请求，并让其后到的响应自行丢弃，避免覆盖热词视图
   if (abortController) {
@@ -1158,8 +1324,10 @@ function handleInputCleared() {
   state.page = 1;
   state.tokens = [];
   state.total = 0;
-  history.replaceState(null, '', location.pathname); // 移除全部 query 参数
-  if (hadSearch) showHotWords();
+  // 用 updateUrl 而非直接 replaceState：只丢掉关键词，排序 / 每页条数 / 大小筛选
+  // 仍是界面上的当前值，URL 应与之一致（原地改写，不新增历史记录）
+  updateUrl('replace');
+  if (hadSearch) showBrowseView();
 }
 
 /** 根据输入框内容同步清空按钮的显隐 */
@@ -1225,6 +1393,7 @@ el.jumpPage.addEventListener('keydown', (e) => {
 el.jumpPage.addEventListener('focus', () => el.jumpPage.select());
 
 // 大小范围变化后重新搜索（仅在有查询词时；空查询回到热词视图）
+// 该筛选只属于搜索视图（最新入库视图下整块隐藏，固定 id 倒序）
 el.sizeRange.addEventListener('change', () => { if (state.query) doSearch(); });
 
 loadCount();

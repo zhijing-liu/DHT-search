@@ -18,7 +18,9 @@
  * 暴露能力：
  *   countMagnets()   —— 已索引条数
  *   searchMagnets()  —— 检索（FTS5 模糊 / infohash 精确），支持分页与排序
+ *   listLatest()     —— 最新入库列表（不经过 FTS，按入库顺序从新到旧）
  *   normalizeSearchQuery() —— 检索参数归一化，HTTP 层与数据层共用（幂等）
+ *   normalizeLatestQuery() —— 最新入库参数归一化，HTTP 层与数据层共用（幂等）
  *   normalizeKeyword()     —— 热词 / 过滤词归一化，HTTP 层与数据层共用
  *   reindex()        —— 全量重建影子索引（异步；Node 走 worker 线程，Bun 走子进程）
  *   rebuildSync()    —— 同上但在当前进程内同步执行（供 worker / 脚本使用）
@@ -102,6 +104,9 @@ const KEYWORD_SOURCE = 'name';
 const MIN_KEYWORD_LEN = 2;
 /** 热词过滤：纯数字 token（年份/大小等噪声）丢弃 */
 const NUMERIC_ONLY = /^\d+$/;
+
+/** 「最新入库」默认每批条数 */
+const DEFAULT_LATEST_LIMIT = 30;
 
 /* ------------------------------------------------------------------ */
 /* 工具函数                                                            */
@@ -195,6 +200,26 @@ export function normalizeSearchQuery(raw = {}) {
     minSize: toSize(source.minSize),
     maxSize: toSize(source.maxSize),
     limit: toLimit(source.limit),
+    offset: clampInt(source.offset, 0, 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+/**
+ * 「最新入库」参数归一化——**只有分页**。
+ *
+ * 该列表固定按 id 倒序（id 是源库自增主键/rowid，倒序即「最新入库的在最前」，
+ * 也就是把表倒过来看），不提供关键词、排序与过滤，避免把「看一眼最新入库了什么」
+ * 做成一个检索界面。
+ *
+ * @param {object} [raw] 原始参数（Express 的 req.query 或子进程转发对象）
+ * @returns {{ limit: number, offset: number }}
+ */
+export function normalizeLatestQuery(raw = {}) {
+  const source = raw ?? {};
+  const n = Number(source.limit);
+  return {
+    // 不支持「整集拉取」：本列表是浏览式的，一次最多 MAX_LIMIT 条，靠 offset 翻页
+    limit: Number.isFinite(n) && n > 0 ? clampInt(n, DEFAULT_LATEST_LIMIT, 1, MAX_LIMIT) : DEFAULT_LATEST_LIMIT,
     offset: clampInt(source.offset, 0, 0, Number.MAX_SAFE_INTEGER),
   };
 }
@@ -762,7 +787,31 @@ export function buildSearchApi(dbRO) {
     return { total, limit: effLimit, offset: effOffset, items };
   }
 
-  return { searchMagnetsSync };
+  /**
+   * 「最新入库」列表：不经过 FTS、不带任何条件，固定按 id 倒序取一段——
+   * 就是「把副本表倒过来看最新入库的几页」。
+   *
+   * 与 searchMagnetsSync 的区别：没有关键词与 MATCH，也不排序/过滤，
+   * 因此不存在「源库已删除但索引未清理的残留行」被 JOIN 剔除的机制
+   * （total 会略偏大，DHT 场景删除极少，可接受）。
+   *
+   * @param {object} [options] 见 normalizeLatestQuery（只有 limit / offset）
+   * @returns {{ total: number, limit: number, offset: number, items: Array }}
+   */
+  function listLatestSync(options) {
+    const { limit, offset } = normalizeLatestQuery(options);
+    const total = Number(
+      dbRO.all(sql`SELECT count(*) AS total FROM ${sql.raw(DOCS_TABLE)}`)[0]?.total ?? 0
+    );
+    const items = dbRO.all(sql`
+      SELECT ${sql.raw(SELECT_COLUMNS)} FROM ${sql.raw(DOCS_TABLE)} m
+      ORDER BY m.id DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `).map(mapRow);
+    return { total, limit, offset, items };
+  }
+
+  return { searchMagnetsSync, listLatestSync };
 }
 
 export function createMagnetDb(options = {}) {
@@ -1229,6 +1278,7 @@ export function createMagnetDb(options = {}) {
     sourcePath,
     countMagnets,
     searchMagnets: search.searchMagnetsSync,
+    listLatest: search.listLatestSync,
     topKeywords,
     listKeywordFilters,
     addKeywordFilter,

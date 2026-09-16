@@ -124,7 +124,7 @@ DHT-search/
 │   ├── vite.config.js         # 产物输出 ../public；dev 期 /api 代理到后端
 │   ├── package.json
 │   └── src/
-│       ├── main.js            # 主逻辑：搜索/分页/排序/热词/联想/URL 同步/重建/设置面板
+│       ├── main.js            # 主逻辑：搜索/分页/排序/热词/最新入库/联想/URL 与历史同步/重建/设置面板
 │       ├── components.js      # 自定义元素：结果卡片 / 文件树 / 排序控件等
 │       ├── file-tree.js       # 由扁平 [{path,size}] 构建可折叠目录树
 │       ├── util.js            # 共享纯函数（格式化、复制、高亮、RPC 推送等）
@@ -146,6 +146,8 @@ DHT-search/
 - **排序**：`fetchedAt`（抓取时间）、`totalSize`（体积）、`relevance`（bm25 相关度）；未指定则按 id。
 - **体积过滤**：按字节区间过滤（前端以 MB 输入）。
 - **真服务端分页**：每次查询/翻页/排序都按页从后端拉取，`total` 与结果始终一致。
+- **整体视图切换（搜索 / 最新入库）**：顶栏分段按钮切换两套视图。最新入库走 `/api/latest`，按 `id` 倒序（表倒序）列出最新入库的资源——**只有分页**，不提供关键词、排序与过滤，结果列表与服务端分页与搜索视图复用同一套实现。
+- **URL 状态同步**：视图类型记在 **hash**（`#latest` 为最新入库，无 hash 即搜索），视图内的关键词 / 排序 / 体积筛选 / 翻页 / 每页条数记在 **query string**；两者都会写回地址栏**并记入浏览器历史**，后退 / 前进可逐步还原任意视图。链接可直接分享或刷新保持（原地重取如「刷新按钮 / 同步重建后的重搜」不产生多余历史记录）。
 - **热门关键词榜**：构建索引时统计 `name` 中的合格 token（去单字、去纯数字、去噪声词），按文档频率降序。
 - **热词过滤词（黑名单）**：用户可维护噪声词清单（经种子脚本 / API / Web 界面导入导出），从热词榜与统计中剔除。
 - **输入联想**：基于热词的「完全相等 > 前缀 > 包含 > 模糊（Levenshtein）」分级匹配。
@@ -299,6 +301,7 @@ dist/
 | GET | `/` | 重定向到 `/index.html` |
 | GET | `/index.html`、 `/public/*` | 前端静态资源（构建产物） |
 | GET | `/api/search` | 搜索（见下） |
+| GET | `/api/latest` | 最新入库列表（不经 FTS，按入库顺序从新到旧；前端「最新入库」视图使用，见下） |
 | GET | `/api/count` | 已索引条数 `{ count }`（读内存缓存，不扫表） |
 | GET | `/api/hot?limit=` | 热词榜 `{ items: [{term,doc_count,occurrences}] }` |
 | GET | `/api/hot/filter` | 热词过滤词列表 |
@@ -323,6 +326,17 @@ dist/
 
 返回：`{ total, limit, offset, items: [{ id, name, infohash, magnet, files, totalSize, fetchedAt }], truncated? }`
 （`files` 为已解析的 `[{ path, size }]` 数组；整集拉取超出 `MAX_RESULTS` 时带 `truncated: true`。）
+
+### `GET /api/latest` 参数
+只有分页——结果**固定按 `id` 倒序**（`id` 是源库自增主键，倒序即入库顺序从新到旧，等价于把表倒过来看），不提供关键词 / 排序 / 过滤：
+
+| 参数 | 说明 |
+|------|------|
+| `limit` | 每页条数（钳制 1..`MAX_LIMIT`，缺省 30；不支持 `all`） |
+| `offset` | 分页偏移 |
+
+返回：`{ total, limit, offset, items }`（字段同 `/api/search`）。
+与检索完全独立：不带关键词、不经过 FTS，也不参与热词与相关度；走同一套「搜索子进程 + 客户端断开即取消 + 结果缓存」机制（`SYNC_CRON` / `/api/sync` / `/api/reindex` 补录或重建后缓存自动失效）。
 
 客户端中途断开（关页面 / 前端发起新搜索取消旧请求）时，服务端会立即取消对应检索（排队中直接移除、执行中 `SIGKILL` 子进程），不写缓存、不响应。
 
