@@ -6,9 +6,26 @@
   <title>DHT Search</title>
   <script type="module" src="/src/main.js"></script>
 </head>
-<!-- 字号必须挂在 body 上：挂到 html 会让所有 rem 工具类（间距/圆角/尺寸）整体缩放，布局失真。
+<!-- 页面由 Alpine 驱动：body 上的 x-data 提供全部状态与动作（见 src/app.js），
+     其余指令只做声明式绑定——x-show 控制显隐、x-for 渲染列表、@click/@input 绑定事件、
+     :class/:attr 同步属性。x-cloak 的元素在 Alpine 启动前保持隐藏，避免首屏闪现。
+     字号必须挂在 body 上：挂到 html 会让所有 rem 工具类（间距/圆角/尺寸）整体缩放，布局失真。
      preflight 已重置 body 的 margin。 -->
-<body class="font-sans text-[clamp(13px,calc(12px_+_0.3vw),15px)] text-fg h-screen flex flex-col overflow-hidden bg-[linear-gradient(160deg,var(--color-canvas),var(--color-surface))]">
+     <!--
+     DOM 契约：本文件里的 id 与部分「行为契约类名」已不再被 web/src 查询
+     （src 下 getElementById / querySelector 计数为 0，交互全走 Alpine 指令与 $refs），
+     但它们是对外稳定的钩子——DevTools 调试、e2e 脚本、外部注入脚本都按名字定位，
+     因此**不要删除或改名**：
+     id：#tabSearch #tabLatest #countBadge #q #clearBtn #suggestions #sortGroup #sizeRange
+        #browseView #editToggle #hotWords #blacklistFilter #blacklistList #results #pager
+        #pagerInfo #jumpPage #pageSize #loadingOverlay #cancelSearchBtn #statsHud #settingsDialog
+        #confirmDialog #reindexProgress …（完整清单见本文件各 id 属性）
+     类名：.title .magnet-text .copy .files-row .detail .meta .sb .ob .seg .k .v .dlg-*
+     另外 <magnet-card> / <result-list> / <magnet-files> 这些自定义元素标签名同样不能改：
+     src/styles/app.css 里 magnet-card:has(dialog[open]) 依赖标签名选择器。
+     -->
+<body x-data="searchPage" @keydown.escape.window="onEscape()"
+  class="font-sans text-[clamp(13px,calc(12px_+_0.3vw),15px)] text-fg h-screen flex flex-col overflow-hidden bg-[linear-gradient(160deg,var(--color-canvas),var(--color-surface))]">
   <!-- 顶栏：三段式「品牌区 / 居中视图切换 / 右侧状态与操作」。
        所有控件统一 36px 高（h-9）、10px 圆角，纵向 items-center 对齐，
        避免此前 baseline 与 center 混用造成的参差。 -->
@@ -18,41 +35,67 @@
       <span class="text-xs text-muted whitespace-nowrap max-[900px]:hidden">基于 FTS5 全文检索</span>
     </div>
 
-    <!-- 全局视图切换：搜索（关键词检索 + 热词） / 最新入库（固定 id 倒序、只有分页）
-         视图类型记在地址栏 hash 上（#latest 为最新入库，无 hash 即搜索），可刷新/分享/后退。
+    <!-- 全局视图切换：搜索（关键词检索 + 热词） / 资源库（固定 id 倒序、只有分页）
+         视图类型记在地址栏 hash 上（#latest 为资源库，无 hash 即搜索），可刷新/分享/后退。
          mx-auto 让切换器落在两侧之间的中线上（左右各分走一半空白） -->
     <div class="mx-auto inline-flex items-stretch h-9 flex-none border border-line rounded-[10px] overflow-hidden bg-card" role="tablist" aria-label="视图切换">
-      <button id="tabSearch" type="button" role="tab" aria-selected="true"
+      <button id="tabSearch" type="button" role="tab" :aria-selected="mode === 'search'" :class="{ active: mode === 'search' }"
+        @click="switchMode('search')"
         class="inline-flex items-center px-3.5 border-0 border-r border-line bg-transparent text-muted text-[13px] font-medium whitespace-nowrap cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.05] [&.active]:bg-brand/[0.18] [&.active]:text-brand2 max-[480px]:px-2.5 max-[480px]:text-[12px]">搜索</button>
-      <button id="tabLatest" type="button" role="tab" aria-selected="false"
-        class="inline-flex items-center px-3.5 border-0 bg-transparent text-muted text-[13px] font-medium whitespace-nowrap cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.05] [&.active]:bg-brand/[0.18] [&.active]:text-brand2 max-[480px]:px-2.5 max-[480px]:text-[12px]">最新入库</button>
+      <button id="tabLatest" type="button" role="tab" :aria-selected="mode === 'latest'" :class="{ active: mode === 'latest' }"
+        @click="switchMode('latest')"
+        class="inline-flex items-center px-3.5 border-0 bg-transparent text-muted text-[13px] font-medium whitespace-nowrap cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.05] [&.active]:bg-brand/[0.18] [&.active]:text-brand2 max-[480px]:px-2.5 max-[480px]:text-[12px]">资源库</button>
     </div>
 
     <div class="flex-none flex items-center gap-2 min-w-0">
-      <span id="countBadge"
+      <span id="countBadge" x-text="countText"
         class="inline-flex items-center h-9 px-3 rounded-[10px] border border-line bg-brand/[0.12] text-xs text-muted whitespace-nowrap tabular-nums max-[768px]:h-8 max-[768px]:px-2.5 max-[768px]:text-[11px] max-[520px]:hidden">加载中…</span>
-      <!-- 设置按钮放在顶栏右侧：它不属于检索条件，最新入库视图隐去整条检索栏时仍然可用 -->
-      <button id="settingsBtn" class="flex-none inline-flex items-center justify-center size-9 p-0 rounded-[10px] border border-line bg-card text-muted cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.08] max-[768px]:size-8" type="button" aria-label="设置" title="设置">
+      <!-- 设置按钮放在顶栏右侧：它不属于检索条件，资源库视图隐去整条检索栏时仍然可用 -->
+      <button id="settingsBtn" @click="openSettings()" class="flex-none inline-flex items-center justify-center size-9 p-0 rounded-[10px] border border-line bg-card text-muted cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.08] max-[768px]:size-8" type="button" aria-label="设置" title="设置">
         <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       </button>
     </div>
   </header>
 
   <main class="flex-1 flex flex-col min-h-0 items-center w-full p-[clamp(12px,2vw,20px)] max-[480px]:p-[10px_8px]">
-    <!-- 检索栏（搜索框 + 排序 + 大小筛选）：整条都是检索视图专属，最新入库时整体隐去 -->
-    <section id="searchBar" class="flex-none flex gap-2.5 flex-wrap items-stretch h-11 min-w-0 max-[768px]:h-auto max-[768px]:gap-2 max-[480px]:flex-col max-[480px]:items-stretch">
+    <!-- 检索栏（搜索框 + 排序 + 大小筛选）：整条都是检索视图专属，资源库视图下整体隐去 -->
+    <section id="searchBar" x-show="mode === 'search'" x-cloak
+      class="flex-none flex gap-2.5 flex-wrap items-stretch h-11 min-w-0 max-[768px]:h-auto max-[768px]:gap-2 max-[480px]:flex-col max-[480px]:items-stretch">
       <div class="relative flex-none w-[40vw] min-w-0 h-full max-[768px]:h-10 max-[480px]:flex-1 max-[480px]:w-full">
-        <input id="q" type="text" placeholder="输入关键词搜索" autocomplete="off"
+        <input id="q" type="text" placeholder="输入关键词搜索" autocomplete="off" x-ref="q"
+          x-model="input" @input="onQueryInput()" @change="onQueryChange()" @blur="onQueryBlur()"
+          @keydown.enter="onEnterKey()" @keydown.arrow-down="moveSuggestion(1, $event)" @keydown.arrow-up="moveSuggestion(-1, $event)" @keydown.escape="onEscapeKey($event)"
           class="w-full h-full py-0 pr-10 pl-3.5 rounded-[10px] border border-line bg-card text-fg text-[15px] outline-none focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)] max-[480px]:pr-[38px] max-[480px]:pl-3" />
-        <button id="clearBtn" class="absolute top-1/2 right-2.5 -translate-y-1/2 inline-flex items-center justify-center size-6 p-0 rounded-full border-0 bg-transparent text-muted text-[0px] cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.08]" type="button" aria-label="清空搜索" title="清空搜索" hidden>
+        <button id="clearBtn" x-show="input.trim() !== ''" x-cloak @click="clearInput()" class="absolute top-1/2 right-2.5 -translate-y-1/2 inline-flex items-center justify-center size-6 p-0 rounded-full border-0 bg-transparent text-muted text-[0px] cursor-pointer transition-colors hover:text-fg hover:bg-white/[0.08]" type="button" aria-label="清空搜索" title="清空搜索">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
-        <div id="suggestions" class="absolute top-[calc(100%+6px)] left-0 right-0 z-50 max-h-[360px] overflow-y-auto bg-surface border border-line rounded-[10px] shadow-[0_10px_30px_rgba(0,0,0,0.4)] py-1.5 scrollbar-thin" role="listbox" aria-label="搜索建议" hidden></div>
+        <!-- 联想下拉：行内为高亮后的安全 HTML（见 util.highlightHtml） -->
+        <div id="suggestions" x-show="suggestOpen" x-cloak class="absolute top-[calc(100%+6px)] left-0 right-0 z-50 max-h-[360px] overflow-y-auto bg-surface border border-line rounded-[10px] shadow-[0_10px_30px_rgba(0,0,0,0.4)] py-1.5 scrollbar-thin" role="listbox" aria-label="搜索建议">
+          <template x-for="(s, i) in suggestionRows" :key="s.term">
+            <div class="flex items-center justify-between gap-3 px-3.5 py-2.5 cursor-pointer text-sm text-fg transition-colors hover:bg-brand/[0.16] [&.active]:bg-brand/[0.16]"
+              :class="{ active: i === activeSuggestion }"
+              x-effect="i === activeSuggestion && $el.scrollIntoView({ block: 'nearest' })"
+              @mousedown.prevent="applySuggestion(s.term)" @mouseenter="activeSuggestion = i">
+              <span class="overflow-hidden text-ellipsis whitespace-nowrap [&_mark]:bg-transparent [&_mark]:text-brand2 [&_mark]:font-semibold" x-html="s.html"></span>
+              <span class="shrink-0 text-xs text-muted whitespace-nowrap" x-text="s.countText"></span>
+            </div>
+          </template>
+        </div>
       </div>
-      <dht-sort-group id="sortGroup" class="inline-flex items-stretch gap-2 h-full max-[768px]:h-10 max-[480px]:self-end"></dht-sort-group>
+      <!-- 排序图标组：分段控件选排序键，右侧按钮切换升/降序 -->
+      <div id="sortGroup" class="inline-flex items-stretch gap-2 h-full max-[768px]:h-10 max-[480px]:self-end">
+        <div class="seg flex items-stretch h-full border border-line rounded-[10px] overflow-hidden bg-card">
+          <template x-for="k in sortKeys" :key="k.value">
+            <button type="button" :title="k.title" :aria-label="k.title" :class="{ active: sortBy === k.value }"
+              x-html="k.icon" @click="setSort(k.value)"
+              class="sb flex items-center justify-center w-[clamp(34px,4vw,40px)] h-full p-0 border-0 border-r border-line bg-transparent text-muted cursor-pointer transition-colors last:border-r-0 hover:text-fg [&.active]:bg-brand/[0.18] [&.active]:text-brand2"></button>
+          </template>
+        </div>
+        <button type="button" class="ob flex items-center justify-center w-[clamp(34px,4vw,40px)] h-full p-0 rounded-[10px] border border-line bg-card text-muted cursor-pointer transition-colors hover:text-fg" title="切换升序/降序" aria-label="切换升序/降序" x-html="orderIcon" @click="toggleOrder()"></button>
+      </div>
       <div class="flex items-center h-full max-[768px]:h-10 max-[480px]:self-end">
         <label for="sizeRange" class="sr-only">大小范围</label>
-        <select id="sizeRange" aria-label="大小范围"
+        <select id="sizeRange" aria-label="大小范围" x-model="sizeRange" @change="onSizeRangeChange()"
           class="h-full pr-7 pl-3 rounded-[10px] border border-line bg-card text-fg text-[15px] outline-none cursor-pointer select-caret focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)] max-[768px]:text-sm">
           <option value="all">全部</option>
           <option value="lt100mb">&lt;100MB</option>
@@ -64,12 +107,13 @@
       </div>
     </section>
 
-    <div id="settingsDialog" class="fixed inset-0 z-[1000] flex items-center justify-center p-4" hidden>
-      <div class="absolute inset-0 bg-black/60 backdrop-blur-[2px]" data-close="settings"></div>
+    <!-- 设置面板 -->
+    <div id="settingsDialog" x-show="settingsOpen" x-cloak class="fixed inset-0 z-[1000] flex items-center justify-center p-4">
+      <div class="absolute inset-0 bg-black/60 backdrop-blur-[2px]" @click="closeSettings()"></div>
       <div class="relative w-[min(420px,94vw)] p-0 border border-line rounded-[14px] text-fg bg-surface shadow-[0_24px_70px_rgba(0,0,0,0.55)] flex flex-col">
         <div class="flex items-center gap-2.5 px-[18px] py-3.5 border-b border-line">
           <h2 class="m-0 flex-1 text-base font-semibold">设置</h2>
-          <button id="settingsClose" class="flex-none inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-transparent text-fg cursor-pointer transition-colors hover:bg-white/[0.08]" type="button" aria-label="关闭" title="关闭">
+          <button id="settingsClose" @click="closeSettings()" class="flex-none inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-transparent text-fg cursor-pointer transition-colors hover:bg-white/[0.08]" type="button" aria-label="关闭" title="关闭">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
@@ -92,7 +136,7 @@
             <!-- 开关：隐藏原生 checkbox（peer sr-only），用 track/thumb 模拟 -->
             <label class="inline-flex items-center gap-2.5 mt-2.5 cursor-pointer select-none text-muted text-[13px]" title="开启后页面右下角常驻显示运行状态">
               <span>开启悬浮窗</span>
-              <input type="checkbox" id="statsToggle" class="peer sr-only" />
+              <input type="checkbox" id="statsToggle" class="peer sr-only" x-model="hudOn" @change="onHudToggle()" />
               <span class="relative flex-none w-10 h-[22px] rounded-full bg-line transition-colors peer-checked:grad-brand peer-checked:[&>span]:translate-x-[18px] peer-focus-visible:ring-[3px] peer-focus-visible:ring-accent/25">
                 <span class="absolute top-0.5 left-0.5 size-[18px] rounded-full bg-white transition-transform"></span>
               </span>
@@ -105,80 +149,169 @@
             <div class="text-sm font-medium">RPC 推送（aria2 / Motrix）</div>
             <div class="text-muted text-xs leading-[1.45]">将磁力链接推送到本地下载器；下载器需开启 JSON-RPC 并允许跨域</div>
             <div class="flex flex-col gap-2.5 mt-2.5">
-              <label class="flex flex-col gap-1.5 text-xs text-muted"><span class="text-xs text-muted">地址</span><input id="rpcUrl" type="text" placeholder="http://localhost:16800/jsonrpc" autocomplete="off" spellcheck="false" class="w-full box-border bg-canvas border border-line text-fg rounded-lg px-2.5 py-2 text-[13px] outline-none focus:border-accent" /></label>
-              <label class="flex flex-col gap-1.5 text-xs text-muted"><span class="text-xs text-muted">密钥</span><input id="rpcSecret" type="text" placeholder="可选，留空表示无密钥" autocomplete="off" spellcheck="false" class="w-full box-border bg-canvas border border-line text-fg rounded-lg px-2.5 py-2 text-[13px] outline-none focus:border-accent" /></label>
+              <label class="flex flex-col gap-1.5 text-xs text-muted"><span class="text-xs text-muted">地址</span><input id="rpcUrl" type="text" placeholder="http://localhost:16800/jsonrpc" autocomplete="off" spellcheck="false" x-model="rpc.url" @change="saveRpc()" class="w-full box-border bg-canvas border border-line text-fg rounded-lg px-2.5 py-2 text-[13px] outline-none focus:border-accent" /></label>
+              <label class="flex flex-col gap-1.5 text-xs text-muted"><span class="text-xs text-muted">密钥</span><input id="rpcSecret" type="text" placeholder="可选，留空表示无密钥" autocomplete="off" spellcheck="false" x-model="rpc.secret" @change="saveRpc()" class="w-full box-border bg-canvas border border-line text-fg rounded-lg px-2.5 py-2 text-[13px] outline-none focus:border-accent" /></label>
             </div>
           </div>
         </div>
       </div>
       <div class="flex gap-2.5 px-[18px] pt-3.5 pb-[18px] border-t border-line">
-        <button id="syncBtn" type="button" class="flex-1 px-4 py-[9px] rounded-lg border border-line grad-brand text-white text-[13px] font-medium cursor-pointer transition-[filter] hover:brightness-110 disabled:opacity-60 disabled:cursor-default disabled:brightness-100">同步索引</button>
-        <button id="reindexBtn" type="button" class="flex-1 px-4 py-[9px] rounded-lg border border-line grad-danger text-white text-[13px] font-medium cursor-pointer transition-[filter] hover:brightness-110 disabled:opacity-60 disabled:cursor-default disabled:brightness-100">重建索引</button>
+        <button id="syncBtn" type="button" @click="confirmSync()" :disabled="busy.sync" x-text="syncLabel"
+          class="flex-1 px-4 py-[9px] rounded-lg border border-line grad-brand text-white text-[13px] font-medium cursor-pointer transition-[filter] hover:brightness-110 disabled:opacity-60 disabled:cursor-default disabled:brightness-100">同步索引</button>
+        <button id="reindexBtn" type="button" @click="confirmReindex()" :disabled="busy.reindex" x-text="reindexLabel"
+          class="flex-1 px-4 py-[9px] rounded-lg border border-line grad-danger text-white text-[13px] font-medium cursor-pointer transition-[filter] hover:brightness-110 disabled:opacity-60 disabled:cursor-default disabled:brightness-100">重建索引</button>
       </div>
       </div>
     </div>
 
-    <div id="confirmDialog" class="fixed inset-0 z-[1000] flex items-center justify-center p-4" hidden>
+    <!-- 二次确认弹窗（替代浏览器原生 confirm） -->
+    <div id="confirmDialog" x-show="confirm.open" x-cloak class="fixed inset-0 z-[1000] flex items-center justify-center p-4">
       <div class="absolute inset-0 bg-black/60 backdrop-blur-[2px]"></div>
       <div class="relative w-[min(340px,92vw)] p-[18px] border border-line rounded-[14px] text-fg bg-surface shadow-[0_24px_70px_rgba(0,0,0,0.55)]">
-      <p id="confirmMsg" class="m-0 mb-[18px] text-sm leading-[1.55]"></p>
+      <p id="confirmMsg" class="m-0 mb-[18px] text-sm leading-[1.55]" x-text="confirm.message"></p>
       <div class="flex justify-end gap-2.5">
-        <button id="confirmCancel" type="button" class="px-[18px] py-2 rounded-lg border border-line bg-transparent text-fg text-[13px] font-medium cursor-pointer transition-[filter,background-color] hover:bg-white/[0.08]">取消</button>
-        <button id="confirmOk" type="button" class="px-[18px] py-2 rounded-lg border border-transparent grad-brand text-white text-[13px] font-medium cursor-pointer transition-[filter,background-color] hover:brightness-110 [&.danger]:grad-danger">确定</button>
+        <button id="confirmCancel" type="button" @click="answerConfirm(false)" class="px-[18px] py-2 rounded-lg border border-line bg-transparent text-fg text-[13px] font-medium cursor-pointer transition-[filter,background-color] hover:bg-white/[0.08]">取消</button>
+        <button id="confirmOk" type="button" @click="answerConfirm(true)" :class="{ danger: confirm.danger }" class="px-[18px] py-2 rounded-lg border border-transparent grad-brand text-white text-[13px] font-medium cursor-pointer transition-[filter,background-color] hover:brightness-110 [&.danger]:grad-danger">确定</button>
       </div>
       </div>
     </div>
 
-    <section id="browseView" class="flex-1 min-h-0 w-full flex flex-col items-center overflow-hidden" hidden>
+    <!-- 浏览区：搜索视图 + 无关键词时的热词榜（编辑模式下右侧附带黑名单面板） -->
+    <section id="browseView" x-show="showBrowse" x-cloak class="flex-1 min-h-0 w-full flex flex-col items-center overflow-hidden">
       <div class="flex-none w-full max-w-[1100px] flex items-center gap-3 mt-1.5 mb-1">
         <span class="text-[15px] font-semibold text-fg">热门关键词</span>
         <label class="inline-flex items-center gap-2 ml-auto cursor-pointer select-none text-muted text-[13px]" title="开启后可删除关键词 / 管理黑名单">
           <span>关键词编辑</span>
-          <input type="checkbox" id="editToggle" class="peer sr-only" />
+          <input type="checkbox" id="editToggle" class="peer sr-only" x-model="editMode" @change="onEditToggle()" />
           <span class="relative flex-none w-10 h-[22px] rounded-full bg-line transition-colors peer-checked:grad-brand peer-checked:[&>span]:translate-x-[18px] peer-focus-visible:ring-[3px] peer-focus-visible:ring-accent/25">
             <span class="absolute top-0.5 left-0.5 size-[18px] rounded-full bg-white transition-transform"></span>
           </span>
         </label>
       </div>
       <div class="flex-1 min-h-0 w-full flex gap-5 items-stretch overflow-hidden max-[480px]:flex-col">
-        <div id="hotWords" class="flex-1 min-h-0 w-auto flex flex-wrap gap-2.5 py-4 overflow-y-auto scrollbar-thin"></div>
-        <aside id="blacklistPanel" class="flex-none w-[260px] max-[480px]:w-full flex flex-col p-3 px-3.5 border border-line rounded-xl bg-card overflow-hidden" hidden>
+        <div id="hotWords" class="flex-1 min-h-0 w-auto flex flex-wrap gap-2.5 py-4 overflow-y-auto scrollbar-thin">
+          <p class="text-muted text-center py-10 max-[480px]:py-6" x-show="hotList.length === 0">暂无热词数据</p>
+          <template x-for="it in hotList" :key="it.term">
+            <button type="button" :class="{ editing: editMode }"
+              :title="editMode ? `点击右侧 × 将「${it.term}」加入黑名单` : `搜索「${it.term}」`"
+              @click="onHotWordClick(it.term)"
+              class="inline-flex items-center rounded-full border border-line bg-card text-fg text-sm cursor-pointer px-4 py-2 transition-[border-color,background-color,transform] duration-150 hover:border-accent hover:bg-accent/10 hover:-translate-y-px max-[480px]:px-3 max-[480px]:py-1.5 max-[480px]:text-[13px]">
+              <span x-text="it.term"></span>
+              <span x-show="editMode" class="inline-flex items-center justify-center ml-1.5 size-4 rounded-full text-muted cursor-pointer transition-colors hover:text-red-400 hover:bg-red-400/15"
+                :aria-label="`将「${it.term}」加入黑名单`" x-html="ICONS.closeSm" @click.stop.prevent="addToBlacklist(it.term)"></span>
+            </button>
+          </template>
+        </div>
+        <aside id="blacklistPanel" x-show="editMode" x-cloak class="flex-none w-[260px] max-[480px]:w-full flex flex-col p-3 px-3.5 border border-line rounded-xl bg-card overflow-hidden">
           <div class="flex-none flex items-center justify-between mb-2">
             <h3 class="m-0 text-sm font-semibold text-fg">黑名单</h3>
             <div class="flex gap-1.5">
-              <button id="blImportBtn" class="inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-surface text-fg cursor-pointer transition-colors hover:bg-white/[0.08] hover:border-accent disabled:opacity-50 disabled:cursor-default" type="button" aria-label="导入黑名单" title="导入黑名单（.txt，每行一个词）">
+              <button id="blImportBtn" @click="$refs.blImportFile.click()" :disabled="busy.import" class="inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-surface text-fg cursor-pointer transition-colors hover:bg-white/[0.08] hover:border-accent disabled:opacity-50 disabled:cursor-default" type="button" aria-label="导入黑名单" title="导入黑名单（.txt，每行一个词）">
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
               </button>
-              <button id="blExportBtn" class="inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-surface text-fg cursor-pointer transition-colors hover:bg-white/[0.08] hover:border-accent disabled:opacity-50 disabled:cursor-default" type="button" aria-label="导出黑名单" title="导出黑名单为 .txt">
+              <button id="blExportBtn" @click="exportBlacklist()" class="inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-surface text-fg cursor-pointer transition-colors hover:bg-white/[0.08] hover:border-accent disabled:opacity-50 disabled:cursor-default" type="button" aria-label="导出黑名单" title="导出黑名单为 .txt">
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               </button>
-              <input id="blImportFile" type="file" accept=".txt,text/plain" hidden />
+              <input id="blImportFile" type="file" accept=".txt,text/plain" hidden x-ref="blImportFile" @change="importBlacklist($event)" />
             </div>
           </div>
-          <input id="blacklistFilter" class="flex-none w-full mb-2.5 px-2.5 py-1.5 rounded-lg border border-line bg-surface text-fg text-[13px] outline-none focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)]" type="text" placeholder="过滤黑名单…" autocomplete="off" />
-          <ul id="blacklistList" class="flex-1 min-h-0 list-none m-0 p-0 flex flex-col gap-1.5 overflow-y-auto scrollbar-thin"></ul>
-          <p id="blacklistEmpty" class="flex-none m-0 py-2 text-muted text-xs text-center">暂无黑名单词</p>
+          <input id="blacklistFilter" class="flex-none w-full mb-2.5 px-2.5 py-1.5 rounded-lg border border-line bg-surface text-fg text-[13px] outline-none focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)]" type="text" placeholder="过滤黑名单…" autocomplete="off" x-model="blacklistFilter" />
+          <ul id="blacklistList" class="flex-1 min-h-0 list-none m-0 p-0 flex flex-col gap-1.5 overflow-y-auto scrollbar-thin">
+            <template x-for="it in filteredBlacklist" :key="it.term">
+              <li class="flex-none flex items-center justify-between gap-2 px-2 py-1.5 border border-line rounded-lg bg-surface">
+                <span class="text-[13px] overflow-hidden text-ellipsis whitespace-nowrap" x-text="it.term"></span>
+                <button type="button" :aria-label="`将「${it.term}」移出黑名单`" x-html="ICONS.close" @click="removeFromBlacklist(it.term)"
+                  class="shrink-0 inline-flex items-center justify-center size-[22px] rounded-full border-0 bg-transparent text-muted cursor-pointer transition-colors hover:text-red-400 hover:bg-red-400/[0.12]"></button>
+              </li>
+            </template>
+          </ul>
+          <p id="blacklistEmpty" x-show="filteredBlacklist.length === 0" class="flex-none m-0 py-2 text-muted text-xs text-center">暂无黑名单词</p>
         </aside>
       </div>
     </section>
 
     <!-- light DOM 容器：自定义元素默认 display:inline，必须显式给 display 才能成为滚动区
-         （搜索结果与「最新入库」复用同一个列表容器与分页条，差别只在请求的接口与有无搜索框） -->
-    <result-list id="results" class="w-full flex-1 min-h-0 flex flex-col gap-3.5 px-[clamp(8px,2vw,5vw)] py-2.5 overflow-y-auto scrollbar-thin" hidden></result-list>
+         （搜索结果与「资源库」复用同一个列表容器与分页条，差别只在请求的接口与有无搜索框） -->
+    <result-list id="results" x-ref="results" x-show="resultsVisible" x-cloak class="w-full flex-1 min-h-0 flex flex-col gap-3.5 px-[clamp(8px,2vw,5vw)] py-2.5 overflow-y-auto scrollbar-thin">
+      <p class="text-muted text-center py-10 max-[480px]:py-6" x-show="items.length === 0" x-text="emptyText"></p>
+      <template x-for="item in items" :key="item.key">
+        <!-- 每条结果一个独立作用域：item 为数据，tokens 为高亮关键词 -->
+        <magnet-card x-data="magnetCard(item, tokens)"
+          class="block bg-card border border-line rounded-xl p-[clamp(12px,2vw,16px)_clamp(14px,2.5vw,18px)] transition-[transform,border-color] duration-150 hover:-translate-y-0.5 hover:border-accent">
+          <h2 class="title m-0 mb-2 text-[clamp(14px,calc(13px_+_0.4vw),16px)] font-medium break-all [&_mark]:rounded-[3px] [&_mark]:bg-brand/[0.35] [&_mark]:px-0.5 [&_mark]:text-white" x-html="titleHtml"></h2>
+          <div class="magnet flex items-center gap-2 mb-2">
+            <a class="magnet-text flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-brand2 text-[clamp(11px,calc(10px_+_0.3vw),12px)] no-underline cursor-pointer hover:underline" :href="magnet" :title="magnet" x-text="magnet"></a>
+            <button class="copy flex-none inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-transparent text-fg cursor-pointer transition-colors hover:bg-white/[0.08] [&_svg]:size-[15px] [&_svg]:block [&.copied]:text-green-400 [&.copied]:border-green-400"
+              type="button" :class="{ copied }" :title="copied ? '已复制' : '复制磁力链接'" aria-label="复制磁力链接" @click="copy()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+            <a class="thunder flex-none inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-transparent text-fg cursor-pointer transition-colors hover:bg-white/[0.08] [&_svg]:size-[15px] [&_svg]:block no-underline hover:border-accent hover:text-accent"
+              x-show="!!thunder" :href="thunder" aria-label="迅雷下载" title="迅雷下载"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg></a>
+            <button class="rpc flex-none inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-transparent text-fg cursor-pointer transition-colors hover:bg-white/[0.08] [&_svg]:size-[15px] [&_svg]:block hover:border-green-400 hover:text-green-400"
+              type="button" aria-label="RPC 推送" title="推送到下载器（aria2 / Motrix）" @click="push()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
+          </div>
+          <div class="files-row flex items-start gap-2">
+            <magnet-files class="block flex-1 min-w-0 mb-2">
+              <ul class="list-none m-0 p-0">
+                <li class="text-[clamp(12px,calc(11px_+_0.3vw),13px)] py-0.5" x-show="fileList.length === 0">（无文件列表）</li>
+                <template x-for="(f, i) in previewView" :key="i">
+                  <li class="text-[clamp(12px,calc(11px_+_0.3vw),13px)] py-0.5 flex gap-1.5 items-baseline">
+                    <span class="text-fg break-all [&_mark]:rounded-[3px] [&_mark]:bg-brand/[0.35] [&_mark]:px-0.5 [&_mark]:text-white" x-html="f.html"></span>
+                    <span class="shrink-0 text-muted whitespace-nowrap" x-text="f.size"></span>
+                  </li>
+                </template>
+                <li class="text-muted text-[clamp(11px,calc(10px_+_0.3vw),12px)] pt-1" x-show="moreCount > 0" x-text="moreText"></li>
+              </ul>
+            </magnet-files>
+            <!-- 「查看全部文件」常显：卡片只预览前几条（有关键词时只预览命中的几条），
+                 是否展开由用户自己决定；无文件时弹窗内有「（无文件列表）」兜底 -->
+            <button class="detail flex-none self-center px-2.5 py-[5px] rounded-lg border border-line bg-transparent text-fg cursor-pointer text-[clamp(12px,calc(11px_+_0.3vw),13px)] whitespace-nowrap transition-colors hover:bg-white/[0.08]"
+              type="button" @click="openDetail()">查看全部文件</button>
+          </div>
+          <div class="meta text-muted text-[clamp(11px,calc(10px_+_0.3vw),12px)]" x-text="metaText"></div>
+          <!-- 详情弹窗：内容懒渲染（x-if），关闭即销毁 -->
+          <!-- 宽度 80vw：文件树不折行，靠宽度+横向滚动容纳长文件名（小屏回落到 96vw） -->
+          <dialog class="w-[80vw] h-[86vh] max-[768px]:w-[96vw] p-0 border border-line rounded-[14px] text-fg bg-surface [&::backdrop]:bg-black/60 open:flex open:flex-col" x-ref="detailDialog" @close="detailOpen = false">
+            <template x-if="detailOpen">
+              <div class="dlg-head flex-none flex items-start gap-2.5 p-[clamp(12px,2vw,16px)_clamp(14px,2.5vw,18px)] border-b border-line">
+                <h3 class="dlg-title m-0 flex-1 text-[clamp(14px,calc(13px_+_0.4vw),16px)] font-semibold break-all [&_mark]:rounded-[3px] [&_mark]:bg-brand/[0.35] [&_mark]:px-0.5 [&_mark]:text-white" x-html="titleHtml"></h3>
+                <button class="close flex-none inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-transparent text-fg cursor-pointer transition-colors hover:bg-white/[0.08] [&_svg]:size-[15px] [&_svg]:block" type="button" aria-label="关闭" title="关闭" @click="closeDetail()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+              </div>
+            </template>
+            <template x-if="detailOpen">
+              <div class="dlg-body flex-1 flex flex-col overflow-hidden p-[clamp(12px,2vw,16px)_clamp(14px,2.5vw,18px)]">
+                <div class="dlg-meta flex-none">
+                  <div class="dlg-row flex gap-2 mb-1.5 text-[clamp(12px,calc(11px_+_0.3vw),13px)]"><span class="k flex-none w-16 text-muted">磁力链接</span><a class="v v-link no-underline cursor-pointer hover:underline" :href="magnet" x-text="magnet" style="color: var(--color-brand2)"></a></div>
+                  <div class="dlg-row flex gap-2 mb-1.5 text-[clamp(12px,calc(11px_+_0.3vw),13px)]"><span class="k flex-none w-16 text-muted">infohash</span><span class="v break-all" x-text="detailInfohash"></span></div>
+                  <div class="dlg-row flex gap-2 mb-1.5 text-[clamp(12px,calc(11px_+_0.3vw),13px)]"><span class="k flex-none w-16 text-muted">大小</span><span class="v break-all" x-text="detailSize"></span></div>
+                  <div class="dlg-row flex gap-2 mb-1.5 text-[clamp(12px,calc(11px_+_0.3vw),13px)]"><span class="k flex-none w-16 text-muted">抓取于</span><span class="v break-all" x-text="detailDate"></span></div>
+                </div>
+                <!-- 任意深度的目录树由 renderTreeNode 递归生成（DOM API，天然防注入）；
+                     弹窗内容由 x-if 懒创建，故 x-init 只在每次打开时跑一次 -->
+                <ul class="dlg-files flex-1 overflow-auto min-h-0 list-none m-0 mt-3 p-0 scrollbar-thin" x-init="renderTree($el)"></ul>
+              </div>
+            </template>
+          </dialog>
+        </magnet-card>
+      </template>
+    </result-list>
 
-    <button id="refreshBtn" class="fixed right-[18px] bottom-[10vh] z-50 flex-none inline-flex items-center justify-center size-11 p-0 rounded-full border border-line bg-surface text-fg shadow-[0_4px_14px_rgba(0,0,0,0.25)] cursor-pointer transition-[transform,filter] hover:brightness-110 hover:rotate-[40deg] active:rotate-[180deg]" type="button" aria-label="刷新搜索结果" title="刷新搜索结果" hidden>
+    <button id="refreshBtn" x-show="resultsVisible" x-cloak @click="refresh()" :title="refreshTitle" :aria-label="refreshTitle"
+      class="fixed right-[18px] bottom-[10vh] z-50 flex-none inline-flex items-center justify-center size-11 p-0 rounded-full border border-line bg-surface text-fg shadow-[0_4px_14px_rgba(0,0,0,0.25)] cursor-pointer transition-[transform,filter] hover:brightness-110 hover:rotate-[40deg] active:rotate-[180deg]" type="button">
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
     </button>
 
-    <div id="pagerRow" class="flex-none flex items-center justify-center gap-4 mt-5 flex-wrap max-[768px]:mt-3.5 max-[768px]:gap-2.5 max-[480px]:flex-col max-[480px]:items-stretch max-[480px]:gap-2" hidden>
-      <span id="pagerInfo" class="text-muted text-[13px] mr-auto max-[480px]:text-center max-[480px]:mr-0"></span>
-      <nav id="pager" class="flex-none flex gap-1.5 flex-wrap justify-center" hidden></nav>
-      <span class="inline-flex items-center gap-1.5 text-muted text-[13px] whitespace-nowrap max-[480px]:justify-center">
-        跳至 <input id="jumpPage" type="number" min="1" value="" class="w-16 h-9 px-2 rounded-lg border border-line bg-card text-fg text-sm text-center outline-none box-border focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)]" /> 页
+    <div id="pagerRow" x-show="resultsVisible" x-cloak class="flex-none flex items-center justify-center gap-4 mt-5 flex-wrap max-[768px]:mt-3.5 max-[768px]:gap-2.5 max-[480px]:flex-col max-[480px]:items-stretch max-[480px]:gap-2">
+      <span id="pagerInfo" class="text-muted text-[13px] mr-auto max-[480px]:text-center max-[480px]:mr-0" x-text="pagerInfo"></span>
+      <nav id="pager" x-show="totalPages > 1" x-cloak class="flex-none flex gap-1.5 flex-wrap justify-center">
+        <template x-for="p in pageItems" :key="p.key">
+          <button type="button" :class="p.cls" :disabled="p.disabled" :aria-label="p.aria" x-html="p.html" @click="goToPage(p.page)"></button>
+        </template>
+      </nav>
+      <span x-show="totalPages > 1" x-cloak class="inline-flex items-center gap-1.5 text-muted text-[13px] whitespace-nowrap max-[480px]:justify-center">
+        跳至 <input id="jumpPage" type="number" min="1" :max="totalPages" x-ref="jumpPage" :value="jumpValue" @keydown.enter="jumpTo()" @focus="$event.target.select()" class="w-16 h-9 px-2 rounded-lg border border-line bg-card text-fg text-sm text-center outline-none box-border focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)]" /> 页
       </span>
       <label class="inline-flex items-center gap-1.5 text-muted text-[13px] whitespace-nowrap max-[480px]:justify-center">
         每页
-        <select id="pageSize" class="w-16 h-9 px-2 rounded-lg border border-line bg-card text-fg text-sm text-center outline-none box-border cursor-pointer select-caret-sm focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)]">
+        <select id="pageSize" x-model.number="pageSize" @change="onPageSizeChange()" class="w-16 h-9 px-2 rounded-lg border border-line bg-card text-fg text-sm text-center outline-none box-border cursor-pointer select-caret-sm focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)]">
           <option value="10">10</option>
           <option value="20" selected>20</option>
           <option value="30">30</option>
@@ -191,40 +324,57 @@
     </div>
   </main>
 
-  <div id="loadingOverlay" class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/55 backdrop-blur-[2px]" hidden>
+  <!-- 搜索蒙层：由 loadingVisible 控制——请求超过 300ms 未返回才出现，避免快速检索时闪一下 -->
+  <div id="loadingOverlay" x-show="loadingVisible" x-cloak class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/55 backdrop-blur-[2px]">
     <div class="flex flex-col items-center gap-4 px-9 py-7 rounded-[14px] border border-line bg-card text-fg shadow-[0_12px_40px_rgba(0,0,0,0.45)]">
       <div class="size-[38px] rounded-full border-[3px] border-white/[0.18] border-t-accent animate-spin" aria-hidden="true"></div>
       <div class="text-[15px]">搜索中…</div>
-      <button id="cancelSearchBtn" type="button" class="px-[18px] py-2 rounded-lg border border-line bg-transparent text-fg text-[13px] cursor-pointer transition-colors hover:bg-white/[0.08]">取消搜索</button>
+      <button id="cancelSearchBtn" type="button" @click="cancelSearch()" class="px-[18px] py-2 rounded-lg border border-line bg-transparent text-fg text-[13px] cursor-pointer transition-colors hover:bg-white/[0.08]">取消搜索</button>
     </div>
   </div>
 
   <!-- 运行状态悬浮窗：默认贴左边缘只露竖排标签，鼠标移入向右滑出。
        .stats-hud 是唯一的钩子类名，供 app.css 里 @media (hover: none) 的触屏降级使用。 -->
-  <aside id="statsHud" class="stats-hud group fixed left-0 bottom-3.5 z-[55] flex items-stretch gap-2 translate-x-[calc(-100%_+_34px)] transition-transform duration-[250ms] delay-[1200ms] hover:translate-x-0 focus-within:translate-x-0 hover:delay-0 focus-within:delay-0 will-change-[translate]" hidden>
+  <aside id="statsHud" x-show="hudOn" x-cloak class="stats-hud group fixed left-0 bottom-3.5 z-[55] flex items-stretch gap-2 translate-x-[calc(-100%_+_34px)] transition-transform duration-[250ms] delay-[1200ms] hover:translate-x-0 focus-within:translate-x-0 hover:delay-0 focus-within:delay-0 will-change-[translate]">
     <div class="w-[196px] max-[560px]:w-[172px] p-[9px] px-[11px] box-border border border-line rounded-xl bg-card/[0.72] backdrop-blur-[10px] shadow-[0_8px_26px_rgba(0,0,0,0.32)] text-fg text-xs">
       <div class="flex items-baseline justify-between gap-2 mb-1.5 pb-1.5 border-b border-line">
         <span class="font-semibold">运行状态</span>
-        <span id="statsStatus" class="text-muted text-[11px] whitespace-nowrap">连接中…</span>
+        <span id="statsStatus" class="text-muted text-[11px] whitespace-nowrap" x-text="stats.status">连接中…</span>
       </div>
       <div class="flex flex-col gap-0.5 text-[11px] max-[560px]:text-[10px]">
-        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">缓存占用</span><b id="stCache" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">缓存条目</span><b id="stEntries" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">命中率</span><b id="stHitRate" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">堆内存</span><b id="stHeap" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">RSS</span><b id="stRss" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">搜索进程</span><b id="stProcs" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">已索引</span><b id="stIndexed" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
-        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">下次同步</span><b id="stNextSync" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">缓存占用</span><b id="stCache" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" x-text="stats.cache">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">缓存条目</span><b id="stEntries" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" x-text="stats.entries">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">命中率</span><b id="stHitRate" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" x-text="stats.hitRate">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">堆内存</span><b id="stHeap" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" x-text="stats.heap">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">RSS</span><b id="stRss" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" x-text="stats.rss">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">搜索进程</span><b id="stProcs" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" x-text="stats.procs">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">已索引</span><b id="stIndexed" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" x-text="stats.indexed">—</b></div>
+        <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">下次同步</span><b id="stNextSync" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" :title="stats.syncCron ? `自动同步 cron：${stats.syncCron}` : ''" x-text="nextSyncText">—</b></div>
       </div>
-      <div id="reindexProgress" class="flex flex-col gap-[5px] mt-[7px] pt-[7px] border-t border-line" hidden>
-        <div class="h-[5px] overflow-hidden bg-canvas rounded-full"><div id="reindexBarFill" class="w-0 h-full rounded-full grad-brand transition-[width] duration-300"></div></div>
-        <div id="reindexText" class="text-muted text-[11px] tabular-nums">0 / 0</div>
+      <div id="reindexProgress" x-show="stats.progress.visible" x-cloak class="flex flex-col gap-[5px] mt-[7px] pt-[7px] border-t border-line">
+        <div class="h-[5px] overflow-hidden bg-canvas rounded-full"><div id="reindexBarFill" class="h-full rounded-full grad-brand transition-[width] duration-300" :style="`width:${stats.progress.pct}%`"></div></div>
+        <div id="reindexText" class="text-muted text-[11px] tabular-nums" x-text="stats.progress.text">0 / 0</div>
       </div>
     </div>
     <div class="flex-none w-[26px] flex items-center justify-center box-border border border-line rounded-xl bg-card/[0.72] backdrop-blur-[10px] shadow-[2px_0_12px_rgba(0,0,0,0.28)] text-muted cursor-default select-none opacity-100 transition-opacity duration-200 delay-[1200ms] group-hover:opacity-0 group-focus-within:opacity-0 group-hover:pointer-events-none group-hover:delay-0 group-focus-within:delay-0" aria-hidden="true">
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
     </div>
   </aside>
+
+  <!-- 全局通知：数据来自 $store.toast（见 src/toast.js）；
+       x-show + x-transition 负责进出场（x-for 移除项本身不播动画，故用 shown 标记收起） -->
+  <div class="fixed top-[18px] left-1/2 -translate-x-1/2 z-[9999] flex flex-col gap-2 pointer-events-none">
+    <template x-for="t in $store.toast.items" :key="t.id">
+      <div x-show="t.shown"
+        x-transition:enter="transition duration-200 ease-out"
+        x-transition:enter-start="opacity-0 -translate-y-2"
+        x-transition:enter-end="opacity-100 translate-y-0"
+        x-transition:leave="transition duration-200 ease-in"
+        x-transition:leave-start="opacity-100 translate-y-0"
+        x-transition:leave-end="opacity-0 -translate-y-2"
+        class="bg-surface/95 text-white border border-white/[0.14] px-[18px] py-2.5 rounded-[10px] text-sm leading-[1.4] shadow-[0_8px_24px_rgba(0,0,0,0.35)]"
+        x-text="t.message"></div>
+    </template>
+  </div>
 </body>
 </html>

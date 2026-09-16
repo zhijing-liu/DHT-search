@@ -78,6 +78,11 @@
     display: none !important;
   }
 
+  /* Alpine 接管显隐前先隐藏：避免 x-show/x-if 的元素在启动瞬间闪现一下 */
+  [x-cloak] {
+    display: none !important;
+  }
+
   /* 弹窗改为普通定位层（非原生 <dialog>），无需 dialog:modal 居中兜底 */
 
   /* 结果卡片「查看全部文件」仍是原生 <dialog>：
@@ -133,7 +138,9 @@
    ------------------------------------------------------------------ */
 /* 弹窗打开瞬间指针仍在卡片上（hover:-translate-y-0.5 生效），transform
    会给 fixed 定位的 dialog 建立非视口包含块导致偏位；
-   置于无 layer 顶层，优先级高于工具类，打开时先解除卡片位移。 */
+   置于无 layer 顶层，优先级高于工具类，打开时先解除卡片位移。
+   注意：magnet-card 是 index.html 里的自定义元素标签名（DOM 契约的一部分），
+   改名必须同步改这条选择器。 */
 magnet-card:has(dialog[open]) {
   transform: none;
 }

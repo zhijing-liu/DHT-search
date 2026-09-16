@@ -76,7 +76,8 @@ Two-level cancellation, fully covered: **queued** → removed from queue (zero c
 > lower memory is **fewer processes**, not tighter PRAGMAs.
 
 ### Frontend (`web/`, Vite + Tailwind)
-Frontend sources live in `web/src/` (native ES modules + custom elements + Tailwind CSS).
+Frontend sources live in `web/src/` (Alpine.js declarative templates + Tailwind CSS, bundled by Vite).
+All rendering and event binding is driven by Alpine directives in `index.html`; `web/src/` only holds state, actions and pure helpers.
 `npm run build:web` outputs the bundle to `public/` at the repo root, served by the backend via `express.static`.
 For development use `npm run dev:web` (Vite dev server, `/api` proxied to the backend, port read from `config.js`).
 When deploying behind a reverse-proxy subpath, `WEB_BASE_PATH` controls the asset reference prefix.
@@ -120,10 +121,14 @@ DHT-search/
 │   ├── vite.config.js         # Outputs to ../public; dev proxies /api to the backend
 │   ├── package.json
 │   └── src/
-│       ├── main.js            # Main logic: search/pagination/sort/keywords/suggest/URL sync/rebuild/settings
-│       ├── components.js      # Custom elements: result cards / file tree / sort controls etc.
+│       ├── main.js            # Entry: registers Alpine components/stores, then starts Alpine
+│       ├── app.js             # Page component: state + actions (search/sort/filter/paging/hot words/blacklist/settings/stats/URL sync)
+│       ├── card.js            # Result card component: title highlight / file preview / detail dialog + tree
+│       ├── api.js             # Backend API layer (uniform JSON parsing & error messages)
+│       ├── toast.js           # Alpine store for global notifications
+│       ├── icons.js           # Icon literals rendered dynamically from templates
 │       ├── file-tree.js       # Builds a collapsible tree from flat [{path,size}]
-│       ├── util.js            # Shared pure helpers (format, copy, highlight, RPC push etc.)
+│       ├── util.js            # Shared pure helpers (format, highlight, suggest matching, copy, RPC push etc.)
 │       └── styles/app.css     # Tailwind entry & global styles
 ├── public/                    # Frontend build output (npm run build:web), served by the backend
 ├── test/
