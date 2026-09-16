@@ -2,15 +2,11 @@
 /**
  * 热词过滤词种子脚本
  * ---------------------------------------------------------------
- * 读取同目录下的 hot-filter-words.txt，按行读取（每行一个过滤词），
- * 去掉首尾空白后批量写入索引库的 keyword_filter 表（幂等，可重复运行）。
+ * 读取同目录的 hot-filter-words.txt（每行一个词，支持 # 注释），批量写入索引库的
+ * keyword_filter 表（幂等，可重复运行）。
  *
- * 用法：
- *   npm run seed:filter
- *   node scripts/seed-filter.mjs
- *
- * 扩充过滤词：编辑 hot-filter-words.txt 追加行（支持 # 注释），
- * 再跑一次本脚本即可，重复的词不会重复写入。
+ * 用法：npm run seed:filter（或 node scripts/seed-filter.mjs）
+ * 扩充过滤词：编辑 hot-filter-words.txt 追加行后再跑一次即可。
  */
 import fs from 'node:fs';
 import path from 'node:path';

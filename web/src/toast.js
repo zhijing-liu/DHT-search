@@ -1,9 +1,6 @@
 /**
- * 全局轻量通知（toast）。
- * ------------------------------------------------------------------
- * 状态放在 Alpine store 里，页面用 <template x-for="$store.toast.items"> 渲染，
- * 进出场动画完全交给模板的 x-show + x-transition（帧时序与过渡类的增删都由 Alpine 负责），
- * 因此本模块只改数据、不碰 DOM，也不手写动画用的 CSS 类。
+ * 全局轻量通知（toast）：状态放在 Alpine store 里，由模板的 x-for + x-show + x-transition
+ * 渲染与播动画，本模块只改数据、不碰 DOM。
  */
 import Alpine from 'alpinejs';
 
@@ -17,9 +14,8 @@ export const toastStore = {
   /** 弹出一条提示 */
   push(message) {
     const id = ++this._seq;
-    // 先以 shown:false 入列：x-show 的**首次**求值不会播过渡（Alpine 为避免首屏闪现刻意如此），
-    // 必须在元素创建之后再翻成 true，入场动画才会走 x-transition。
-    // queueMicrotask 排在 Alpine 本轮渲染 flush 之后，能保证「先创建、后翻转」的顺序。
+    // 先以 shown:false 入列，元素创建后再翻成 true（x-show 首次求值不播过渡，否则无入场动画）；
+    // queueMicrotask 排在 Alpine 本轮渲染 flush 之后，保证「先创建、后翻转」
     this.items.push({ id, message, shown: false });
     queueMicrotask(() => this._setShown(id, true));
     setTimeout(() => this.dismiss(id), VISIBLE_MS);

@@ -1,20 +1,13 @@
 /**
- * 文件树：由扁平 [{ path, size }] 列表生成可折叠目录树。
+ * 文件树渲染：消费后端下发的扁平树（parent 指向父节点下标）
  * ------------------------------------------------------------------
- * 前半部分是纯数据函数（构建 / 累加 / 命中评分 / 预览筛选），对外导出的几个可直接单测
- * （fileMatchScore 只服务于本模块的排序，故不导出）；
- * 后半部分（renderTreeNode）产出真实 DOM 节点，供详情弹窗里的文件树使用。
+ * 数据形状 [{ name, parent, isDir, size, path? }] 由详情接口返回，故这里不判定分隔符、
+ * 不 split 路径、不累加目录大小：先按 parent 归组还原父子关系，再产出真实 DOM
+ * （任意深度、展开时才建子层、单层按批补行）。
  *
- * 这里是全站唯一由 JS 直接建 DOM 的渲染点，且是刻意保留的：树是**任意深度**的递归结构，
- * Alpine 的模板递归只能在模板里重复展开有限层（或改成扁平列表，那会连带改掉
- * 每层 <ul> 的缩进竖线结构），两者都会让 DOM 或可读性变差。模板侧只需一句
- * x-init="renderTree($el)"——递归细节收敛在这一个纯函数里，同时全程 DOM API 拼接，
- * 天然不存在 innerHTML 注入面。
+ * 全程 DOM API 拼接，无 innerHTML 注入面；模板侧只需 x-init="renderTree($el)"。
  */
-import { formatBytes, normalizeFiles } from './util.js';
-
-/** 文件预览最多展示的条数（性能：列表不渲染全部） */
-const PREVIEW_LIMIT = 5;
+import { formatBytes } from './util.js';
 
 /** 文件命中查询 token 的数量评分，用于「匹配关键词优先」排序（仅本模块内部使用） */
 function fileMatchScore(name, tokens) {
@@ -26,102 +19,36 @@ function fileMatchScore(name, tokens) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 路径 → 树                                                            */
-/* 源库里的 path 有两种写法：POSIX 风格（'dir/sub/a.mkv'），以及把目录    */
-/* 写成逗号分隔（'Scenes,a.m4v'）。先判定用哪个分隔符，再逐级建树；      */
-/* 判定不出来的就按扁平列表处理（整条 path 就是文件名，不拆层级）。       */
+/* 扁平树 → 渲染用父子关系                                              */
 /* ------------------------------------------------------------------ */
 
 /**
- * 判定层级分隔符（空串 = 不拆分）：
- * - 只要出现 '/' 就用 '/'——它是真正的路径分隔符，最可信；
- * - 否则看 ',':只有当「首段」被多个文件共用时才算目录分隔符。
- *   文件名里本身带逗号（'片名,片名.CHM' 这类）时首段各不相同，
- *   不会被误判成目录层级，避免凭空多出一堆单文件目录；
- * - 两种都不满足 → 返回 ''（扁平列表）。
+ * 由扁平树还原成渲染用的嵌套结构 { name, isDir, size, children: Map<序号, node> }。
+ * parent 只认「已经出现过的下标」，非法值一律当作根级（避免脏数据成环）；
+ * 返回虚拟根节点，其 children 即全部根级节点。
  */
-function detectSeparator(paths) {
-  if (paths.some((p) => p.includes('/'))) return '/';
-
-  const heads = new Map();
-  let commaFiles = 0;
-  for (const p of paths) {
-    const i = p.indexOf(',');
-    if (i < 0) continue;
-    commaFiles += 1;
-    const head = p.slice(0, i);
-    heads.set(head, (heads.get(head) || 0) + 1);
-  }
-  if (commaFiles === 0) return '';
-
-  // 多数「含逗号的文件」都落在被共用的首段下 → 认定逗号是目录分隔符
-  let shared = 0;
-  for (const n of heads.values()) if (n > 1) shared += n;
-  return shared * 2 > commaFiles ? ',' : '';
-}
-
-/**
- * 把扁平的 [{ path, size }] 列表还原成目录树。
- * 目录节点聚合字节大小（见 computeTreeSizes），文件节点保留自身 size。
- * 节点形状：{ name, isDir, children: Map<name, node>, size }。
- */
-export function buildFileTree(files) {
-  const list = Array.isArray(files) ? files : [];
-  const sep = detectSeparator(list.map((f) => String((f && f.path) || '')));
-  const root = { name: '', isDir: true, children: new Map(), size: 0 };
-
-  for (const f of list) {
-    const path = String((f && f.path) || '');
-    // 分隔符为空 = 扁平列表；过滤空段以容忍首尾/连续分隔符
-    const parts = (sep ? path.split(sep) : [path]).filter((s) => s !== '');
-    if (parts.length === 0) continue;
-
-    // 最后一段是文件名，前面的段逐级建目录
-    const fileName = parts.pop();
-    let cur = root;
-    for (const dir of parts) {
-      let child = cur.children.get(dir);
-      if (!child) {
-        child = { name: dir, isDir: true, children: new Map(), size: 0 };
-        cur.children.set(dir, child);
-      }
-      cur = child;
-    }
-
-    // 同名节点可能是先建出来的目录（同名前缀路径），这里统一收敛成文件
-    let leaf = cur.children.get(fileName);
-    if (!leaf) {
-      leaf = { name: fileName, isDir: false, children: new Map(), size: 0 };
-      cur.children.set(fileName, leaf);
-    }
-    leaf.isDir = false;
-    leaf.size = Number(f.size) || 0;
+function toNestedTree(flat) {
+  const list = Array.isArray(flat) ? flat : [];
+  const wrapped = new Array(list.length);
+  for (let i = 0; i < list.length; i += 1) {
+    const n = list[i] || {};
+    wrapped[i] = {
+      // 退化兜底：老格式（尚未重建完成）的节点是 { path, size }，没有 name/isDir，
+      // 这里平铺成根级文件显示原始路径，而不是渲染出一堆空名字行
+      name: String(n.name ?? n.path ?? ''),
+      isDir: !!n.isDir,
+      size: Number(n.size) || 0,
+      children: new Map(),
+    };
   }
 
+  const root = { name: '', isDir: true, size: 0, children: new Map() };
+  for (let i = 0; i < wrapped.length; i += 1) {
+    const p = Number(list[i]?.parent);
+    const parent = Number.isInteger(p) && p >= 0 && p < i ? wrapped[p] : root;
+    parent.children.set(i, wrapped[i]);
+  }
   return root;
-}
-
-/** 递归累加目录节点的字节大小（所有子孙叶子之和） */
-export function computeTreeSizes(node) {
-  if (!node.isDir) return Number(node.size) || 0;
-  let total = 0;
-  for (const c of node.children.values()) total += computeTreeSizes(c);
-  node.size = total;
-  return total;
-}
-
-/**
- * 卡片内的文件预览：有关键词时只保留匹配到的文件，否则取前 limit 条；
- * 命中较多者优先，同分保持原始顺序（稳定）。
- */
-export function previewFiles(files, tokens, limit = PREVIEW_LIMIT) {
-  const list = normalizeFiles(files);
-  const hasTokens = Array.isArray(tokens) && tokens.length > 0;
-  const scored = list
-    .map((f, i) => ({ f, i, s: fileMatchScore(f?.path, tokens) }))
-    .filter((x) => !hasTokens || x.s > 0);
-  scored.sort((a, b) => b.s - a.s || a.i - b.i);
-  return scored.slice(0, limit).map((x) => x.f);
 }
 
 /* ------------------------------------------------------------------ */
@@ -140,20 +67,15 @@ const NAME_CLASS =
 const SIZE_CLASS = 'shrink-0 text-muted ml-1';
 /** 子层级：左侧竖线缩进 */
 const CHILDREN_CLASS = 'list-none m-0 p-0 pl-3.5 border-l border-line';
-/** 每一行（li）：离屏时跳过布局与绘制——浏览器自带的「长列表虚拟化」，
- *  上千行的文件树滚动不再卡顿。contain-intrinsic-size 用 auto 让浏览器复用上次实测高度，
- *  避免滚动条因占位高度估算而跳动（不支持的浏览器会忽略这两条，行为与原来一致）。 */
+/** 每一行（li）：离屏时跳过布局与绘制（浏览器自带的长列表虚拟化，上千行滚动不卡） */
 const ROW_ITEM_CLASS = '[content-visibility:auto] [contain-intrinsic-size:auto_24px]';
 /** 「…还有 N 项」这一行：弱化为可点击样式 */
 const MORE_CLASS = 'text-brand2 whitespace-nowrap cursor-pointer hover:underline';
 
 /** 单层一次最多构建的行数：超出的部分折叠成「…还有 N 项」一行，点击继续按批构建 */
 const BATCH_SIZE = 200;
-/**
- * 打开弹窗时的「自动展开预算」（行数上限）。
- * 第一层目录只在装得下时默认展开，装不下就折叠（点开再建）；
- * 于是「打开」的构建量与文件总数解耦——上千文件、根层挂着几百个文件也能立刻打开。
- */
+/** 打开弹窗时的自动展开预算（行数上限）：第一层目录只在装得下时默认展开 */
+
 const INITIAL_ROWS = 200;
 
 /** 把 text 中命中 tokens 的片段以 <mark> 写入 container（全程 DOM API，无注入风险） */
@@ -288,10 +210,10 @@ function renderChildren(node, depth, tokens, budget, from = 0) {
 }
 
 /**
- * 渲染整棵树，返回可直接插进容器的 Fragment。
- * depth 为父节点深度（子节点实际深度 = depth + 1）；
+ * 渲染整棵文件树，返回可直接插进容器的 Fragment。
  * budget 只由「打开弹窗」的那次调用给出，用于决定第一层目录是否默认展开。
+ * @param {Array} nodes 后端下发的扁平树
  */
-export function renderTreeNode(node, depth, tokens, budget = { rows: INITIAL_ROWS }) {
-  return renderChildren(node, depth, tokens, budget);
+export function renderFileTree(nodes, tokens, budget = { rows: INITIAL_ROWS }) {
+  return renderChildren(toNestedTree(nodes), 0, tokens, budget);
 }

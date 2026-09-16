@@ -251,7 +251,7 @@
           <div class="files-row flex items-start gap-2">
             <magnet-files class="block flex-1 min-w-0 mb-2">
               <ul class="list-none m-0 p-0">
-                <li class="text-[clamp(12px,calc(11px_+_0.3vw),13px)] py-0.5" x-show="fileList.length === 0">（无文件列表）</li>
+                <li class="text-[clamp(12px,calc(11px_+_0.3vw),13px)] py-0.5" x-show="fileCount === 0">（无文件列表）</li>
                 <template x-for="(f, i) in previewView" :key="i">
                   <li class="text-[clamp(12px,calc(11px_+_0.3vw),13px)] py-0.5 flex gap-1.5 items-baseline">
                     <span class="text-fg break-all [&_mark]:rounded-[3px] [&_mark]:bg-brand/[0.35] [&_mark]:px-0.5 [&_mark]:text-white" x-html="f.html"></span>
@@ -284,8 +284,9 @@
                   <div class="dlg-row flex gap-2 mb-1.5 text-[clamp(12px,calc(11px_+_0.3vw),13px)]"><span class="k flex-none w-16 text-muted">大小</span><span class="v break-all" x-text="detailSize"></span></div>
                   <div class="dlg-row flex gap-2 mb-1.5 text-[clamp(12px,calc(11px_+_0.3vw),13px)]"><span class="k flex-none w-16 text-muted">抓取于</span><span class="v break-all" x-text="detailDate"></span></div>
                 </div>
-                <!-- 任意深度的目录树由 renderTreeNode 递归生成（DOM API，天然防注入）；
-                     弹窗内容由 x-if 懒创建，故 x-init 只在每次打开时跑一次 -->
+                <!-- 任意深度的目录树由 renderFileTree 递归生成；扁平树来自
+                     /api/magnet/:id/files（按需请求：列表只带 fileCount + 预览，
+                     DOM API 天然防注入）；弹窗内容由 x-if 懒创建，故 x-init 每次打开只跑一次 -->
                 <ul class="dlg-files flex-1 overflow-auto min-h-0 list-none m-0 mt-3 p-0 scrollbar-thin" x-init="renderTree($el)"></ul>
               </div>
             </template>
@@ -337,9 +338,11 @@
        .stats-hud 是唯一的钩子类名，供 app.css 里 @media (hover: none) 的触屏降级使用。 -->
   <aside id="statsHud" x-show="hudOn" x-cloak class="stats-hud group fixed left-0 bottom-3.5 z-[55] flex items-stretch gap-2 translate-x-[calc(-100%_+_34px)] transition-transform duration-[250ms] delay-[1200ms] hover:translate-x-0 focus-within:translate-x-0 hover:delay-0 focus-within:delay-0 will-change-[translate]">
     <div class="w-[196px] max-[560px]:w-[172px] p-[9px] px-[11px] box-border border border-line rounded-xl bg-card/[0.72] backdrop-blur-[10px] shadow-[0_8px_26px_rgba(0,0,0,0.32)] text-fg text-xs">
+      <!-- 标题 flex-none 防挤、状态 min-w-0 truncate 防溢出：状态文案是变量，
+           面板仅 196px（内容宽 172px），不设这两条会把标题压成竖排并让状态溢出卡片 -->
       <div class="flex items-baseline justify-between gap-2 mb-1.5 pb-1.5 border-b border-line">
-        <span class="font-semibold">运行状态</span>
-        <span id="statsStatus" class="text-muted text-[11px] whitespace-nowrap" x-text="stats.status">连接中…</span>
+        <span class="font-semibold flex-none whitespace-nowrap">运行状态</span>
+        <span id="statsStatus" class="text-muted text-[11px] min-w-0 truncate" :title="stats.statusHint" x-text="stats.status">连接中…</span>
       </div>
       <div class="flex flex-col gap-0.5 text-[11px] max-[560px]:text-[10px]">
         <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">缓存占用</span><b id="stCache" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" x-text="stats.cache">—</b></div>
@@ -351,9 +354,17 @@
         <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">已索引</span><b id="stIndexed" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" x-text="stats.indexed">—</b></div>
         <div class="flex items-baseline justify-between gap-2 leading-[1.65]"><span class="text-muted whitespace-nowrap">下次同步</span><b id="stNextSync" class="min-w-0 overflow-hidden text-ellipsis font-medium tabular-nums whitespace-nowrap" :title="stats.syncCron ? `自动同步 cron：${stats.syncCron}` : ''" x-text="nextSyncText">—</b></div>
       </div>
+      <!-- 维护进度：进度条只在「扫描并写入」这一步显示（唯一有真实计数的阶段）；
+           建索引 / 合并 FTS / 回写没有可换算的比例，只显示「第几步 + 在做什么」 -->
       <div id="reindexProgress" x-show="stats.progress.visible" x-cloak class="flex flex-col gap-[5px] mt-[7px] pt-[7px] border-t border-line">
-        <div class="h-[5px] overflow-hidden bg-canvas rounded-full"><div id="reindexBarFill" class="h-full rounded-full grad-brand transition-[width] duration-300" :style="`width:${stats.progress.pct}%`"></div></div>
-        <div id="reindexText" class="text-muted text-[11px] tabular-nums" x-text="stats.progress.text">0 / 0</div>
+        <div x-show="stats.progress.barVisible" x-cloak class="h-[5px] overflow-hidden bg-canvas rounded-full">
+          <div id="reindexBarFill" class="h-full rounded-full grad-brand transition-[width] duration-300" :style="`width:${stats.progress.pct}%`"></div>
+        </div>
+        <div class="flex items-baseline justify-between gap-2 text-[11px]" :title="progressTitle">
+          <span id="reindexStep" class="min-w-0 truncate" x-text="progressHead">—</span>
+          <span id="reindexCount" class="flex-none text-muted tabular-nums whitespace-nowrap" x-text="progressTail">—</span>
+        </div>
+        <div id="reindexText" class="text-muted text-[11px] truncate" x-text="progressDetail">—</div>
       </div>
     </div>
     <div class="flex-none w-[26px] flex items-center justify-center box-border border border-line rounded-xl bg-card/[0.72] backdrop-blur-[10px] shadow-[2px_0_12px_rgba(0,0,0,0.28)] text-muted cursor-default select-none opacity-100 transition-opacity duration-200 delay-[1200ms] group-hover:opacity-0 group-focus-within:opacity-0 group-hover:pointer-events-none group-hover:delay-0 group-focus-within:delay-0" aria-hidden="true">

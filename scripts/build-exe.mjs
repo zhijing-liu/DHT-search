@@ -1,19 +1,13 @@
 /**
  * 单文件 exe 构建脚本（bun build --compile 的编译与收尾步骤）
  * ------------------------------------------------------------------
- * 完整的 build:exe 在 package.json 中用 `&` 串联两步，本脚本不做前端构建：
- *   "build:exe": "npm run build:web & bun scripts/build-exe.mjs"
- *   ① npm run build:web  前端 Vite 构建 → 产物输出到仓库根 public/
- *   ② 本脚本             bun 打包 + 收尾复制
- *
- * 本脚本职责：
- *   1. bun build --compile → dist/DHT-Search.exe（内含后端、两个 worker 执行体、
- *      内置默认配置；前端静态资源不进 exe）
+ * 完整的 build:exe 在 package.json 中用 `&` 串联两步（前端构建 + 本脚本），本脚本职责：
+ *   1. bun build --compile → dist/DHT-Search.exe（内含后端与两个执行体，前端资源不进 exe）
  *   2. public/ → dist/public/（前端静态资源随目录分发）
  *   3. 复制外置 config.js / README.md（config 运行时优先读 exe 同目录这份）
- *   4. 创建空 data/（已存在则原样保留，使用者把 magnet.db 放进来）
+ *   4. 创建空 data/（已存在则原样保留）
  *
- * 压缩发布包另行执行 `npm run pack:zip`（只压缩，不做任何构建）。
+ * 压缩发布包另行执行 `npm run pack:zip`。
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';

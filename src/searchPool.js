@@ -1,38 +1,20 @@
 /**
- * 搜索子进程池（按需 fork + 有界并发 + 等待队列）
+ * 搜索子进程池（按需 spawn + 有界并发 + 等待队列）
  * ------------------------------------------------------------------
- * 设计目标：低并发场景下的内存最优。
+ * 用「进程」而非「线程」：驱动是同步 API，一条查询会把执行单元阻塞在 C++ 里，
+ * terminate() 的终止标志要等执行权回到 JS 才被检查，只有操作系统级 kill 能真正中断
+ * ——这是「关页面即停」的唯一手段。
  *
- * 为什么是「进程」而不是「线程」
- * ------------------------------------------------------------------
- * better-sqlite3 / bun:sqlite 是同步 API，一条查询会把执行单元阻塞在 C++ 里。
- * worker.terminate() 走 V8 的 Isolate::TerminateExecution，终止标志要等执行权
- * 回到 JS 才被检查，卡在原生调用里的查询根本收不到信号（实测：Node 下 terminate
- * 到 worker 真正退出 23328ms；Bun 下 6s 后仍存活）。只有操作系统级的 kill 能真正
- * 中断——这是「关页面即停」的唯一手段，也是本池坚持用进程的理由。
+ * 内存模型（常驻 0 个进程）：第一个查询到来才 spawn；未达 maxProcesses 则继续 spawn，
+ * 已达上限则新查询进 FIFO 等待队列；客户端断开即 SIGKILL 并移出池（不补位）；
+ * 查询完成后按 recycleImmediate 决定立刻回收还是保留复用（空闲超过 idleMs 回收）。
  *
- * 内存模型：常驻 0 个
- * ------------------------------------------------------------------
- * 进程方案每个槽位都是一整套运行时（Bun 基线 60~120MB）+ 一条独立的 SQLite
- * 连接，代价远高于线程。低并发下不需要常备，故：
- *   - 启动时 **0 个**进程，第一个查询到来才 fork；
- *   - 并发超过当前进程数且未达 maxProcesses → 继续 fork；
- *   - 已达上限 → 新查询进等待队列（FIFO），不新建进程；
- *   - 客户端断开 → SIGKILL，进程从池中移除（**不补位**）；
- *   - 查询完成 → `recycleImmediate` 模式下立刻杀掉（空闲恒为 0 个进程，
- *     代价是每次查询都要付一次 fork 冷启动）；否则保留供后续复用，
- *     直到空闲超过 idleMs 才回收，进程数回到 0。
- *
- * 取消能力（两级，完整覆盖）
- * ------------------------------------------------------------------
- *   - 仍在队列中：直接从队列移除，零成本取消；
- *   - 已派发：SIGKILL 该进程，真正中断其正在执行的同步查询。
+ * 取消是两级的：仍在队列中直接移除；已派发则 SIGKILL 该进程。
  */
-import { fork, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { log } from './logger.js';
 import { clampInt } from './util.js';
-import { isCompiledExe } from './db-driver.js';
+import { spawnChild } from './child-process.js';
 import { SEARCH_WORKER_FLAG } from './worker-flags.js';
 
 const CHILD_PATH = fileURLToPath(new URL('./search-child.mjs', import.meta.url));
@@ -71,6 +53,11 @@ export class SearchExecutor {
     /** 已派发但客户端已断开的任务计数，仅用于日志观测 */
     this.abandoned = 0;
     this._shuttingDown = false;
+    /**
+     * 暂停派发（索引库原子切换窗口内为真）：期间不派生新进程（新进程会立刻打开即将
+     * 被替换的旧库文件，使 rename 重试甚至失败）。队列仍可接收任务，由 resume() 解除。
+     */
+    this._paused = false;
 
     // 立即回收模式下不存在「空闲进程」，无需启动回收扫描
     if (!this.recycleImmediate && this.idleMs > 0) {
@@ -97,19 +84,14 @@ export class SearchExecutor {
     return this.pool.length;
   }
 
-  /** fork 一个子进程并挂进池中（按需调用：池初始为空，首个查询才走到这里） */
+  /** 派生一个子进程并挂进池中（按需调用：池初始为空，首个查询才走到这里） */
   _spawn() {
     // 通过环境变量把主进程解析好的索引库路径交给子进程（比 IPC 消息更早生效，无竞态）
     const env = this.indexPath
       ? { ...process.env, DHT_SEARCH_INDEX_DB_PATH: this.indexPath }
       : process.env;
-    const stdio = ['ignore', 'inherit', 'inherit', 'ipc'];
-    // 源码运行：fork 磁盘上的执行体；编译产物（bun --compile）内本文件位于虚拟
-    // 文件系统、无法 fork，改为 spawn exe 自身并传启动标记自拉起 —— 两种方式的
-    // IPC 消息协议一致（见 search-child.mjs）
-    const child = isCompiledExe
-      ? spawn(process.execPath, [SEARCH_WORKER_FLAG], { stdio, env })
-      : fork(CHILD_PATH, [SEARCH_WORKER_FLAG], { stdio, env });
+    // 统一派生入口：源码态跑脚本，编译态由 exe 自拉起（见 src/child-process.js）
+    const child = spawnChild({ entryPath: CHILD_PATH, flag: SEARCH_WORKER_FLAG, env });
     const slot = {
       child,
       busy: false,
@@ -134,8 +116,7 @@ export class SearchExecutor {
           })
         );
       }
-      // 立即回收模式：查询一完成就杀掉进程，空闲时进程数恒为 0。
-      // 代价是每次查询都要重新 fork（Windows 上约 1 秒冷启动），换来最低的空闲内存。
+      // 立即回收模式：查询一完成就杀进程（代价是每次查询重新 spawn，换来空闲内存最低）
       if (this.recycleImmediate) this._killSlot(slot);
       // 槽位空出（或已回收），立即把队列头部的任务派过来
       this._dispatch();
@@ -156,8 +137,7 @@ export class SearchExecutor {
       const task = slot.task;
       slot.task = null;
       slot.busy = false;
-      // 刚 fork 就退出（seq 仍为 0 = 从未派发过任何查询）：多半是索引库不可用或
-      // 子进程脚本报错。任务侧会收到 reject，这里额外打日志便于定位。
+      // seq 仍为 0 说明刚 spawn 就退出（多半是索引库不可用或子进程脚本报错）
       if (slot.seq === 0) {
         log.error(`搜索子进程启动即退出（code=${code}）：索引库是否可用？`);
       }
@@ -181,9 +161,9 @@ export class SearchExecutor {
     if (i >= 0) this.queue.splice(i, 1);
   }
 
-  /** 从队列头部取任务派发给空闲进程；无空闲且未达上限则 fork 新的 */
+  /** 从队列头部取任务派发给空闲进程；无空闲且未达上限则 spawn 新的 */
   _dispatch() {
-    while (this.queue.length > 0 && !this._shuttingDown) {
+    while (this.queue.length > 0 && !this._shuttingDown && !this._paused) {
       const slot = this.pool.find((s) => !s.busy && !s.dead);
       if (!slot) {
         if (this.pool.length < this.maxProcesses) {
@@ -224,10 +204,8 @@ export class SearchExecutor {
   /**
    * 派发一次搜索。
    * @param {object} params 透传给 buildSearchApi().searchMagnetsSync 的参数
-   * @returns {{ done: Promise<any>, cancel: () => void }}
-   *   - done: 解析为检索结果（或 reject 为错误）
-   *   - cancel: 客户端断开时调用。仍在队列中 → 零成本移除；已派发 → SIGKILL
-   *     该进程，真正中断其正在执行的同步 SQLite 查询
+   * @returns {{ done: Promise<any>, cancel: () => void }} cancel 在客户端断开时调用：
+   *   仍在队列中则零成本移除，已派发则 SIGKILL 该进程（真正中断同步查询）
    */
   run(params) {
     let task;
@@ -290,6 +268,28 @@ export class SearchExecutor {
         task.reject(Object.assign(new Error('搜索已取消'), { code: 'CANCELLED' }));
       },
     };
+  }
+
+  /**
+   * 为「索引库原子切换」回收全部搜索子进程：杀掉并清空池，但保持池可用。
+   * 只置 _paused 而不用 terminateAll（后者置 _shuttingDown 且不恢复，复用会让此后所有
+   * 检索都返回「服务正在关闭」）：暂停期间不派发也不派生新进程，由 resume() 解除。
+   * 在飞的查询随进程被杀而失败（它们读的正是将被替换的旧库）。
+   *
+   * @returns {number} 被回收的进程数
+   */
+  recycleAll() {
+    const n = this.pool.length;
+    for (const slot of this.pool.slice()) this._killSlot(slot);
+    this._paused = true;
+    return n;
+  }
+
+  /** 切换完成后解除暂停，并把暂停期间积压的查询继续派发出去 */
+  resume() {
+    if (this._shuttingDown) return;
+    this._paused = false;
+    this._dispatch();
   }
 
   /** 关闭所有子进程（进程退出时调用），覆盖空闲 / 忙碌 / 排队中全部状态 */

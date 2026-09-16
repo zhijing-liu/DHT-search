@@ -1,18 +1,12 @@
 /**
- * 统一控制台输出：chalk 配色 + Emoji 图标。
- * ------------------------------------------------------------------
- * 所有运行时日志（index.js / db.js / searchPool.js / app-entry.cjs）都走这里，
- * 保证「图标 + 颜色 + 标签」三要素一致，避免各处散落的 console.* 风格漂移。
- *
- * 图标统一使用 Emoji 块字符（在主流终端里通常是双宽），因此图标后只跟 1 个空格，
- * 即可让 [SYSTEM] / [USER] / [cache] 这些标签列自然对齐。
+ * 统一控制台输出：chalk 配色 + Emoji 图标（所有运行时日志都走这里，保证风格一致）。
+ * 图标为双宽块字符，故图标后只跟 1 个空格即可让标签列对齐。
  */
 import chalk from 'chalk';
 import { execSync } from 'node:child_process';
 
-// Windows 控制台默认代码页为 GBK(CP936)，会把 Node 以 UTF-8 写出的中文当成 GBK
-// 解码，导致日志里的中文乱码（如「鏀跺埌」）。首次加载即切到 UTF-8(CP65001)，
-// 让控制台按 UTF-8 解码 stdout 字节。非 Windows 或切换失败（服务/无控制台态）忽略。
+// Windows 控制台默认代码页为 GBK，会把 UTF-8 中文解成乱码，故首次加载切到 UTF-8；
+// 非 Windows 或切换失败（服务 / 无控制台态）忽略。
 if (process.platform === 'win32') {
   try {
     execSync('chcp 65001 > nul', { stdio: 'ignore' });

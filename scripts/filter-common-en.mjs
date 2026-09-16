@@ -1,10 +1,8 @@
 #!/usr/bin/env node
 /**
- * 自动筛选「宽泛英语热词」：把 keyword_stats 中纯字母、且属于常用英语词表
- * （data/common-english.txt，约 1 万最常用的日常英语词）的词挑出来，
- * 视为「指向很宽泛、无检索价值的英语词」加入黑名单候选；另补一小撮明显的
- * 语言/地区代码噪声。结果写入 scripts/hot-filter-en.auto.txt 供人工审阅，
- * 不直接动库（最终由 scripts/seed-filter.mjs 入库）。
+ * 自动筛选「宽泛英语热词」：把 keyword_stats 中纯字母且属于常用英语词表
+ * （data/common-english.txt）的词挑出来作为黑名单候选，另补一小撮语言 / 地区代码噪声。
+ * 结果写入 scripts/hot-filter-en.auto.txt 供人工审阅，不直接动库。
  *
  * 用法：node scripts/filter-common-en.mjs
  */

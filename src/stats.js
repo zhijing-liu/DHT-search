@@ -1,15 +1,9 @@
 /**
  * 运行期状态（设置面板监测用）
  * ------------------------------------------------------------------
- * 单一数据源：设置面板 SSE 推送所需的全部「服务自身状态」集中在此，由
- * index.js 的 collectStats() 统一组装后推送（src/stats.js 只管状态，不管采集）。
- *
- * 为什么用 begin/end 这类成对函数而不是直接赋值：
- *   reindex / sync 的 running 标志必须在异常路径也复位，否则前端进度条会
- *   永远卡在「正在重建…」。把开始/结束收敛成函数后，调用方只需在 finally
- *   里调 end*()，不可能漏掉复位。
- *
- * 本模块零外部依赖（不 import 任何运行时对象），可独立测试。
+ * 设置面板 SSE 推送所需的全部「服务自身状态」集中在此，由 index.js 的 collectStats()
+ * 组装后推送。状态变更统一走成对的 begin / end 函数，以便调用方在 finally 里复位
+ * running 标志（否则前端进度条会永远卡住）。本模块零外部依赖，可独立测试。
  */
 
 /** 运行期状态快照（进程内单例） */
@@ -18,8 +12,14 @@ export const runtimeStats = {
   reindex: { running: false, done: 0, total: 0 },
   /** 增量同步节拍 */
   sync: { running: false, lastAt: null, lastAdded: 0, nextAt: null },
-  /** 索引维护中（启动同步 / 手动·定时同步 / 重建 统一状态机，由 db.js 直接赋值） */
-  indexing: { running: false, mode: null, done: 0, total: 0 },
+  /**
+   * 索引维护中（启动同步 / 手动·定时同步 / 重建 统一状态机，由 db.js 直接赋值）。
+   * step 系列字段描述「当前在第几步做什么」，scanned/total 仅在 step='scan' 时有意义。
+   */
+  indexing: {
+    running: false, mode: null, done: 0, scanned: 0, total: 0,
+    step: null, stepIndex: 0, stepCount: 0, startedAt: 0,
+  },
   /** 启动初始化中（仅首次启动同步期间为 true） */
   initializing: false,
   /** 搜索结果缓存命中统计（累计值） */
@@ -30,11 +30,7 @@ export const runtimeStats = {
 /* 搜索缓存命中率                                                      */
 /* ------------------------------------------------------------------ */
 
-/**
- * 缓存命中 +1。
- * 刻意做成「自进程启动累计」而非随 searchCache.clear() 清零——这样能直接
- * 观察到每次增量同步清空缓存后命中率从高位跌落的过程。
- */
+/** 缓存命中 +1（自进程启动累计，不随 searchCache.clear() 清零） */
 export function markCacheHit() {
   runtimeStats.cache.hit += 1;
 }
@@ -53,9 +49,9 @@ export function beginReindex() {
   runtimeStats.reindex = { running: true, done: 0, total: 0 };
 }
 
-/** 重建进度（由 api.reindex 的 onProgress 回调驱动） */
-export function setReindexProgress(done, total) {
-  runtimeStats.reindex = { running: true, done, total };
+/** 重建进度（由 api.reindex 的 onProgress 回调驱动；step 为当前阶段名） */
+export function setReindexProgress(done, total, step = null) {
+  runtimeStats.reindex = { running: true, done, total, step };
 }
 
 /** 重建结束（成功/失败都要调，建议放在 finally 中） */
@@ -73,10 +69,8 @@ export function beginSync() {
 }
 
 /**
- * 同步结束（成功/失败都要调，建议放在 finally 中）。
- * 刻意**不在这里推算下次时刻**：同步节拍已交给 cron（SYNC_CRON），下次触发点
- * 由 cron 表达式单独推算（见 src/cron.js + index.js 的 getNextSyncAt），
- * 手动同步也不该挪动 cron 计划，故此处只记录本轮结果。
+ * 同步结束（成功/失败都要调，建议放在 finally 中）。只记录本轮结果，
+ * 下次触发时刻由调度器提供（见 index.js 的 getNextSyncAt）。
  * @param {number} added 本轮补录行数；异常时为 0
  */
 export function endSync(added) {

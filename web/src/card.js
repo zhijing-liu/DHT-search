@@ -1,23 +1,17 @@
 /**
- * 结果卡片组件（Alpine.data('magnetCard')）。
+ * 结果卡片组件（Alpine.data('magnetCard')）
  * ------------------------------------------------------------------
- * 一个卡片实例只承载「这一条结果」的状态：高亮 token、复制反馈、详情弹窗开关。
- * 卡片外观与结构全部写在 index.html 的 <magnet-card> 模板里（Tailwind 工具类），
- * 这里只提供只读派生数据（标题 / 文件预览 / 元信息）与少量动作。
+ * 一个实例只承载「这一条结果」的状态，提供只读派生数据（标题 / 文件预览 / 元信息）
+ * 与少量动作；外观与结构写在 index.html 的 <magnet-card> 模板里。
  */
 import Alpine from 'alpinejs';
-import {
-  buildFileTree,
-  computeTreeSizes,
-  previewFiles as pickPreviewFiles,
-  renderTreeNode,
-} from './file-tree.js';
+import { renderFileTree } from './file-tree.js';
+import { fetchMagnetFiles } from './api.js';
 import {
   copyToClipboard,
   formatBytes,
   formatDate,
   highlightHtml,
-  normalizeFiles,
   pushToAria2,
   toThunder,
 } from './util.js';
@@ -25,6 +19,15 @@ import { showToast } from './toast.js';
 
 /** 复制按钮反馈时长 */
 const COPIED_MS = 1200;
+
+/** 文件树按 id 缓存（上限 32 条，FIFO 淘汰）——树按需请求，反复打开不必重复往返 */
+
+const TREE_CACHE_MAX = 32;
+const treeCache = new Map();
+function cacheTree(id, nodes) {
+  if (treeCache.size >= TREE_CACHE_MAX) treeCache.delete(treeCache.keys().next().value);
+  treeCache.set(id, nodes);
+}
 
 export function registerCard() {
   Alpine.data('magnetCard', (item, tokens = []) => ({
@@ -49,30 +52,13 @@ export function registerCard() {
     get metaText() {
       return `大小 ${formatBytes(Number(this.item?.totalSize))} · 抓取于 ${formatDate(Number(this.item?.fetchedAt))}`;
     },
-    /**
-     * 派生值的记忆化缓存：挂在元素上（非响应式，读写不会自触发副作用），
-     * 按 (files, tokens) 的引用失效。
-     * 一次渲染里模板会多次读同一份派生值（预览列表 + 「还有 N 个文件」+ 详情文件树 +
-     * 「无文件列表」判断），上千文件的条目下重复 normalize / 筛选的代价并不小。
-     */
-    _memo() {
-      const files = this.item?.files;
-      const el = this.$el;
-      if (!el._memo || el._memo.files !== files || el._memo.tokens !== this.tokens) {
-        el._memo = { files, tokens: this.tokens, list: null, preview: null };
-      }
-      return el._memo;
+    /** 文件数（索引期算好的列）与预览（服务端挑好的前几条）都是直读字段 */
+    get fileCount() {
+      return Number(this.item?.fileCount) || 0;
     },
-    get fileList() {
-      const m = this._memo();
-      if (!m.list) m.list = normalizeFiles(m.files);
-      return m.list;
-    },
-    /** 预览文件（有关键词时优先展示命中的若干条） */
+    /** 预览文件：[{ path, size }]；有关键词时只含命中的条目 */
     get preview() {
-      const m = this._memo();
-      if (!m.preview) m.preview = pickPreviewFiles(m.files, m.tokens);
-      return m.preview;
+      return Array.isArray(this.item?.preview) ? this.item.preview : [];
     },
     get previewView() {
       return this.preview.map((f) => ({
@@ -81,7 +67,7 @@ export function registerCard() {
       }));
     },
     get moreCount() {
-      return Math.max(0, this.fileList.length - this.preview.length);
+      return Math.max(0, this.fileCount - this.preview.length);
     },
     get moreText() {
       return `…及其他 ${this.moreCount} 个文件（点「查看全部文件」展开）`;
@@ -130,17 +116,30 @@ export function registerCard() {
       this.$refs.detailDialog.close();
     },
 
-    /** 把递归文件树挂到详情弹窗的列表中（由模板的 x-init 调用，每次打开只构建一次） */
-    renderTree(container) {
-      const list = this.fileList;
-      container.replaceChildren();
-      if (!list.length) {
+    /**
+     * 把文件树挂到详情弹窗（模板的 x-init 调用，每次打开只跑一次）。
+     * 按需请求 /api/magnet/:id/files，命中缓存则直接渲染。
+     */
+    async renderTree(container) {
+      if (this.fileCount === 0) {
         container.textContent = '（无文件列表）';
         return;
       }
-      const root = buildFileTree(list);
-      computeTreeSizes(root);
-      container.replaceChildren(renderTreeNode(root, 0, this.tokens));
+      const id = this.item?.id;
+      const cached = treeCache.get(id);
+      if (cached) {
+        container.replaceChildren(renderFileTree(cached, this.tokens));
+        return;
+      }
+      container.textContent = '加载中…';
+      try {
+        const nodes = await fetchMagnetFiles(id);
+        cacheTree(id, nodes);
+        container.replaceChildren(renderFileTree(nodes, this.tokens));
+      } catch {
+        // 弹窗可能已被关闭（容器脱离文档），写文案无副作用
+        container.textContent = '文件列表加载失败';
+      }
     },
   }));
 }

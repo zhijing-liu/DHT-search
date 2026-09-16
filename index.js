@@ -1,20 +1,15 @@
 /**
  * Express 检索服务入口
  * ------------------------------------------------------------------
- *   GET /                 -> 重定向到 /index.html
- *   GET /index.html       -> 返回 public/index.html
- *   /public              -> 静态资源（app.js / styles.css）
- *   GET /api/search        -> FTS5 检索接口（复用 db.js）
- *   GET /api/latest        -> 最新入库列表（按入库顺序从新到旧，与检索/热词独立）
- *
- * 接口约定（GET /api/search）：
- *   q        必填，搜索关键词
- *   sortBy   可选 'fetchedAt' | 'totalSize' | 'relevance'（其余值忽略，按 id 排序）
- *   order    可选 'asc' | 'desc'，默认 desc，仅 sortBy 传入时生效
- *   limit    可选；默认分页（每页 20 条，钳制 1..200）。仅传 'all' 表示「整集拉取」
- *            （一次性返回全部匹配，上限 MAX_RESULTS）；0 / 负数 / 非数值一律按分页处理
- *   offset   可选，分页偏移（默认 0）
- * 返回：{ total, limit, offset, items, truncated? }
+ *   GET  /                    重定向到 /index.html
+ *   GET  /api/search          FTS5 检索（参数：q 必填；sortBy / order / limit / offset 可选）
+ *   GET  /api/latest          最新入库列表（不经 FTS，按入库顺序从新到旧）
+ *   GET  /api/magnet/:id/files 某条资源的完整文件树
+ *   POST /api/reindex         手动全量重建；POST /api/sync 手动增量补录
+ *   GET  /api/count           已索引总数
+ *   GET  /api/hot、/api/hot/filter(/export|/import)  热词榜与过滤词维护
+ *   GET  /api/stats/stream    运行状态 SSE
+ * 其余静态资源来自 public/（经 WEB_BASE_PATH 前缀访问）。
  */
 
 import path from 'node:path';
@@ -40,16 +35,14 @@ import {
   endSync,
   setNextSyncAt,
 } from './src/stats.js';
-import { nextCronTime } from './src/cron.js';
 
-// 编译产物（bun --compile）内 import.meta.url 指向虚拟文件系统，静态资源目录
-// 改取 exe 同目录的 public/；源码态行为不变
+// 编译产物（bun --compile）内 import.meta.url 指向虚拟文件系统，静态资源取 exe 同目录的 public/
 const __dirname = isCompiledExe
   ? path.dirname(process.execPath)
   : path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-// 端口唯一来源是 config.js（env 兜底永不生效，已移除，见 config.js 顶部说明）
+// 端口唯一来源是 config.js
 const PORT = Number(CONFIG.port) || 3000;
 
 const api = createMagnetDb({ sync: false });
@@ -58,10 +51,8 @@ const api = createMagnetDb({ sync: false });
 /* 已索引总数内存缓存（事件驱动）                                      */
 /* ------------------------------------------------------------------ */
 /**
- * count(*) 是百万行主键扫描，代价远高于其他查询。但 magnets_docs 的行数
- * 只在「会改动索引的事件」后才变化：启动初始化、增量同步补录新行、全量重建完成。
- * 故改为事件驱动的内存缓存——这些事件成功后调用 syncIndexedCount() 刷新一次，
- * 平时直接返回内存值，不再每次请求都扫表。
+ * 已索引总数的内存缓存：只在「会改动索引的事件」（启动初始化、增量补录、重建完成）
+ * 之后由 syncIndexedCount() 刷新，平时请求直接返回内存值，不再每次扫表。
  */
 let indexedCountCache = { value: null };
 function syncIndexedCount() {
@@ -74,11 +65,8 @@ function syncIndexedCount() {
 // 启动即初始化（createMagnetDb 内部已完成启动同步，索引库已是正确状态）
 syncIndexedCount();
 
-// 搜索子进程池：检索在独立进程中执行，客户端断开时 SIGKILL 该进程即可真正中断查询
-// （worker 线程的 terminate() 无法中断同步原生查询，详见 src/searchPool.js 文件头）。
-// 进程按需 fork：启动时 0 个，第一个查询到来才启动，客户端断开或空闲超时后回收，
-// 上限由 config.js 的 SEARCH_MAX_PROCESSES 控制。
-// 必须在 createMagnetDb() 之后创建——此时索引库文件已就绪，子进程才能以只读方式打开。
+// 搜索子进程池：检索在独立进程中执行（客户端断开时 SIGKILL 即可中断同步查询）；
+// 进程按需启动、断开或空闲超时后回收。必须在 createMagnetDb() 之后创建（索引库文件已就绪）。
 const searchExecutor = createSearchExecutor({
   maxProcesses: CONFIG.searchMaxProcesses,
   recycleImmediate: CONFIG.searchProcessRecycleImmediate,
@@ -88,22 +76,25 @@ const searchExecutor = createSearchExecutor({
   indexPath: api.indexPath,
 });
 
+// 索引库原子切换的前后钩子（重建写影子库，完成后由 db.js 的 swapIndex 调用）：
+//   before —— 回收搜索子进程并暂停派发（它们持有旧库句柄，不释放就无法改名文件）。
+//             必须用 recycleAll 而不是 terminateAll：后者是退出用的一次性开关且不恢复，
+//             挂在这里会让此后所有检索都返回「服务正在关闭」。
+//   after  —— 解除暂停，积压的查询继续派发到新库上。
+api.setBeforeSwap(() => searchExecutor.recycleAll());
+api.setAfterSwap(() => searchExecutor.resume());
+
 /* ------------------------------------------------------------------ */
 /* 搜索结果内存缓存                                                    */
 /* ------------------------------------------------------------------ */
 /**
  * 进程内搜索缓存：以「最大内存占用 + 每条 TTL」双约束淘汰。
- *  - 存的是**序列化后的 JSON 字符串**而非对象：对象的堆占用约为 JSON 字节数的
- *    3~5 倍（隐藏类指针、UTF-16 String、重复的 files 键名），存字符串让
- *    SEARCH_CACHE_MAX_SIZE_MB 的配额 ≈ 实际堆占用，命中时也可直接 res.send 省掉
- *    一次完整 stringify；
- *  - maxSize + sizeCalculation：按序列化后字节数限制总内存（空间约束）；
- *  - ttl + updateAgeOnGet：每条缓存独立计时，被访问即刷新 TTL；
- *    默认 1 小时，经 config.js 的 SEARCH_CACHE_TTL_MS 覆盖；
- *  - ttlAutopurge + 定时 purgeStale：超时且未被访问的条目会被真正释放（定期释放）。
+ * 存的是序列化后的 JSON 字符串（堆占用 ≈ 该值，命中时可直接 res.send 省一次 stringify）；
+ * 被访问即刷新 TTL（updateAgeOnGet），超时条目由 ttlAutopurge 与定时 purgeStale 真正释放。
  */
+// 兜底值（config.js 缺失 / 非法时）与 config.js 的默认值保持一致：32MB
 const SEARCH_CACHE_MAX_SIZE =
-  (Number(CONFIG.searchCacheMaxSizeMb) > 0 ? Number(CONFIG.searchCacheMaxSizeMb) : 256) * 1024 * 1024;
+  (Number(CONFIG.searchCacheMaxSizeMb) > 0 ? Number(CONFIG.searchCacheMaxSizeMb) : 32) * 1024 * 1024;
 const SEARCH_CACHE_TTL_MS =
   Number.isFinite(Number(CONFIG.searchCacheTtlMs)) && Number(CONFIG.searchCacheTtlMs) > 0
     ? Number(CONFIG.searchCacheTtlMs)
@@ -123,23 +114,18 @@ const searchCacheSweep = setInterval(() => searchCache.purgeStale(), 60_000);
 if (typeof searchCacheSweep.unref === 'function') searchCacheSweep.unref();
 
 /* ------------------------------------------------------------------ */
-/* 定时同步计划（cron 节拍的只读翻译）                                  */
+/* 定时同步计划（cron 节拍的只读查询）                                  */
 /* ------------------------------------------------------------------ */
-/**
- * 只有非空且 node-cron 认可才算「已启用」：表达式非法时下面的注册阶段会告警
- * 并不启用，这里保持一致，避免前端显示一个永远不会触发的倒计时。
- */
+/** 只有非空且 node-cron 认可才算「已启用」（与下面注册阶段的判定保持一致） */
 const SYNC_CRON_ON = Boolean(SYNC_CRON) && cron.validate(SYNC_CRON);
-/** 上次推算时刻；仅在推算无解（如 '0 0 30 2 *'）时用于重试节流 */
+/** 上次取值时刻；仅在取不到下次触发时间时用于重试节流 */
 let syncNextCheckedAt = 0;
 
 /**
- * 下次同步时刻——cron 表达式的只读翻译：不是「上次 + 固定间隔」，而是按
- * SYNC_CRON 重新求下一次触发点，因此与 node-cron 的实际节拍天然一致。
- *
- * 惰性重算：到点触发后（或系统休眠直接跨过触发点）缓存值即过期，下一帧重新
- * 推算；推算无解时最多每 10 秒重试一次，不至于每帧都白算。
- * @returns {number|null} 未启用 / 无法推算时为 null
+ * 下次同步时刻——直接问调度器（`task.getNextRun()`），不再自行推算 cron 语义。
+ * 惰性重算：缓存值过期时下一帧重取，取不到时最多每 10 秒重试一次。
+ * @param {number} [now=Date.now()]
+ * @returns {number|null} 未启用 / 取不到时为 null
  */
 function getNextSyncAt(now = Date.now()) {
   if (!SYNC_CRON_ON) return null;
@@ -147,7 +133,7 @@ function getNextSyncAt(now = Date.now()) {
   const stale = cur == null ? now - syncNextCheckedAt > 10_000 : cur <= now;
   if (stale) {
     syncNextCheckedAt = now;
-    setNextSyncAt(nextCronTime(SYNC_CRON, new Date(now))?.getTime() ?? null);
+    setNextSyncAt(syncTask?.getNextRun()?.getTime() ?? null);
   }
   return runtimeStats.sync.nextAt;
 }
@@ -155,11 +141,8 @@ function getNextSyncAt(now = Date.now()) {
 const app = express();
 
 /**
- * WEB_BASE_PATH 作为整个 Express 服务的统一前缀（如 '/dht'）：
- * 在路由层面前把 /dht/api/...、/dht/assets/...、/dht/index.html 等请求剥掉前缀，
- * 于是后续所有 API / 静态 / 中间件都无需感知前缀即可统一工作；
- * 不带前缀的根路径请求（旧直连/nginx 已剥前缀的转发）继续兼容。
- * 入口统一：访问站点根 '/' 会被重定向到 `${PREFIX}/index.html`（见下）。
+ * WEB_BASE_PATH 作为整个 Express 服务的统一前缀（如 '/dht'）：在此剥掉前缀，
+ * 后续 API / 静态 / 中间件都无需感知前缀；不带前缀的直连路径同样可用。
  */
 const PREFIX = (() => {
   const p = String(WEB_BASE_PATH ?? '').trim().replace(/^\/+|\/+$/g, '');
@@ -177,23 +160,17 @@ if (PREFIX) {
   });
 }
 
-// 信任前置反向代理（nginx 等）时设为 true / 'loopback' / 具体子网，
-// 才能从 X-Forwarded-For 拿到真实客户端 IP 用于白名单比对；
-// 默认 false：直连场景取 TCP 对端地址，安全且正确。
+// 是否信任前置反代的 X-Forwarded-For（用于白名单比对时拿到真实客户端 IP）
 if (TRUST_PROXY) app.set('trust proxy', TRUST_PROXY);
 
-// 接入层访问控制（IP / 网段白名单）：放在最前，整站（前端页面 + 所有 API +
-// 写接口）统一由白名单把关。mode 为 'off' 或白名单为空时不限制。
+// 接入层访问控制（IP / 网段白名单）：放在最前，整站统一由白名单把关
 app.use(createAccessControl({
   mode: ACCESS_CONTROL_MODE ?? 'off',
   allowed: ALLOWED_CLIENTS ?? [],
 }));
 
-/**
- * 请求日志中间件：所有来自用户（或前端）主动发起的操作统一标记为 [USER]。
- * 仅记录页面入口与 /api 接口，忽略 /public 下的静态资源噪音（app.js / styles.css 等），
- * 让控制台输出聚焦于「用户做了什么」。
- */
+/** 请求日志中间件：只记录页面入口与 /api 接口，忽略 /public 静态资源噪音 */
+
 app.use((req, res, next) => {
   if (req.path === '/' || req.path === '/index.html' || req.path.startsWith('/api/')) {
     const start = Date.now();
@@ -220,12 +197,15 @@ function apiHandler(fn, status = 500, defaultMessage = INTERNAL_ERROR) {
       .then(() => fn(req, res))
       .catch((err) => {
         if (res.headersSent) return;
-        // 错误对象自带合法 status（如搜索排队满 / 排队超时标记的 503）时优先使用，
-        // 让「服务过载」与「客户端错误 / 内部错误」在状态码上可区分
+        // 错误对象自带合法 status（如排队满 / 超时标记的 503）时优先使用
         const code =
           Number.isInteger(err?.status) && err.status >= 400 && err.status < 600
             ? err.status
             : status;
+        // 5xx 记服务端日志（客户端只看到一句话）；4xx 属预期内输入错误，不记以免刷屏
+        if (code >= 500) {
+          log.error(`${req.method} ${req.originalUrl} -> ${code}: ${err?.stack || err?.message || err}`);
+        }
         res.status(code).json({ error: err?.message || defaultMessage });
       });
   };
@@ -238,11 +218,7 @@ app.get('/', (_req, res) => res.redirect(`${PREFIX}/index.html`));
 app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
 
-/**
- * 构造搜索缓存键：直接由归一化后的检索参数派生。
- * 这样「影响结果的字段」与「参与比对的字段」永远同源——将来新增检索参数时，
- * 不可能再出现「忘了同步进缓存键导致不同查询撞 key」的问题。
- */
+/** 构造搜索缓存键：由归一化后的检索参数派生（新增参数时不易漏改） */
 function searchCacheKey(s) {
   return JSON.stringify([s.query, s.by, s.sortBy, s.order, s.limit, s.offset, s.minSize, s.maxSize]);
 }
@@ -252,11 +228,7 @@ function describeSearch(s) {
   return `q="${s.query}" 模式=${s.by === 'hash' ? 'infohash精确' : 'FTS5模糊'} 排序=${s.sortBy ?? 'id'}/${s.order}`;
 }
 
-/**
- * 「最新入库」缓存键：首元素用哨兵字符串而非查询词，与搜索键（首元素恒为查询词）
- * 在结构上不可能相撞——两边数组长度也不同（8 vs 3）。
- * 该接口只有分页，故键里只有 limit / offset（结果固定按 id 倒序）。
- */
+/** 「最新入库」缓存键：首元素用哨兵字符串，与搜索键不会相撞；只有分页参数 */
 function latestCacheKey(s) {
   return JSON.stringify(['__latest__', s.limit, s.offset]);
 }
@@ -267,15 +239,9 @@ function describeLatest(s) {
 }
 
 /**
- * 查询类请求的统一执行管线（/api/search 与 /api/latest 共用）。
- *
- * 职责：查缓存 → 派发搜索子进程 → 客户端断开时取消 → 回写缓存与响应。
- * 两个接口的差异只有「参数归一化、缓存键、子进程模式（params.mode）、是否可缓存」，
- * 全部由调用方传入，本函数不感知具体业务。
- *
- * 为什么必须放进子进程执行：better-sqlite3 / bun:sqlite 是同步 API，
- * 客户端断开时只有 SIGKILL 整个进程才能真正中断正在执行的同步 SQLite 查询
- * （线程 terminate() 无效，见 src/searchPool.js 文件头）。
+ * 查询类请求的统一执行管线（/api/search 与 /api/latest 共用）：
+ * 查缓存 → 派发搜索子进程 → 客户端断开时取消 → 回写缓存与响应。
+ * 接口差异（参数、缓存键、子进程模式、是否可缓存）全部由调用方传入。
  *
  * @param {import('express').Request}  req
  * @param {import('express').Response} res
@@ -303,11 +269,9 @@ async function runQuery(req, res, { params, key, describe, cacheable = true }) {
   const logCancelled = () => log.cancel(`客户端断开，已取消检索 ${describe}`);
 
   let aborted = false;
-  // 客户端断开（关闭页面 / 中止请求 / 新一轮查询取消旧请求）时：
-  // 1) 标记 aborted，避免正常分支再写响应 / 缓存；
-  // 2) 立即 SIGKILL 该搜索子进程——由操作系统回收进程，其中正在执行的同步 SQLite 查询随之中断。
-  // 用 req 的 close 而非仅靠 res 的 close：Express 5 下 res.close 在 keep-alive 正常响应完成后
-  // 也会触发，对「客户端已离开」判断不可靠；req.close 才是断连信号。两者兜底，Bun / Node 均生效。
+  // 客户端断开（关闭页面 / 中止请求 / 新一轮查询取消旧请求）时：标记 aborted（避免再写响应与缓存），
+  // 并让 cancel() 中断该次检索。两个事件都监听：Express 5 下 res.close 在 keep-alive 正常
+  // 响应完成后也会触发，req.close 才是可靠的断连信号。
   const onClose = () => {
     if (aborted) return;
     aborted = true;
@@ -345,9 +309,7 @@ async function runQuery(req, res, { params, key, describe, cacheable = true }) {
 }
 
 app.get('/api/search', apiHandler(async (req, res) => {
-  // 参数只归一化这一次：缓存键、worker 派参、日志描述全部由这一个对象派生。
-  // 注意 HTTP 参数名是 q，而领域字段名是 query，在此处完成这唯一的命名映射；
-  // req.query 的值可能是字符串也可能是数组，normalizeSearchQuery 统一收敛为安全类型。
+  // 参数只归一化这一次（HTTP 参数名 q → 领域字段 query），缓存键 / 派参 / 日志都由它派生
   const s = normalizeSearchQuery({ ...req.query, query: req.query.q });
   if (!s.query) {
     return res.status(400).json({ error: 'query 不能为空' });
@@ -363,8 +325,7 @@ app.get('/api/search', apiHandler(async (req, res) => {
 }));
 
 /**
- * 最新入库列表：直接遍历副本表，按 id 倒序（即表倒序 / 入库顺序从新到旧）返回一页。
- * 与检索完全独立——没有关键词、不经过 FTS、不参与热词与相关度，也不提供排序与过滤。
+ * 最新入库列表：遍历副本表按 id 倒序返回一页（不经 FTS，无关键词 / 排序 / 过滤）。
  * 参数只有分页：limit / offset
  */
 app.get('/api/latest', apiHandler(async (req, res) => {
@@ -376,16 +337,32 @@ app.get('/api/latest', apiHandler(async (req, res) => {
   });
 }));
 
-/** 手动全量重建影子索引（在 worker 线程 / 子进程中执行，重建期间检索仍可用） */
+/**
+ * 某条 magnet 的完整文件树（扁平树：parent 指向父节点下标，根为 -1）。
+ * 列表接口只下发 fileCount + 预览，整棵树由本接口按需返回；单行主键查询，不走搜索进程池。
+ */
+app.get('/api/magnet/:id/files', apiHandler((req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: 'id 非法' });
+  }
+  const found = api.getMagnetFiles(id);
+  if (!found) {
+    return res.status(404).json({ error: '未找到该条目' });
+  }
+  res.json({ id: found.id, nodes: found.nodes });
+}));
+
+/** 手动全量重建影子索引（在独立子进程中执行，重建期间检索仍可用） */
 app.post('/api/reindex', apiHandler(async (_req, res) => {
   log.user('手动触发全量索引重建');
   beginReindex();
   let indexed;
   try {
-    indexed = await api.reindex(({ done, total }) => {
+    indexed = await api.reindex(({ done, total, step }) => {
       // 进度写入运行时状态，由 SSE 顺带推送给设置面板（不额外做事件总线）
-      setReindexProgress(done, total);
-      log.progress(`重建进度 ${done}/${total}`);
+      setReindexProgress(done, total, step ?? null);
+      log.progress(`重建进度 ${step ?? '-'} ${done}/${total}`);
     });
   } finally {
     endReindex();
@@ -438,10 +415,8 @@ app.get('/api/count', apiHandler((_req, res) => {
 /* 运行状态监测（设置面板 SSE）                                        */
 /* ------------------------------------------------------------------ */
 /**
- * 采集一份完整运行期快照——所有推送字段的唯一组装点。
- * 新增/删除面板指标只改这个函数，SSE 路由与前端渲染都不必改动。
- * 注意推的是时间戳而非倒计时：相对时间交给前端本地逐秒渲染，
- * 服务端无需为此提高推送频率。
+ * 采集一份完整运行期快照——所有推送字段的唯一组装点（新增指标只改这里）。
+ * 推的是时间戳而非倒计时，相对时间交给前端本地渲染。
  */
 function collectStats() {
   if (indexedCountCache.value == null) syncIndexedCount();
@@ -571,26 +546,33 @@ const server = app.listen(PORT, () => {
   log.banner(PORT, CONFIG.maxResults);
 });
 
-// 启动同步：由 config.js 的 SYNC_ON_START 控制。
-// true：丢进后台增量补录，不阻塞主线程、页面立即可响应；
-//   期间标记 initializing，完成后刷新总数缓存。
-// false：跳过启动补录，索引维持上次退出时的状态（仍可手动 /api/sync 或等 SYNC_CRON）。
-if (SYNC_ON_START) {
+// 启动索引维护（后台执行，期间标记 initializing，页面立即可用）：
+//   1) 索引格式过期（版本升级 / 首次建库）→ 全量重建，与 SYNC_ON_START 无关；
+//   2) 否则按 SYNC_ON_START 决定是否做一次增量补录。
+// 完成后刷新总数缓存；重建还要清搜索缓存（索引内容已变）。
+const needsFormatMigration = api.indexNeedsRebuild();
+if (needsFormatMigration || SYNC_ON_START) {
   runtimeStats.initializing = true;
-  api.syncIncremental()
-    .then((r) => { if (r && r.added > 0) syncIndexedCount(); })
-    .catch((e) => log.error(`启动同步失败: ${e?.message || e}`))
+  if (needsFormatMigration) {
+    log.warn('索引格式已过期（版本升级或首次建库），后台开始全量重建；期间线上仍用旧索引服务');
+  }
+  const job = needsFormatMigration ? api.reindex() : api.syncIncremental();
+  job
+    .then((r) => {
+      if (needsFormatMigration) searchCache.clear();
+      else if (r && r.added > 0) syncIndexedCount();
+    })
+    .catch((e) => log.error(`启动${needsFormatMigration ? '重建' : '同步'}失败: ${e?.message || e}`))
     .finally(() => {
       runtimeStats.initializing = false;
       syncIndexedCount(); // 无论成败都刷新总数，反映当前索引状态
     });
 } else {
-  log.system('SYNC_ON_START=false，已跳过启动增量同步');
+  log.system('SYNC_ON_START=false，已跳过启动增量同步（索引格式无变化）');
 }
 
-// 定时增量同步（唯一周期索引维护）：SYNC_CRON（默认关闭）到点在后台执行一次
-// 增量补录（按 last_rowid 只灌源库新增行，秒级、几乎无写放大），主进程零阻塞。
-// 全量重建不再定时执行，只保留给启动建库（tokenizer 变更/索引为空）与手动 /api/reindex。
+// 定时增量同步（唯一的周期索引维护）：SYNC_CRON（默认关闭）到点在后台补录新增行；
+// 全量重建只保留给启动建库与手动 /api/reindex。
 let syncTask = null;
 if (SYNC_CRON_ON) {
   syncTask = cron.schedule(SYNC_CRON, async () => {
@@ -619,7 +601,7 @@ if (SYNC_CRON_ON) {
       log.ok(`定时增量同步完成，补录 ${added} 行${added > 0 ? '，已清空搜索缓存' : ''}`);
     }
   });
-  const nextRun = nextCronTime(SYNC_CRON);
+  const nextRun = syncTask.getNextRun();
   log.system(`已注册定时增量同步任务（cron: ${SYNC_CRON}${nextRun ? `，下次 ${nextRun.toLocaleString('zh-CN')}` : ''}）`);
 } else if (SYNC_CRON) {
   log.warn(`SYNC_CRON 表达式无效，已忽略: ${SYNC_CRON}`);

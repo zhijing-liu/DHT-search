@@ -1,8 +1,6 @@
 /**
- * 后端接口层。
- * ------------------------------------------------------------------
- * 统一「拼参 → 取 JSON → 校验 ok」三步，失败一律 throw Error(后端 error 文案 || HTTP 状态)，
- * 于是组件层只需 try/catch + showToast，不再各自解析响应。
+ * 后端接口层：统一「拼参 → 取 JSON → 校验 ok」，失败一律 throw Error（后端 error 文案
+ * 或 HTTP 状态），组件层只需 try/catch + showToast。
  */
 
 /** 解析响应；非 2xx 抛错，错误信息优先取后端返回的 error 字段 */
@@ -34,6 +32,12 @@ export const search = (params, signal) => get('api/search', params, signal);
 
 /** 资源库（固定 id 倒序，只传分页参数） */
 export const fetchLatest = (params, signal) => get('api/latest', params, signal);
+
+/** 某条 magnet 的完整文件树（列表只下发 fileCount + 预览，整棵树在打开详情时才取） */
+export const fetchMagnetFiles = (id) =>
+  fetch(`api/magnet/${encodeURIComponent(id)}/files`)
+    .then(toJson)
+    .then((d) => d.nodes || []);
 
 /** 已索引总数 */
 export const fetchCount = () => fetch('api/count').then(toJson).then((d) => d.count);

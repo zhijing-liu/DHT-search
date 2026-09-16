@@ -1,26 +1,11 @@
 /**
- * 搜索子进程：在独立进程内执行检索，主进程在客户端断开时 SIGKILL 掉本进程，
- * 即可中断其正在执行的同步 SQLite 查询。
+ * 搜索子进程：在独立进程内执行检索，主进程在客户端断开时 SIGKILL 本进程，即可中断其
+ * 正在执行的同步 SQLite 查询（worker 线程的 terminate() 拦不住卡在原生调用里的查询）。
  *
- * 为什么必须是「进程」而不是「线程」
- * ------------------------------------------------------------------
- * better-sqlite3 / bun:sqlite 都是同步 API，一条查询会把整个执行单元阻塞在 C++
- * 里。worker.terminate() 走的是 V8 的 Isolate::TerminateExecution —— 终止标志要等
- * 执行权回到 JS 才被检查，卡在原生调用里的查询根本收不到信号。实测：
- *   - Node + better-sqlite3：terminate() 到 worker 真正退出 = 23328ms（＝查询跑完）
- *   - Bun + bun:sqlite     ：6s 后 worker 仍存活
- * 两个运行时都无法中断。唯一能打断同步原生调用的是操作系统级 kill，实测
- * kill(SIGKILL) -> exit 在两个运行时均为 6ms。
- *
- * 本进程以只读方式打开索引库（query_only=ON），被 SIGKILL 不会造成任何数据损坏。
- *
- * 与主进程共用同一套检索实现（buildSearchApi），Bun / Node 下逻辑一致。
- *
- * 启动方式（统一以 SEARCH_WORKER_FLAG 命令行标记守卫，见 worker-flags.js）：
- *   - 源码运行：searchPool.js fork 本文件并附加该标记；
- *   - 编译运行（bun build --compile）：磁盘上没有本文件，searchPool.js 改为
- *     spawn(exe 自身, [标记]) 自拉起 —— 两种方式的 IPC 消息协议一致。
- * 被普通 import（如 exe 打包入口）时 main() 不执行，无副作用。
+ * 以只读方式打开索引库（query_only=ON），被 SIGKILL 不会造成数据损坏；
+ * 与主进程共用同一套检索实现（buildSearchApi）。
+ * 派生方式与命令行标记守卫见 src/child-process.js 与 worker-flags.js；被普通 import
+ * 时 main() 不执行。
  */
 import { openDatabase, createDrizzle, setPragma } from './db-driver.js';
 import { CONFIG, resolveDbPath, DEFAULT_INDEX_DB_PATH } from './store.js';
@@ -35,11 +20,8 @@ function main() {
   );
 
   /**
-   * 本进程的内存配额（来自 config.js，缺省值与其保持一致）：
-   *   - cacheSizeKb：SQLite page cache，是**每个进程一份**的私有内存；
-   *   - mmapSizeMb ：mmap 窗口，映射共享 clean page，多进程读同一库不重复占用，
-   *                  且可被 OS 回收，故同样的预算给 mmap 比给 page cache 划算。
-   * 检索是分页的（单次 ≤ MAX_LIMIT 条），工作集很小，默认「小 cache + 中等 mmap」。
+   * 本进程的 SQLite 内存配额（来自 config.js，缺省值与其保持一致）：
+   * cacheSizeKb 是每进程一份的私有内存，mmapSizeMb 映射的是可回收的共享页。
    */
   const CACHE_SIZE_KB =
     Number(CONFIG.searchProcessCacheSizeKb) > 0 ? Math.trunc(Number(CONFIG.searchProcessCacheSizeKb)) : 2048;
@@ -53,9 +35,7 @@ function main() {
   // SQLite 的 cache_size 负数值单位才是 KiB，故这里取负
   setPragma(rdb, 'cache_size', -CACHE_SIZE_KB);
   setPragma(rdb, 'mmap_size', MMAP_SIZE_MB * 1024 * 1024);
-  // 排序临时数据放内存：宽泛词 + 非 id 排序（totalSize/fetchedAt/bm25）时匹配量可达
-  // 数十万，落磁盘排序慢数倍（实测 20.8 万匹配 6681ms→836ms）。排序只存排序键+rowid，
-  // 数十万行仅几 MB，内存安全。
+  // 排序临时数据放内存（宽泛词非 id 排序时匹配量可达数十万，落盘慢数倍；数据仅排序键+rowid）
   setPragma(rdb, 'temp_store', 'MEMORY');
   const dbRO = createDrizzle(rdb);
 
@@ -64,9 +44,7 @@ function main() {
   process.on('message', (msg) => {
     const { id, params } = msg;
     try {
-      // params.mode 是唯一的任务类型开关（缺省为关键词检索）：
-      //   'latest' → 最新入库列表（不经过 FTS，按入库顺序从新到旧）
-      //   其他/缺省 → FTS5 模糊或 infohash 精确检索
+      // params.mode 是任务类型开关：'latest' = 最新入库列表，其余 = 关键词检索
       const result = params?.mode === 'latest' ? listLatestSync(params) : searchMagnetsSync(params);
       process.send({ id, type: 'result', result });
     } catch (e) {

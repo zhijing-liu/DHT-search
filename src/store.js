@@ -1,14 +1,12 @@
 /**
  * 全局配置与共享约定（store）
  * ------------------------------------------------------------------
- * 集中存放跨模块共享的「配置 + 约定常量」，与 db.js 的查询实现解耦：
- *   - CONFIG              来自 config.js 的运行期配置（具名 export const 聚合）
- *   - 库路径约定         DEFAULT_DB_PATH / DEFAULT_INDEX_DB_PATH / resolveDbPath
- *   - 表名约定           TABLE / FTS_TABLE / DOCS_TABLE / KEYWORD_TABLE / KEYWORD_FILTER_TABLE
- *   - 索引与排序约定     TOKENIZER / DEFAULT_LIMIT / MAX_LIMIT / SORT_COLUMNS
- *
- * db.js 仅导入使用，不再各自 export；纯查询实现细节（ORDER_SQL /
- * SELECT_COLUMNS / TOKEN_PATTERN 等）仍留在 db.js。
+ * 集中存放跨模块共享的「配置 + 约定常量」，只放约定不放实现：
+ *   - CONFIG           来自 config.js 的运行期配置（具名 export const 聚合）
+ *   - 库路径 / 表名     DEFAULT_DB_PATH / DEFAULT_INDEX_DB_PATH / resolveDbPath，各表名
+ *   - 列清单            DOCS_COLUMN_DEFS / RECORD_COLUMNS / DOCS_SELECT_COLUMNS（唯一来源）
+ *   - 索引与排序约定    TOKENIZER / DEFAULT_LIMIT / MAX_LIMIT / SORT_COLUMNS
+ * 查询实现细节在 search/query.js，token 规则在 util.js，DDL 与老库补列在 index/ddl.js。
  */
 
 import path from 'node:path';
@@ -85,10 +83,68 @@ export const TABLE = 'magnets';
 export const FTS_TABLE = 'magnets_fts';
 /** 影子索引库中的去规范化副本表名（展示/排序用） */
 export const DOCS_TABLE = 'magnets_docs';
+
 /** 热词统计表名（构建索引时随 populate 统计写入） */
 export const KEYWORD_TABLE = 'keyword_stats';
 /** 热词过滤表名（用户配置的噪声词；reindex 不清除） */
 export const KEYWORD_FILTER_TABLE = 'keyword_filter';
+
+/** 索引状态表名（同步水位 / 格式版本 / 维护状态），key/value 结构 */
+export const STATE_TABLE = 'sync_meta';
+
+/* ------------------------------------------------------------------ */
+/* 副本表（magnets_docs）列清单 —— 全站唯一来源                        */
+/* ------------------------------------------------------------------ */
+/**
+ * 每项为 [列名, 类型与约束]。`id` 是主键、建表时必在，不参与老库补列。
+ *
+ * 副本表的列定义只有这一处，以下四处都由它派生：
+ *   DOCS_COLUMN_DEFS ─┬→ index/ddl.js：建表 SQL + 老库补列语句
+ *                     ├→ RECORD_COLUMNS：db.js 读源库的列 + 源表列校验
+ *                     └→ DOCS_SELECT_COLUMNS：search/api.js 的检索取列白名单
+ */
+export const DOCS_COLUMN_DEFS = Object.freeze([
+  ['id', 'INTEGER PRIMARY KEY'],
+  ['name', "TEXT NOT NULL DEFAULT ''"],
+  ['infohash', 'TEXT'],
+  ['magnet', 'TEXT'],
+  ['files', 'TEXT'],
+  ['fileCount', 'INTEGER NOT NULL DEFAULT 0'],
+  ['totalSize', 'INTEGER NOT NULL DEFAULT 0'],
+  ['fetchedAt', 'INTEGER NOT NULL DEFAULT 0'],
+]);
+
+/** 列名数组（顺序即 DDL 顺序） */
+export const DOCS_COLUMN_NAMES = Object.freeze(DOCS_COLUMN_DEFS.map(([name]) => name));
+
+/** 索引期派生列：源库没有这些列，由 index/transform.js 在索引时算出 */
+const DERIVED_COLUMNS = Object.freeze(['fileCount']);
+
+/** 源库（magnets）必需列 = 副本表列清单 − 派生列；读源库的 SELECT 与源表列校验共用 */
+export const RECORD_COLUMNS = DOCS_COLUMN_NAMES.filter((n) => !DERIVED_COLUMNS.includes(n)).join(', ');
+
+/**
+ * 带 `m.` 前缀的列清单：检索 JOIN 的取列白名单（别名 m 指向副本表）。
+ * 含 `files` 是因为服务端要据此挑预览，响应体里会丢掉它、只下发 `preview`。
+ */
+export const DOCS_SELECT_COLUMNS = DOCS_COLUMN_NAMES.map((name) => `m.${name}`).join(', ');
+
+/**
+ * 索引状态表的键。按写入时机分三类，混用会破坏失败恢复：
+ *   dataWatermark            每批与数据同事务推进（断点续跑的起点）
+ *   tokenizer / filesFormat  只在重建成功收尾才写（中途失败留在旧值即触发重跑）
+ *   buildMode / ftsPending   维护过程状态（中断识别、FTS 合并节流）
+ */
+export const STATE_KEYS = Object.freeze({
+  dataWatermark: 'last_rowid',
+  tokenizer: 'tokenizer',
+  filesFormat: 'files_format',
+  buildMode: 'build_mode',
+  ftsPending: 'fts_pending',
+});
+
+/** 维护状态取值（STATE_KEYS.buildMode） */
+export const BUILD_MODES = Object.freeze({ idle: 'idle', full: 'full', incremental: 'incremental' });
 
 /** FTS5 分词器（unicode61：大小写/变音折叠，去变音符） */
 export const TOKENIZER = 'unicode61 remove_diacritics 2';

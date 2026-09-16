@@ -1,13 +1,9 @@
 /**
- * 页面主组件（Alpine.data('searchPage')）。
+ * 页面主组件（Alpine.data('searchPage')）
  * ------------------------------------------------------------------
- * 这里是唯一的状态源：所有渲染都由 index.html 的模板绑定驱动，所有交互都在模板里
- * 显式声明为 @click / @input / @keydown…，本文件不查询、不构造任何 DOM。
- *
- * 约定：
- *   - 状态字段用名词（mode / query / items…），动作统一用动词短语（submitSearch / loadPage…）；
- *   - 只读派生值一律做成 getter，模板直接读，避免额外的同步字段；
- *   - 每个动作只做一件事，网络与提示交给 api.js / toast.js。
+ * 唯一的状态源：所有渲染由 index.html 的模板绑定驱动，所有交互在模板里声明，
+ * 本文件不查询、不构造任何 DOM。只读派生值一律做成 getter 供模板直接读；
+ * 网络与提示交给 api.js / toast.js。
  */
 import Alpine from 'alpinejs';
 import * as api from './api.js';
@@ -30,9 +26,8 @@ import {
 const DEFAULT_PAGE_SIZE = 20;
 
 /**
- * loading 蒙层的出现延迟（毫秒）：请求在此时间内返回就完全不显示蒙层，避免「闪一下」。
- * 注意「请求在途」(searching) 与「蒙层可见」(loadingVisible) 是两件事：
- * 前者必须立刻为真（否则防不住重复触发），后者延后出现。
+ * loading 蒙层的出现延迟（毫秒）：请求及时返回就不显示蒙层。
+ * 「请求在途」(searching) 立刻为真以挡住重复触发，蒙层显隐另行延后。
  */
 const LOADING_DELAY_MS = 300;
 
@@ -65,9 +60,7 @@ const PAGE_BTN_CLASS =
 const PAGE_NAV_CLASS = 'inline-flex items-center justify-center size-9 p-0 box-border';
 const PAGE_NUM_CLASS = 'inline-flex items-center justify-center h-9 min-w-9 px-2 text-sm box-border';
 const PAGE_DOTS_CLASS = 'inline-flex items-center justify-center h-9 px-1.5 text-muted box-border';
-/** 当前页码的标记类：配合上面的 [&.active] 变体生效。
- *  注意必须是完整类名字符串——Alpine 的 :class 遇到数组会直接 join(' ')，
- *  数组里混对象会被字符串化成 "[object Object]" 并被当作类名加进去。 */
+/** 当前页码的标记类（配合上面的 [&.active] 变体）；必须是完整类名字符串 */
 const PAGE_ACTIVE_CLASS = 'active';
 
 /** 热词：一次拉全量（联想候选要全），榜单只展示前 HOT_LIST_SIZE 条 */
@@ -76,6 +69,26 @@ const HOT_LIST_SIZE = 200;
 
 /** 运行状态悬浮窗开关的持久化键 */
 const STATS_HUD_KEY = 'dht_stats_hud';
+
+/**
+ * 悬浮窗状态标签：[短标签, 完整说明]。
+ * 面板仅 196px，显示用短标签，完整说明挂在 title 上。
+ */
+const STATUS_LABEL = {
+  init: ['初始化中…', '索引初始化中：后台正在同步索引，页面可正常使用'],
+  reindex: ['重建中…', '正在重建索引'],
+  sync: ['同步中…', '正在同步索引'],
+  idle: ['自动刷新', '每 3 秒自动刷新一次'],
+};
+
+/** 索引维护阶段名（与后端 db.js 上报的 step 一一对应） */
+const STEP_LABEL = {
+  schema: '准备索引库',
+  scan: '写入索引',
+  index: '建立二级索引',
+  merge: '合并 FTS 索引',
+  checkpoint: '回写数据库',
+};
 
 /** 空的运行状态快照（避免模板里到处判空） */
 const EMPTY_STATS = {
@@ -87,10 +100,14 @@ const EMPTY_STATS = {
   procs: '—',
   indexed: '—',
   status: '连接中…',
+  statusHint: '',
   nextSyncAt: 0,
   syncCron: '',
   tick: 0,
-  progress: { visible: false, pct: 0, text: '' },
+  progress: {
+    visible: false, barVisible: false, pct: '0', mode: '',
+    stepIndex: 0, stepCount: 0, stepName: '', startedAt: 0,
+  },
 };
 
 /** 读取地址栏状态：视图类型取自 hash（#latest），检索状态取自 query string */
@@ -239,12 +256,12 @@ export function registerApp() {
       if (!filter) return this.blacklistItems;
       return this.blacklistItems.filter((it) => String(it.term).toLowerCase().includes(filter));
     },
-    /** 页码按钮序列：上一页 + 页码窗口（含省略号）+ 下一页。
-     *  两项约定，模板才能只做 :class / :disabled 的直绑：
-     *    - cls 是**完整类名字符串**（active 标记一并算好）——Alpine 的 :class 对数组是 join(' ')，
-     *      数组里混对象会被字符串化成 "[object Object]" 加进 class；
-     *    - disabled 必须是**显式布尔值**——Alpine 的 :bind 在表达式含 '.' 且结果为 undefined 时
-     *      会退化成空串 ""，而布尔属性只把 null/undefined/false 视为假，空串会被写成 disabled="disabled"。 */
+    /**
+     * 页码按钮序列：上一页 + 页码窗口（含省略号）+ 下一页。
+     * 两项约定供模板直绑：cls 必须是完整类名字符串（Alpine 的 :class 遇数组会 join，
+     * 混对象会变成 "[object Object]"）；disabled 必须是显式布尔值（:bind 可能退化成空串，
+     * 而空串会被写成 disabled="disabled"）。
+     */
     get pageItems() {
       const last = this.totalPages;
       const cur = this.page;
@@ -275,6 +292,30 @@ export function registerApp() {
       const s = this.stats;
       if (!s.nextSyncAt) return s.syncCron ? '自动同步已启用' : '未启用自动同步';
       return `${formatCountdown(s.nextSyncAt - s.tick)} 后`;
+    },
+    /** 维护进度首行左侧：重建索引 · 第 2/5 步 */
+    get progressHead() {
+      const p = this.stats.progress;
+      if (!p.visible) return '';
+      return p.stepIndex > 0 ? `${p.mode} · 第 ${p.stepIndex}/${p.stepCount} 步` : p.mode;
+    },
+    /** 首行右侧：有真实计数时显示百分比，否则显示已运行时长（同样是每秒重算） */
+    get progressTail() {
+      const p = this.stats.progress;
+      if (!p.visible) return '';
+      if (p.barVisible) return `${p.pct}%`;
+      // 取 max(0)：跨机器访问时客户端时钟可能略快于服务端，差值会为负
+      return p.startedAt ? formatCountdown(Math.max(0, this.stats.tick - p.startedAt)) : '';
+    },
+    /** 次行：当前阶段在做什么 */
+    get progressDetail() {
+      return this.stats.progress.visible ? this.stats.progress.stepName : '';
+    },
+    /** 悬浮提示：完整信息（面板窄，长文案会被截断） */
+    get progressTitle() {
+      const p = this.stats.progress;
+      if (!p.visible) return '';
+      return [this.progressHead, p.stepName, p.barVisible ? `${p.pct}%` : ''].filter(Boolean).join(' · ');
     },
 
     /* ============================ 生命周期 ============================ */
@@ -562,11 +603,8 @@ export function registerApp() {
     },
 
     /**
-     * 翻页后把结果区滚回顶部。
-     * 页面本身不滚动（body 为 overflow-hidden），真正可滚动的是结果列表容器，
-     * 因此要显式复位它的 scrollTop；且必须等新一页渲染完再复位——
-     * 新列表更短时浏览器会把 scrollTop 夹到新的最大值，先滚后渲染会被这次夹取拉回去。
-     * 只在页码真正变化时执行，原地重取（刷新按钮、同步/重建后的重搜）保留当前阅读位置。
+     * 翻页后把结果区滚回顶部（滚动发生在结果列表容器上，且需等新一页渲染完再复位，
+     * 否则会被浏览器对 scrollTop 的夹取拉回去）。只在页码真正变化时执行。
      */
     async scrollToTopIfPageChanged() {
       if (this._renderedPage === this.page) return;
@@ -845,10 +883,21 @@ export function registerApp() {
 
     /** 把一帧快照整理成模板可直接读取的文案 */
     applyStats(d) {
+      // 维护进度：只有「扫描并写入」这一步有真实计数（scanned = 已扫过的 id 区间），
+      // 建索引 / 合并 FTS / 回写都没有可换算的比例 —— 那时不画进度条，只报阶段名
       const prog = d.indexing && d.indexing.running ? d.indexing : null;
-      const showBar = !!(prog && prog.total > 0);
-      const pct = showBar ? Math.min(100, (prog.done / prog.total) * 100) : 0;
-      const label = prog?.mode === 'incremental' ? '同步' : '重建';
+      const showBar = !!(prog && prog.step === 'scan' && prog.total > 0);
+      const pct = showBar ? Math.max(0, Math.min(100, (prog.scanned / prog.total) * 100)) : 0;
+      const modeLabel = prog?.mode === 'incremental' ? '同步索引' : '重建索引';
+      // 状态优先级：启动初始化 > 重建 > 同步 > 空闲
+      const state = d.initializing
+        ? 'init'
+        : d.reindex && d.reindex.running
+          ? 'reindex'
+          : d.syncing
+            ? 'sync'
+            : 'idle';
+      const [status, statusHint] = STATUS_LABEL[state];
 
       this.stats = {
         cache: `${formatBytes(d.cacheBytes)} / ${formatBytes(d.cacheMaxBytes)}`,
@@ -858,22 +907,20 @@ export function registerApp() {
         rss: `${d.rssMB} MB`,
         procs: `${d.processes} 个`,
         indexed: formatCount(d.indexed),
-        status: d.initializing
-          ? '索引初始化中…（后台同步索引，可正常使用）'
-          : d.reindex && d.reindex.running
-            ? '正在重建索引…'
-            : d.syncing
-              ? '正在同步索引…'
-              : '每 3 秒自动刷新',
+        status,
+        statusHint,
         nextSyncAt: d.nextSyncAt || 0,
         syncCron: d.syncCron || '',
         tick: Date.now(),
         progress: {
-          visible: showBar,
+          visible: !!prog && !!prog.step,
+          barVisible: showBar,
           pct: pct.toFixed(1),
-          text: showBar
-            ? `${label} ${formatCount(prog.done)} / ${formatCount(prog.total)}（${pct.toFixed(1)}%）`
-            : '',
+          mode: modeLabel,
+          stepIndex: prog?.stepIndex || 0,
+          stepCount: prog?.stepCount || 0,
+          stepName: prog?.step ? STEP_LABEL[prog.step] || prog.step : '',
+          startedAt: prog?.startedAt || 0,
         },
       };
     },
@@ -891,9 +938,8 @@ export function registerApp() {
     /* ============================ URL 与浏览器历史 ============================ */
 
     /**
-     * 把当前视图状态写回地址栏：hash 承载视图类型（#latest），query 承载检索状态。
-     * 'push' 为每一次可感知的视图变更新增历史记录（后退键可回退）；
-     * 'replace' 仅改写 URL，用于前进/后退还原与原地重取。
+     * 把当前视图状态写回地址栏（hash 承载视图类型，query 承载检索状态）。
+     * 'push' 新增历史记录；'replace' 仅改写 URL（用于还原与原地重取）。
      */
     updateUrl(historyMode = 'push') {
       const params = new URLSearchParams();
@@ -915,9 +961,8 @@ export function registerApp() {
     },
 
     /**
-     * 把地址栏参数应用到状态与控件。
-     * 地址栏是视图状态的唯一来源：缺省的参数必须显式回落到默认值，
-     * 否则后退到「没有该参数」的那条记录时会残留上一份状态。
+     * 把地址栏参数应用到状态与控件。地址栏是视图状态的唯一来源：
+     * 缺省参数必须显式回落默认值，否则后退时会残留上一份状态。
      */
     applyUrlParams(p) {
       this.mode = p.view === 'latest' ? 'latest' : 'search';

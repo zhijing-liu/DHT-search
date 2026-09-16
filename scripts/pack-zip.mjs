@@ -1,15 +1,11 @@
 /**
  * 纯压缩：把 dist/ 按完整结构打成 release/DHT-Search-<版本号>.zip
  * ------------------------------------------------------------------
- * 本脚本只做压缩，不做任何构建 / 同步 —— 构建请先执行 `npm run build:exe`。
+ * 只做压缩，不做构建（构建请先执行 `npm run build:exe`）。
+ *   用法：npm run pack:zip ；产物：release/DHT-Search-v<版本号>.zip
  *
- *   用法：npm run pack:zip
- *   产物：release/DHT-Search-v<版本号>.zip
- *
- * 细节：
- *   - zip 内含顶层目录 DHT-Search/，解压即得完整交付目录（结构原样保留）；
- *   - 空目录（如尚未放数据库的 data/）也会写入条目，解压后可见；
- *   - exe / db 等高熵二进制走 store（仅归档不压缩），速度更快。
+ * zip 内含顶层目录 DHT-Search/，空目录也会写入条目；exe / db 等高熵二进制走 store
+ * （仅归档不压缩）。
  */
 import fs from 'node:fs';
 import path from 'node:path';

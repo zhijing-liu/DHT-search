@@ -13,7 +13,9 @@ import { sql } from 'drizzle-orm';
 import { createMagnetDb, normalizeSearchQuery } from '../src/db.js';
 import { runtimeStats } from '../src/stats.js';
 import { MAX_LIMIT } from '../src/store.js';
-import { openDatabase, setPragma, execRaw, closeDb } from '../src/db-driver.js';
+import { INDEX_FORMAT } from '../src/index/ddl.js';
+import { createIndexTimer } from '../src/index/timing.js';
+import { openDatabase, setPragma, execRaw, closeDb, allRows } from '../src/db-driver.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SMOKE_DB = path.join(HERE, 'data', 'smoke.db');
@@ -176,17 +178,36 @@ console.log('\n[2] 基础搜索');
     assert.equal(r.total, 1);
     assert.equal(r.items[0].id, 2);
   });
-  check('files 被解析为对象数组', () => {
+  check('列表只下发 fileCount + 预览（不下发整棵文件树）', () => {
     const r = api.searchMagnets({ query: 'sample.txt' });
-    assert.ok(Array.isArray(r.items[0].files));
-    assert.equal(r.items[0].files.length, 2);
-    assert.equal(r.items[0].files[1].path, 'Sample/sample.txt');
-    assert.equal(r.items[0].files[1].size, 1024);
+    const item = r.items[0];
+    assert.equal(item.fileCount, 2);
+    // 有关键词时预览只保留命中的那条
+    assert.deepEqual(item.preview, [{ path: 'Sample/sample.txt', size: 1024 }]);
+    assert.equal(item.files, undefined);
+  });
+  check('详情接口按需返回扁平树（parent 指向父节点下标，目录大小已累加）', () => {
+    const { nodes } = api.getMagnetFiles(2);
+    // 两个源文件 → 根级文件 + Sample 目录 + 目录内的文件
+    assert.equal(nodes.length, 3);
+    assert.deepEqual(
+      nodes.map((n) => [n.name, n.parent, n.isDir, n.size]),
+      [
+        ['Some.Random.Movie.2024.1080p.BluRay.x264-GROUP.mkv', -1, false, 8589934592],
+        ['Sample', -1, true, 1024],
+        ['sample.txt', 1, false, 1024],
+      ]
+    );
+    // 文件节点带上源路径，供渲染时展示与关键词匹配
+    assert.equal(nodes[2].path, 'Sample/sample.txt');
+  });
+  check('详情接口对不存在的 id 返回 null', () => {
+    assert.equal(api.getMagnetFiles(999999), null);
   });
   check('返回行包含全部字段', () => {
     const r = api.searchMagnets({ query: 'brit' });
     assert.deepEqual(Object.keys(r.items[0]).sort(), [
-      'fetchedAt', 'files', 'id', 'infohash', 'magnet', 'name', 'totalSize',
+      'fetchedAt', 'fileCount', 'id', 'infohash', 'magnet', 'name', 'preview', 'totalSize',
     ]);
     assert.equal(r.items[0].magnet, 'magnet:?xt=urn:btih:hash' + '1'.padStart(40, '0'));
     assert.equal(r.items[0].totalSize, 336295318);
@@ -195,14 +216,23 @@ console.log('\n[2] 基础搜索');
   api.close();
 }
 
-console.log('\n[3] files 解析失败时保留原始字符串');
+console.log('\n[3] files 非合法 JSON 的容错（fileCount 记 0、详情返回空树）');
 {
   // 改的是已有行，增量同步不会捕获 UPDATE，需 reindex 全量重建后才会反映
   writeSource((src) => src.prepare('UPDATE magnets SET files = ? WHERE id = 3').run('not-a-json'));
   const api = openApi();
   await api.reindex();
   const r = api.searchMagnets({ query: 'ubuntu' });
-  assert.equal(r.items[0].files, 'not-a-json');
+  check('列表：fileCount 记 0、预览为空（不抛错）', () => {
+    assert.equal(r.items[0].fileCount, 0);
+    assert.deepEqual(r.items[0].preview, []);
+  });
+  check('详情：返回空树而非抛错', () => {
+    assert.deepEqual(api.getMagnetFiles(3).nodes, []);
+  });
+  check('原文仍进 FTS（ftsText 回退为原文，至少原文里的词可检索）', () => {
+    assert.equal(api.searchMagnets({ query: 'not' }).items[0].id, 3);
+  });
   api.close();
   writeSource((src) =>
     src.prepare('UPDATE magnets SET files = ? WHERE id = 3').run(JSON.stringify(FIXTURES[2].files))
@@ -474,11 +504,18 @@ console.log('\n[12] 启动同步不阻塞（sync:false）+ syncIncremental 异�
     assert.equal(api.searchMagnets({ query: 'brunette' }).total, 0);
   });
   const srcCount = countSource();
+  const workerSteps = [];
   await check('await syncIncremental() 返回 {skipped:false, added=id跨度}', async () => {
-    const r = await api.syncIncremental();
+    const r = await api.syncIncremental((p) => {
+      if (p?.step && workerSteps[workerSteps.length - 1] !== p.step) workerSteps.push(p.step);
+    });
     assert.equal(r.skipped, false);
     // added 是 id 跨度（max-last），源库含已删除空洞时可能 > 实际行数，故只需 >= 行数
     assert.ok(r.added >= srcCount, `added=${r.added} 应不小于实际行数 ${srcCount}`);
+  });
+  check('增量进度经子进程 IPC 回传到父进程（阶段名不丢）', () => {
+    // 全新索引库 → 这一步实际是迁移重建，故五阶段齐全
+    assert.deepEqual(workerSteps, ['schema', 'scan', 'index', 'merge', 'checkpoint']);
   });
   check('syncIncremental 后索引与源库一致（count 相等、ubuntu 命中）', () => {
     assert.equal(api.countMagnets(), srcCount);
@@ -497,13 +534,33 @@ console.log('\n[13] reindex 异步化 + indexing 状态机 + 进度回传');
   const api = createMagnetDb({ source: SMOKE_DB, indexDbPath: idxFor(13), sync: false });
   let sawRunning = false;
   let sawProgress = false;
+  const steps = [];
+  const scanSamples = [];
+  const nonScanWithRatio = [];
   const indexed = await api.reindex((p) => {
     if (typeof p?.done === 'number' && typeof p?.total === 'number') sawProgress = true;
     if (runtimeStats.indexing.running === true) sawRunning = true;
+    if (p?.step) {
+      if (steps[steps.length - 1] !== p.step) steps.push(p.step);
+      if (p.step === 'scan') scanSamples.push(p);
+      else if (p.scanned !== undefined || p.total !== undefined) nonScanWithRatio.push(p.step);
+    }
   });
   check('reindex() 返回索引文档数（数字）', () => assert.equal(indexed, countSource()));
   check('reindex 过程中 indexing.running 被置为 true', () => assert.ok(sawRunning));
   check('reindex 回传了 done/total 进度', () => assert.ok(sawProgress));
+  check('重建按顺序上报五个阶段（前端据此显示「第 N/M 步」）', () => {
+    assert.deepEqual(steps, ['schema', 'scan', 'index', 'merge', 'checkpoint']);
+  });
+  check('扫描阶段上报 id 区间推进量，且末批到达 100%（进度条不失真的前提）', () => {
+    assert.ok(scanSamples.length > 0, '未收到 scan 阶段上报');
+    const last = scanSamples[scanSamples.length - 1];
+    assert.equal(last.scanned, last.total, `末批 scanned=${last.scanned} total=${last.total}`);
+    assert.ok(scanSamples.every((s) => s.scanned >= 0 && s.scanned <= s.total));
+  });
+  check('非扫描阶段不下发比例字段（避免画出失真的进度条）', () => {
+    assert.deepEqual(nonScanWithRatio, [], `意外带比例的阶段：${nonScanWithRatio.join(',')}`);
+  });
   check('reindex 完成后 indexing.running 复位为 false', () => {
     assert.equal(runtimeStats.indexing.running, false);
   });
@@ -540,13 +597,13 @@ console.log('\n[15] 最新入库列表（listLatest，不经 FTS，固定按 id 
     assert.equal(r.total, countSource());
     assert.deepEqual(r.items.map((i) => i.id), [6, 4, 3, 2, 1]);
   });
-  check('默认每批 30 条，返回行字段与检索一致（files 已解析为数组）', () => {
+  check('默认每批 30 条，返回行字段与检索一致（fileCount + preview）', () => {
     const r = api.listLatest();
     assert.equal(r.limit, 30);
     assert.deepEqual(Object.keys(r.items[0]).sort(), [
-      'fetchedAt', 'files', 'id', 'infohash', 'magnet', 'name', 'totalSize',
+      'fetchedAt', 'fileCount', 'id', 'infohash', 'magnet', 'name', 'preview', 'totalSize',
     ]);
-    assert.ok(Array.isArray(r.items[0].files));
+    assert.ok(Array.isArray(r.items[0].preview));
   });
   check('limit / offset 分页取最新一段', () => {
     assert.deepEqual(api.listLatest({ limit: 2 }).items.map((i) => i.id), [6, 4]);
@@ -570,29 +627,233 @@ console.log('\n[15] 最新入库列表（listLatest，不经 FTS，固定按 id 
   api.close();
 }
 
-// 放在最后一个：本段会主动制造 worker 失败并 terminate，Node 在进程退出阶段
-// 偶发 V8 fatal（DisposeIsolate），可能中断其后的任何断言，故不与其它用例竞争。
-console.log('\n[16] worker 错误传播：重建失败 reject 且 indexing 复位');
+console.log('\n[15b] 索引格式版本变更时，增量同步自动改跑全量重建');
 {
-  // 构造「表存在但缺列」的畸形源库：主进程 createMagnetDb 只校验表存在故不会崩，
-  // 但 worker 内 rebuildSync 的 scanById 会因缺列抛错，从而验证 reject + 状态机复位。
+  const index = idxFor('15b');
+  // 首建一次，让格式版本落入 sync_meta
+  createMagnetDb({ source: SMOKE_DB, indexDbPath: index }).close();
+
+  // 模拟升级前的历史索引库：格式水位是个未知旧值
+  {
+    const w = openDatabase(index);
+    w.prepare("UPDATE sync_meta SET value = 'legacy' WHERE key = 'files_format'").run();
+    closeDb(w);
+  }
+
+  const api = createMagnetDb({ source: SMOKE_DB, indexDbPath: index, sync: false });
+  const r = api.syncIncrementalSync();
+  check('增量同步改跑全量重建，返回重建行数', () => {
+    assert.ok(r.added > 0);
+  });
+  check('重建后格式水位回到当前版本', () => {
+    const row = api.db.all(sql`SELECT value FROM sync_meta WHERE key = 'files_format'`)[0];
+    assert.equal(row?.value, INDEX_FORMAT);
+  });
+  check('重建后 fileCount 与详情树均可用', () => {
+    const item = api.searchMagnets({ query: 'sample.txt' }).items[0];
+    assert.equal(item.fileCount, 2);
+    assert.equal(api.getMagnetFiles(item.id).nodes.length, 3);
+  });
+  api.close();
+}
+
+// 放在最后一个：本段会主动制造维护失败（源库缺列），验证 reject 与状态机复位。
+// 注：执行载体统一为 spawn 子进程后，原先 worker.terminate() 在 Node 退出阶段偶发的
+// V8 fatal（DisposeIsolate）已消失；此处保留在末尾只为维持既有用例顺序。
+console.log('\n[15c] 数据水位与数据同事务推进（断点续跑幂等的基础）');
+{
+  const index = idxFor('15c');
+  createMagnetDb({ source: SMOKE_DB, indexDbPath: index }).close(); // 首建
+
+  // 追加 10 行，制造一次增量
+  writeSource((s) => {
+    const ins = s.prepare(
+      'INSERT INTO magnets (id, name, files, totalSize, fetchedAt) VALUES (?, ?, ?, 1, 1)'
+    );
+    for (let i = 100; i < 110; i += 1) {
+      ins.run(i, `Watermark.Probe.${i}`, JSON.stringify([{ path: `Watermark.Probe.${i}.bin`, size: 1 }]));
+    }
+  });
+
+  const api = createMagnetDb({ source: SMOKE_DB, indexDbPath: index, sync: false });
+  const samples = [];
+  const steps = [];
+  const r = api.syncIncrementalSync((p) => {
+    if (p?.step && steps[steps.length - 1] !== p.step) steps.push(p.step);
+    // 回调有两种：阶段通知（rows=0，此刻还没有批次落库）与批次落库后的通知。
+    // 水位只在后者有意义——它发生在批事务提交之后，应已随该批推进（而非等全部跑完才写一次）
+    if (!(p?.rows > 0)) return;
+    const row = api.db.all(sql`SELECT value FROM sync_meta WHERE key = 'last_rowid'`)[0];
+    samples.push(Number(row?.value ?? 0));
+  });
+
+  check('批次回调时水位已推进（与数据同事务提交）', () => {
+    assert.ok(r.added > 0, '本轮应有新增');
+    assert.ok(samples.length > 0, '未触发批次回调');
+    assert.ok(samples[0] >= 100, `首批回调时水位应已至少到 100，实为 ${samples[0]}`);
+  });
+  check('增量上报阶段序列；未执行的阶段（未达合并阈值）不上报', () => {
+    assert.deepEqual(steps, ['scan', 'checkpoint']);
+  });
+  check('维护结束后 build_mode 归位 idle', () => {
+    const row = api.db.all(sql`SELECT value FROM sync_meta WHERE key = 'build_mode'`)[0];
+    assert.equal(row?.value, 'idle');
+  });
+  check('增量只累计 fts_pending、不触发全量合并（10 行远低于 5 万阈值）', () => {
+    const row = api.db.all(sql`SELECT value FROM sync_meta WHERE key = 'fts_pending'`)[0];
+    assert.equal(Number(row?.value ?? -1), 10);
+  });
+  api.close();
+}
+
+console.log('\n[16] 源库 schema 校验 + 维护失败传播');
+{
+  // 情形 1：表存在但缺列 → 打开索引库时就应给出明确错误。
+  // 必须显式校验列：indexPass 只在「有内容」时才扫描（max > from 才 populate），
+  // 空源库不触发扫描，靠 SQL 顺带抛错会漏检。
   // 文件名必须以 smoke 开头：cleanup() 只按该前缀通配删除，否则上一轮遗留的文件
   // 会让本轮的 CREATE TABLE 撞上「table magnets already exists」而中断整个测试。
-  const BAD_SRC = path.join(DATA_DIR, 'smoke.bad-source.db');
+  const BAD_COLS = path.join(DATA_DIR, 'smoke.bad-cols.db');
   {
-    const s = openDatabase(BAD_SRC);
+    const s = openDatabase(BAD_COLS);
     setPragma(s, 'journal_mode', 'WAL');
     execRaw(s, 'CREATE TABLE magnets (id INTEGER PRIMARY KEY)');
     closeDb(s);
   }
-  const api = createMagnetDb({ source: BAD_SRC, indexDbPath: idxFor(16), sync: false });
-  await check('reindex() 因源库缺列而 reject', async () => {
+  check('源库缺列时 createMagnetDb 明确报错（不静默放过）', () => {
+    assert.throws(
+      () => createMagnetDb({ source: BAD_COLS, indexDbPath: idxFor('16a'), sync: false }),
+      /缺少列/
+    );
+  });
+
+  // 情形 2：schema 正常、打开成功，但打开后源库表被移除 → 重建时查询失败，
+  // 验证「维护失败 reject + 状态机复位」这条传播路径
+  const BAD_SRC = path.join(DATA_DIR, 'smoke.bad-source.db');
+  {
+    const s = openDatabase(BAD_SRC);
+    setPragma(s, 'journal_mode', 'WAL');
+    execRaw(s, `CREATE TABLE magnets (
+      id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', infohash TEXT, magnet TEXT,
+      files TEXT, totalSize INTEGER NOT NULL DEFAULT 0, fetchedAt INTEGER NOT NULL DEFAULT 0)`);
+    execRaw(s, "INSERT INTO magnets (id, name) VALUES (1, 'probe')");
+    closeDb(s);
+  }
+  const api = createMagnetDb({ source: BAD_SRC, indexDbPath: idxFor('16b'), sync: false });
+  {
+    const s = openDatabase(BAD_SRC);
+    setPragma(s, 'journal_mode', 'WAL');
+    execRaw(s, 'DROP TABLE magnets');
+    closeDb(s);
+  }
+  await check('reindex() 因源库表消失而 reject', async () => {
     await assert.rejects(api.reindex());
   });
   check('失败后 indexing.running 复位为 false（不卡状态机）', () => {
     assert.equal(runtimeStats.indexing.running, false);
   });
-  fs.rmSync(BAD_SRC, { force: true });
+  api.close();
+}
+
+console.log('\n[16b] 索引分段计时器（exclude 只记净耗时，各段互斥可直接相加）');
+{
+  const t = createIndexTimer();
+  t.measure('inner', () => {
+    const s = performance.now();
+    while (performance.now() - s < 20); // 忙等 20ms，保证 inner 明显大于 0
+  });
+  // exclude 包着已计时的子段（批事务提交就是这种情况）：必须扣除子段，否则会被
+  // 重复计入，而 js = 总耗时 − 已计段之和 会被算成负数再截断为 0，掩盖真实瓶颈
+  t.exclude('outer', () => t.measure('inner2', () => {
+    const s = performance.now();
+    while (performance.now() - s < 20);
+  }));
+  const snap = t.snapshot();
+  check('exclude 扣除内部已计时的子段（net << 子段耗时）', () => {
+    assert.ok(snap.outer < snap.inner2, `outer=${snap.outer} inner2=${snap.inner2}`);
+    assert.ok(snap.outer < 10, `outer=${snap.outer}`);
+  });
+  check('各段互斥：已计段之和不超过总耗时，未归类 js 非负', () => {
+    const sum = snap.inner + snap.inner2 + snap.outer;
+    assert.ok(sum <= snap.totalMs + 1, `sum=${sum} total=${snap.totalMs}`);
+    assert.ok(snap.js >= 0);
+  });
+}
+
+console.log('\n[18] 旧格式索引库的升级路径（补列 → 降级可查 → 重建修正）');
+{
+  const index = idxFor(18);
+  createMagnetDb({ source: SMOKE_DB, indexDbPath: index }).close(); // 先有一个 v2 索引
+
+  // 退回 v1 形态：删掉新增列、把格式水位改成旧值
+  {
+    const w = openDatabase(index);
+    execRaw(w, 'ALTER TABLE magnets_docs DROP COLUMN fileCount');
+    execRaw(w, "UPDATE sync_meta SET value = 'flat-parent/1' WHERE key = 'files_format'");
+    closeDb(w);
+  }
+
+  const api = createMagnetDb({ source: SMOKE_DB, indexDbPath: index, sync: false });
+  check('旧库打开时补齐缺失列（否则查询会 no such column）', () => {
+    const raw = api.db.$client ?? api.db.session?.client;
+    const cols = allRows(raw, 'PRAGMA table_info(magnets_docs)').map((r) => r.name);
+    assert.ok(cols.includes('fileCount'), `实际列：${cols.join(',')}`);
+  });
+  check('旧库被判定为需要重建（HTTP 层据此跑启动迁移）', () => {
+    assert.equal(api.indexNeedsRebuild(), true);
+  });
+  check('重建完成前仍可检索（降级服务：新列取默认值）', () => {
+    const item = api.searchMagnets({ query: 'sample.txt' }).items[0];
+    assert.equal(item.id, 2);
+    assert.equal(item.fileCount, 0);
+  });
+  await check('迁移重建可正常完成', async () => {
+    await api.reindex();
+  });
+  check('重建后 fileCount 修正、格式水位回到当前版本', () => {
+    assert.equal(api.indexNeedsRebuild(), false);
+    assert.equal(api.searchMagnets({ query: 'sample.txt' }).items[0].fileCount, 2);
+  });
+  api.close();
+}
+
+// ⚠ 本段会 DROP 掉 smoke 源库的表，因此必须放在最后（其后不得再有依赖 SMOKE_DB 的用例）
+console.log('\n[17] 影子库：重建成功则原子切换，失败则线上索引毫发无损');
+{
+  const index = idxFor(17);
+  const api = createMagnetDb({ source: SMOKE_DB, indexDbPath: index });
+  const before = api.searchMagnets({ query: 'brunette' }).total;
+  check('首建后可检索', () => assert.ok(before > 0));
+
+  // 1) 成功路径：重建写影子库 → 切换 → 无残留、内容一致
+  await check('重建成功并完成原子切换', async () => {
+    const n = await api.reindex();
+    assert.ok(n > 0);
+  });
+  check('切换后无影子库 / 备份残留', () => {
+    assert.equal(fs.existsSync(`${index}.build`), false, '影子库未清理');
+    assert.equal(fs.existsSync(`${index}.old`), false, '备份未清理');
+  });
+  check('切换后检索结果与切换前一致', () => {
+    assert.equal(api.searchMagnets({ query: 'brunette' }).total, before);
+  });
+  check('子进程的分段耗时经 IPC 回传到主进程（日志/SSE 才有数据）', () => {
+    const p = runtimeStats.indexing.phases;
+    assert.ok(p && Number(p.totalMs) > 0, `phases=${JSON.stringify(p)}`);
+    assert.ok(Number(p.fts) >= 0 && Number(p.docs) >= 0);
+  });
+
+  // 2) 失败路径：源库表消失 → 重建失败，线上索引必须完好（这正是影子库的意义）
+  writeSource((s) => execRaw(s, 'DROP TABLE magnets'));
+  await check('源库被破坏后重建 reject', async () => {
+    await assert.rejects(api.reindex());
+  });
+  check('失败后线上索引仍完好（检索结果不变）', () => {
+    assert.equal(api.searchMagnets({ query: 'brunette' }).total, before);
+  });
+  check('失败不留影子库残留（半成品已丢弃）', () => {
+    assert.equal(fs.existsSync(`${index}.build`), false);
+  });
   api.close();
 }
 

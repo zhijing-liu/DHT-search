@@ -8,13 +8,6 @@ import { showToast } from './toast.js';
 
 /* ---------- 数据规范化与格式化 ---------- */
 
-/** 把 files 字段规范为 [{ path, size }] 数组 */
-export function normalizeFiles(files) {
-  if (Array.isArray(files)) return files;
-  if (files && typeof files === 'object') return [files];
-  return [];
-}
-
 /** 把字节数格式化为带单位的可读字符串 */
 export function formatBytes(n) {
   if (!Number.isFinite(n) || n < 0) return '-';
@@ -98,9 +91,8 @@ function isFuzzyMatch(term, query) {
 }
 
 /**
- * 从热词中相似匹配：完全相等 > 前缀 > 包含 > 模糊。
- * 组间按优先级、组内按热度（doc_count 降序，次之 occurrences）。
- * 不能把四组拼接后再统一 sort——那样会按热度打散全部条目，分组优先级失效。
+ * 从热词中相似匹配：完全相等 > 前缀 > 包含 > 模糊；组间按优先级、组内按热度。
+ * 注意分组各自排序后再拼接，统一 sort 会打散分组优先级。
  */
 export function matchSuggestions(items, q, max = 8) {
   const query = String(q).trim().toLowerCase();

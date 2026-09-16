@@ -1,17 +1,19 @@
 /**
  * 后端共享纯函数（无运行时依赖，可被任意模块安全 import）
  * ------------------------------------------------------------------
- * 把原本散落在 db.js / searchPool.js 里的「数值钳制」与「热词归一化」两类
- * 纯工具收敛到此处，避免多处各写一份、行为漂移：
- *   - clampInt        全局唯一的整数钳制实现（原 db.js / searchPool.js 各一份）
+ *   - clampInt         整数钳制（全局唯一实现）
  *   - normalizeKeyword 热词 / 过滤词归一化（HTTP 层与脚本共用）
+ *   - TOKEN_PATTERN    字母数字 token 提取规则（检索 MATCH 表达式与索引侧热词统计共用）
  */
 
 /**
- * 把任意值钳制为 [min, max] 区间内的整数。
- * 非有限数值（undefined / null / 非数字串）一律回退为 fallback；
- * 用 Math.floor 取整（与「负数 → 向下取整」的语义对齐），且所有调用点的
- * min 均为非负，故与 Math.trunc 在实际上等价。
+ * 只保留字母与数字的 token 提取正则。检索侧与索引侧共用同一份规则，
+ * 使「能被搜到的词」与「被统计的词」保持一致。
+ */
+export const TOKEN_PATTERN = /[\p{L}\p{N}]+/gu;
+
+/**
+ * 把任意值钳制为 [min, max] 区间内的整数；非有限数值回退为 fallback。
  * @param {unknown} value
  * @param {number} fallback 非有限值时的回退值
  * @param {number} min
@@ -25,8 +27,7 @@ export function clampInt(value, fallback, min, max) {
 }
 
 /**
- * 归一化热词 / 过滤词：去首尾空白 + 小写折叠。
- * 不含任何字母或数字时返回空串，调用方自行决定跳过还是报错。
+ * 归一化热词 / 过滤词：去首尾空白 + 小写折叠；不含字母或数字时返回空串。
  * @param {unknown} term
  * @returns {string} 归一化后的词；无效输入返回空串
  */
