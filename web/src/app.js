@@ -67,6 +67,13 @@ const PAGE_ACTIVE_CLASS = 'active';
 const HOT_FETCH_SIZE = 1000;
 const HOT_LIST_SIZE = 200;
 
+/**
+ * 黑名单单屏渲染上限。
+ * 黑名单动辄几千条，而面板是 260px 宽的侧栏，可视区只有十几条——全量建 DOM 会明显
+ * 卡顿（每条还是一个带 SVG 的按钮）。截断后用上方过滤框缩小范围即可看到后面的条目。
+ */
+const BLACKLIST_RENDER_LIMIT = 200;
+
 /** 运行状态悬浮窗开关的持久化键 */
 const STATS_HUD_KEY = 'dht_stats_hud';
 
@@ -252,12 +259,23 @@ export function registerApp() {
     get reindexLabel() {
       return this.busy.reindex ? '重建中…' : '重建索引';
     },
-    /** 黑名单前端过滤结果。
+    /** 黑名单前端过滤的完整结果（不截断）。
      *  注意：后端存的是小写词，输入侧必须先 trim + 小写，否则输入大写字母会一个字都匹配不到。 */
-    get filteredBlacklist() {
+    get blacklistMatched() {
       const filter = this.blacklistFilter.trim().toLowerCase();
       if (!filter) return this.blacklistItems;
       return this.blacklistItems.filter((it) => String(it.term).toLowerCase().includes(filter));
+    },
+    /** 实际渲染的条目：超出 BLACKLIST_RENDER_LIMIT 只取前 N 条（见该常量的说明） */
+    get filteredBlacklist() {
+      const matched = this.blacklistMatched;
+      return matched.length > BLACKLIST_RENDER_LIMIT
+        ? matched.slice(0, BLACKLIST_RENDER_LIMIT)
+        : matched;
+    },
+    /** 是否有条目因截断未显示（提示用户用过滤框缩小范围） */
+    get blacklistTruncated() {
+      return this.blacklistMatched.length > BLACKLIST_RENDER_LIMIT;
     },
     /**
      * 页码按钮序列：上一页 + 页码窗口（含省略号）+ 下一页。

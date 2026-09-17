@@ -213,7 +213,7 @@
         </div>
         <aside id="blacklistPanel" x-show="editMode" x-cloak class="flex-none w-[260px] max-[480px]:w-full flex flex-col p-3 px-3.5 border border-line rounded-xl bg-card overflow-hidden">
           <div class="flex-none flex items-center justify-between mb-2">
-            <h3 class="m-0 text-sm font-semibold text-fg">黑名单</h3>
+            <h3 class="m-0 text-sm font-semibold text-fg">黑名单 <span class="font-normal text-muted" x-text="blacklistItems.length"></span></h3>
             <div class="flex gap-1.5">
               <button id="blImportBtn" @click="$refs.blImportFile.click()" :disabled="busy.import" class="inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-surface text-fg cursor-pointer transition-colors hover:bg-white/[0.08] hover:border-accent disabled:opacity-50 disabled:cursor-default" type="button" aria-label="导入黑名单" title="导入黑名单（.txt，每行一个词）">
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
@@ -224,17 +224,24 @@
               <input id="blImportFile" type="file" accept=".txt,text/plain" hidden x-ref="blImportFile" @change="importBlacklist($event)" />
             </div>
           </div>
-          <input id="blacklistFilter" class="flex-none w-full mb-2.5 px-2.5 py-1.5 rounded-lg border border-line bg-surface text-fg text-[13px] outline-none focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)]" type="text" placeholder="过滤黑名单…" autocomplete="off" x-model="blacklistFilter" />
+          <!-- debounce：否则每敲一个字符都要重算过滤并重建整列 DOM，几千条时输入会明显掉帧 -->
+          <input id="blacklistFilter" class="flex-none w-full mb-2.5 px-2.5 py-1.5 rounded-lg border border-line bg-surface text-fg text-[13px] outline-none focus:border-accent focus:shadow-[0_0_0_3px_rgba(59,130,246,0.25)]" type="text" placeholder="过滤黑名单…" autocomplete="off" x-model.debounce.250ms="blacklistFilter" />
           <ul id="blacklistList" class="flex-1 min-h-0 list-none m-0 p-0 flex flex-col gap-1.5 overflow-y-auto scrollbar-thin">
             <template x-for="it in filteredBlacklist" :key="it.term">
               <li class="flex-none flex items-center justify-between gap-2 px-2 py-1.5 border border-line rounded-lg bg-surface">
                 <span class="text-[13px] overflow-hidden text-ellipsis whitespace-nowrap" x-text="it.term"></span>
-                <button type="button" :aria-label="`将「${it.term}」移出黑名单`" x-html="ICONS.close" @click="removeFromBlacklist(it.term)"
-                  class="shrink-0 inline-flex items-center justify-center size-[22px] rounded-full border-0 bg-transparent text-muted cursor-pointer transition-colors hover:text-red-400 hover:bg-red-400/[0.12]"></button>
+                <!-- SVG 内联而非 x-html：x-for 直接克隆节点，省掉每条一次 innerHTML 解析 -->
+                <button type="button" :aria-label="`将「${it.term}」移出黑名单`" @click="removeFromBlacklist(it.term)"
+                  class="shrink-0 inline-flex items-center justify-center size-[22px] rounded-full border-0 bg-transparent text-muted cursor-pointer transition-colors hover:text-red-400 hover:bg-red-400/[0.12]">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
               </li>
             </template>
           </ul>
           <p id="blacklistEmpty" x-show="filteredBlacklist.length === 0" class="flex-none m-0 py-2 text-muted text-xs text-center">暂无黑名单词</p>
+          <p x-show="blacklistTruncated" class="flex-none m-0 pt-1.5 text-muted text-[11px] text-center">
+            共 <span x-text="blacklistMatched.length"></span> 条，仅显示前 200 条（用上方过滤框缩小范围）
+          </p>
         </aside>
       </div>
     </section>
