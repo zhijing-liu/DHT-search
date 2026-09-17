@@ -447,6 +447,21 @@ function removeDbFiles(dbPath) {
 }
 
 /**
+ * 把一个 SQLite 库的「主文件 + -wal + -shm」整体改名（附属文件不存在则跳过）。
+ *
+ * 索引库切换必须连 WAL 一起搬走：-wal/-shm 的名字只由主文件路径派生，不会随主文件
+ * 改名而自动跟随。若只搬主文件，旧库残留的 WAL 会留在原路径上，被随后放到同一路径的
+ * 新库继承——SQLite 打开「新主库 + 旧 WAL」时会重放旧帧，把旧库的水位（乃至被 DROP
+ * 的列）写回新库，表现为「重建后仍判定需要重建」。
+ */
+function renameDbFiles(from, to) {
+  const suffixes = ['', '-wal', '-shm'];
+  for (const suffix of suffixes) {
+    if (fs.existsSync(from + suffix)) fs.renameSync(from + suffix, to + suffix);
+  }
+}
+
+/**
  * 一次索引「通过」（pass）—— 重建与增量补录的唯一实现，差别由 reset 参数化：
  *
  *   reset=true （重建）：DDL 重置 → 从 min(id)-1 起扫 → 建二级索引 → 写结构水位
@@ -1115,6 +1130,8 @@ export function createMagnetDb(options = {}) {
    *   1. beforeSwap 回调（HTTP 层回收持有旧库句柄的搜索子进程并暂停派发）；
    *   2. 关闭本进程的读写连接；
    *   3. 正式库 → .old 备份 → 影子库 → 正式库 → 清理备份与残留文件；
+   *      **主文件与其 -wal/-shm 始终作为一组一起搬/一起删**：-wal 的名字只由主文件
+   *      路径派生，留在原路径上会被新库继承并重放（见 renameDbFiles）；
    *   4. 重开连接（指向新库）；
    *   5. afterSwap 回调（在 finally 里，成功与失败都走到）。
    * 第 3 步任一环节失败都会把备份挪回原位，保证线上索引不丢失。
@@ -1129,20 +1146,24 @@ export function createMagnetDb(options = {}) {
     }
     closeIndexConnections();
     try {
-      // Windows 下改名要求目标无句柄，句柄释放可能有极短延迟，故退避重试
+      // Windows 下改名要求目标无句柄，句柄释放可能有极短延迟，故退避重试。
+      // 注意：主文件与 -wal/-shm 必须一起搬走（理由见 renameDbFiles），
+      // 否则旧库的 WAL 会留在原路径上、被放到同一路径的新库重放。
       await retryAsync(() => {
-        fs.rmSync(backup, { force: true });
-        if (fs.existsSync(indexPath)) fs.renameSync(indexPath, backup);
+        removeDbFiles(backup); // 上次切换崩溃残留的备份（含其 -wal/-shm）
+        if (fs.existsSync(indexPath)) renameDbFiles(indexPath, backup);
       }, SWAP_RETRIES, SWAP_RETRY_MS);
-      await retryAsync(() => fs.renameSync(buildPath, indexPath), SWAP_RETRIES, SWAP_RETRY_MS);
-      fs.rmSync(backup, { force: true });
-      // 影子库主文件已被改名，-wal/-shm 理论上为空（子进程收尾做过 TRUNCATE checkpoint）
+      // 兜底清一次原路径上的残留（旧主文件已搬走；这里只可能清到无主残留）
+      removeDbFiles(indexPath);
+      await retryAsync(() => renameDbFiles(buildPath, indexPath), SWAP_RETRIES, SWAP_RETRY_MS);
+      removeDbFiles(backup);
+      // 影子库已被改名到正式路径，这里清的是它可能残留的无主伴生文件
       removeDbFiles(buildPath);
       log.system('索引库已切换到新构建的副本（重建期间线上未受影响）');
     } catch (err) {
-      // 回滚：把备份挪回原位，正式库仍是可用的旧版本
+      // 回滚：把备份挪回原位（连同 -wal/-shm），正式库仍是可用的旧版本
       try {
-        if (!fs.existsSync(indexPath) && fs.existsSync(backup)) fs.renameSync(backup, indexPath);
+        if (!fs.existsSync(indexPath) && fs.existsSync(backup)) renameDbFiles(backup, indexPath);
       } catch {
         /* 回滚本身失败也要把原始错误抛出去 */
       }
