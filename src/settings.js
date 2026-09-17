@@ -3,13 +3,21 @@
  * ------------------------------------------------------------------
  * 服务代码一律从本模块导入配置，不要直接 import config.js（直接 import 会被 bun 打包
  * 内联进 exe，导致「打包后改配置不生效」）：
- *   - 源码运行：加载项目根的 config.js；
+ *   - 源码运行：加载项目根的 config.js；**缺失时回退随仓库分发的 config.example.js**
+ *     （config.js 被 .gitignore 排除，干净检出 / CI 里并不存在——没有这条回退，
+ *      `npm test` / `bun test/smoke.mjs` 会直接 ERR_MODULE_NOT_FOUND 崩在加载期）；
  *   - 编译运行：优先加载 exe 同目录的 config.js（不存在则回退内置副本，保证单个 exe 可裸跑）。
+ *
+ * 回退口径与 scripts/build-exe.mjs 打包时一致（那里同样在缺失 config.js 时用
+ * config.example.js 兜底），两处保持同一语义。
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isCompiledExe } from './db-driver.js';
+
+/** 源码态的两个候选配置：本地私有配置 + 随仓库分发的公共模板 */
+const LOCAL_CONFIG_PATH = fileURLToPath(new URL('../config.js', import.meta.url));
 
 let loaded = null;
 if (isCompiledExe) {
@@ -23,7 +31,19 @@ if (isCompiledExe) {
     }
   }
 }
-if (!loaded) loaded = await import('../config.js');
+if (!loaded && isCompiledExe) {
+  // 编译态：外置配置未命中时用打包时内置的那份 config.js（单文件 exe 可裸跑）
+  loaded = await import('../config.js');
+}
+if (!loaded) {
+  // 源码态：优先项目根 config.js（本地私有），没有则回退公共模板 config.example.js
+  if (fs.existsSync(LOCAL_CONFIG_PATH)) {
+    loaded = await import('../config.js');
+  } else {
+    console.warn('[settings] 未找到 config.js，已回退公共默认配置 config.example.js（部署时建议 cp config.example.js config.js 后按需修改）');
+    loaded = await import('../config.example.js');
+  }
+}
 
 export const {
   SOURCE_DB_PATH,
