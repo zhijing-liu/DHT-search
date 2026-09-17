@@ -17,7 +17,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { SOURCE_DB_PATH } from '../config.js';
 import {
   openDatabase,
   createDrizzle,
@@ -32,6 +31,14 @@ import {
 } from '../src/db-driver.js';
 import { resetIndexTables, ftsOptionSql } from '../src/index/ddl.js';
 import { FTS_TABLE, DOCS_TABLE } from '../src/store.js';
+
+// 默认源库路径取自配置：优先项目根 config.js（本地私有、不入库），缺失则回退随仓库
+// 分发的 config.example.js —— 否则干净检出（CI / 首次 clone）下本脚本会在加载期
+// ERR_MODULE_NOT_FOUND 直接退出。真正要压测的库仍可用 --src= 覆盖。
+const CONFIG = fs.existsSync(new URL('../config.js', import.meta.url))
+  ? await import('../config.js')
+  : await import('../config.example.js');
+const { SOURCE_DB_PATH } = CONFIG;
 
 /* ------------------------------------------------------------------ */
 /* 参数                                                                */

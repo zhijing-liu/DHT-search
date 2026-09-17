@@ -21,16 +21,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-// 命名空间导入而非具名导入：FILE_DB_PATH 是本版新增项，老 config.js 里没有它，
-// 具名导入会在链接阶段直接抛 "does not provide an export named"（连脚本都起不来）
-import * as CONFIG from '../config.js';
-
-const { SOURCE_DB_PATH, INDEX_DB_PATH } = CONFIG;
-const FILES_DB_PATH = CONFIG.FILES_DB_PATH;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 const TEST_DATA = path.join(ROOT, 'test', 'data');
+
+// 配置读取：优先项目根 config.js（本地私有，.gitignore 排除、不入库），**缺失则回退
+// 随仓库分发的 config.example.js** —— 干净检出（CI / 首次 clone）里没有 config.js，
+// 静态 import 会让本脚本在加载期直接 ERR_MODULE_NOT_FOUND 退出 1（测试全红）。
+// 仍用命名空间导入（而非具名导入）：FILES_DB_PATH 是本版新增项，老 config 里可能没有它，
+// 具名导入会在链接阶段抛 "does not provide an export named"（连脚本都起不来）。
+const CONFIG = fs.existsSync(path.join(ROOT, 'config.js'))
+  ? await import('../config.js')
+  : await import('../config.example.js');
+if (!fs.existsSync(path.join(ROOT, 'config.js'))) {
+  console.error('[reset] 未找到 config.js，已回退公共默认配置 config.example.js（路径可用 DHT_*_DB_PATH 环境变量覆盖）');
+}
+
+const { SOURCE_DB_PATH, INDEX_DB_PATH } = CONFIG;
+const FILES_DB_PATH = CONFIG.FILES_DB_PATH;
 
 // 只读 config.js 自行解析路径，不引入 store.js：那个模块会拉起 SQLite 原生驱动，
 // 而本脚本只删文件——依赖装坏时也应能跑
