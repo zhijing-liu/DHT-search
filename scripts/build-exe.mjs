@@ -17,6 +17,27 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = path.join(ROOT, 'dist');
 const OUTFILE = process.platform === 'win32' ? 'DHT-Search.exe' : 'DHT-Search';
+const CONFIG = path.join(ROOT, 'config.js');
+
+/* 0. 保证打包器能解析 config.js ------------------------------------ */
+// src/settings.js 里的 `await import('../config.js')` 是**字面量**动态导入：bun build
+// --compile 在编译期要求该文件存在，否则直接 `Could not resolve: "../config.js"` 失败
+// （2026-09 v2.0.1 发版即栽在这里）。config.js 是本地私有配置（.gitignore 排除），
+// 干净检出（CI / 首次 clone）没有它 —— 这里用公共模板临时补一份，编译结束（含失败退出）
+// 再删掉。于是 exe 内始终带一份「内置默认配置」，删掉 exe 旁边的 config.js 也能裸跑。
+const tempConfig = !fs.existsSync(CONFIG);
+if (tempConfig) {
+  fs.copyFileSync(path.join(ROOT, 'config.example.js'), CONFIG);
+  console.log('[build-exe] 未找到 config.js：已用 config.example.js 临时补一份（编译后删除）');
+  process.on('exit', () => {
+    try {
+      fs.rmSync(CONFIG, { force: true });
+      console.log('[build-exe] 已删除临时 config.js（保持工作区与干净检出一致）');
+    } catch {
+      /* 删不掉也不影响产物（config.js 已被 .gitignore 排除） */
+    }
+  });
+}
 
 /* 1. bun 打包（前端构建已由 package.json 的 & 链先行完成） ---------- */
 fs.mkdirSync(DIST, { recursive: true });
