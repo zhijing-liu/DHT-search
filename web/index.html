@@ -105,6 +105,15 @@
           <option value="gt100gb">&gt;100GB</option>
         </select>
       </div>
+      <!-- 搜索范围：名称+文件 / 仅种子名 -->
+      <div class="seg flex items-stretch h-full border border-line rounded-[10px] overflow-hidden bg-card max-[768px]:h-10 max-[480px]:self-end" role="group" aria-label="搜索范围">
+        <button type="button" :class="{ active: searchIn !== 'name' }" @click="setSearchIn('')"
+          title="搜索种子名与文件名/路径" aria-label="搜索种子名与文件名"
+          class="sb flex items-center justify-center px-3 h-full border-0 border-r border-line bg-transparent text-muted cursor-pointer transition-colors hover:text-fg text-[13px] [&.active]:bg-brand/[0.18] [&.active]:text-brand2">名称+文件</button>
+        <button type="button" :class="{ active: searchIn === 'name' }" @click="setSearchIn('name')"
+          title="只搜索种子名" aria-label="只搜索种子名"
+          class="sb flex items-center justify-center px-3 h-full bg-transparent text-muted cursor-pointer transition-colors hover:text-fg text-[13px] [&.active]:bg-brand/[0.18] [&.active]:text-brand2">仅名称</button>
+      </div>
     </section>
 
     <!-- 设置面板 -->

@@ -8,8 +8,9 @@
  * 时 main() 不执行。
  */
 import { openDatabase, createDrizzle, setPragma } from './db-driver.js';
-import { CONFIG, resolveDbPath, DEFAULT_INDEX_DB_PATH } from './store.js';
+import { CONFIG, resolveDbPath, DEFAULT_INDEX_DB_PATH, DEFAULT_FILES_DB_PATH } from './store.js';
 import { buildSearchApi } from './db.js';
+import { openFilesDb } from './index/files-store.js';
 import { SEARCH_WORKER_FLAG } from './worker-flags.js';
 
 function main() {
@@ -18,6 +19,9 @@ function main() {
     // 否则与主进程一致：取 config.js 的 indexDbPath（CONFIG 恒非空，env 兜底永不生效）
     process.env.DHT_SEARCH_INDEX_DB_PATH ?? CONFIG.indexDbPath ?? DEFAULT_INDEX_DB_PATH
   );
+  const filesPath = resolveDbPath(
+    process.env.DHT_SEARCH_FILES_DB_PATH ?? CONFIG.filesDbPath ?? DEFAULT_FILES_DB_PATH
+  );
 
   /**
    * 本进程的 SQLite 内存配额（来自 config.js，缺省值与其保持一致）：
@@ -25,8 +29,9 @@ function main() {
    */
   const CACHE_SIZE_KB =
     Number(CONFIG.searchProcessCacheSizeKb) > 0 ? Math.trunc(Number(CONFIG.searchProcessCacheSizeKb)) : 2048;
+  // mmap 窗口：统一由 INDEX_MMAP_SIZE_MB 控制（ENABLE_MMAP=false 或 0 时关闭）
   const MMAP_SIZE_MB =
-    Number(CONFIG.searchProcessMmapSizeMb) >= 0 ? Math.trunc(Number(CONFIG.searchProcessMmapSizeMb)) : 32;
+    CONFIG.enableMmap !== false ? (Number(CONFIG.indexMmapSizeMb) > 0 ? Math.trunc(Number(CONFIG.indexMmapSizeMb)) : 256) : 0;
 
   // 只读连接：与主进程查询连接同构；query_only 杜绝误写，busy_timeout 等待重建写锁
   const rdb = openDatabase(indexPath, { readonly: true });
@@ -39,7 +44,17 @@ function main() {
   setPragma(rdb, 'temp_store', 'MEMORY');
   const dbRO = createDrizzle(rdb);
 
-  const { searchMagnetsSync, listLatestSync } = buildSearchApi(dbRO);
+  // 冷库：只按 id 取本页的预览（几十行点查），因此给它极小的页缓存配额，
+  // 热库的缓存预算不被挤占。只读打开（连接层已禁写，无需 query_only 之外的保护）；
+  // 打开失败（冷库尚未生成）时降级为 null —— 检索照常工作，只是预览为空。
+  let filesRO = null;
+  try {
+    filesRO = openFilesDb(filesPath, { readonly: true, cacheSizeKb: 512 }).db;
+  } catch (err) {
+    console.warn(`[search-child] 冷库不可用，本进程预览将为空: ${err?.message ?? err}`);
+  }
+
+  const { searchMagnetsSync, listLatestSync } = buildSearchApi(dbRO, filesRO);
 
   process.on('message', (msg) => {
     const { id, params } = msg;

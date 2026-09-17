@@ -3,10 +3,15 @@
  * ------------------------------------------------------------------
  * 集中存放跨模块共享的「配置 + 约定常量」，只放约定不放实现：
  *   - CONFIG           来自 config.js 的运行期配置（具名 export const 聚合）
- *   - 库路径 / 表名     DEFAULT_DB_PATH / DEFAULT_INDEX_DB_PATH / resolveDbPath，各表名
+ *   - 库路径 / 表名     DEFAULT_DB_PATH / DEFAULT_INDEX_DB_PATH / DEFAULT_FILES_DB_PATH，各表名
  *   - 列清单            DOCS_COLUMN_DEFS / RECORD_COLUMNS / DOCS_SELECT_COLUMNS（唯一来源）
  *   - 索引与排序约定    TOKENIZER / DEFAULT_LIMIT / MAX_LIMIT / SORT_COLUMNS
  * 查询实现细节在 search/query.js，token 规则在 util.js，DDL 与老库补列在 index/ddl.js。
+ *
+ * 双库分工（v4 起）：
+ *   热库（INDEX_DB_PATH）—— magnets_docs（窄表：只放检索/排序/筛选要用的列）+ magnets_fts
+ *   冷库（FILES_DB_PATH）—— magnets_files（files 原文）+ magnets_preview（预览小列）
+ *   拆分理由见 src/index/files-store.js 文件头；清单策略是「扫描路径绝不触碰大列」。
  */
 
 import path from 'node:path';
@@ -15,6 +20,7 @@ import { isCompiledExe } from './db-driver.js';
 import {
   SOURCE_DB_PATH,
   INDEX_DB_PATH,
+  FILES_DB_PATH,
   PORT,
   MAX_RESULTS,
   REINDEX_MAX_OLD_SPACE_MB,
@@ -26,10 +32,14 @@ import {
   SEARCH_MAX_PROCESSES,
   SEARCH_PROCESS_CACHE_SIZE_KB,
   SEARCH_PROCESS_MMAP_SIZE_MB,
+  MMAP_ENABLED,
+  INDEX_MMAP_SIZE_MB,
   SEARCH_PROCESS_RECYCLE_IMMEDIATE,
   SEARCH_PROCESS_IDLE_MS,
   SEARCH_QUEUE_MAX,
   SEARCH_QUEUE_TIMEOUT_MS,
+  FILES_COMPRESS_ENABLED,
+  FILES_REWRITE_ON_REBUILD,
 } from './settings.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -49,6 +59,7 @@ const ROOT_DIR = isCompiledExe ? path.dirname(process.execPath) : path.resolve(M
 export const CONFIG = {
   sourceDbPath: SOURCE_DB_PATH,
   indexDbPath: INDEX_DB_PATH,
+  filesDbPath: FILES_DB_PATH,
   port: PORT,
   maxResults: MAX_RESULTS,
   reindexMaxOldSpaceMb: REINDEX_MAX_OLD_SPACE_MB,
@@ -59,11 +70,15 @@ export const CONFIG = {
   searchCacheTtlMs: SEARCH_CACHE_TTL_MS,
   searchMaxProcesses: SEARCH_MAX_PROCESSES,
   searchProcessCacheSizeKb: SEARCH_PROCESS_CACHE_SIZE_KB,
-  searchProcessMmapSizeMb: SEARCH_PROCESS_MMAP_SIZE_MB,
+  searchProcessMmapSizeMb: SEARCH_PROCESS_MMAP_SIZE_MB ?? INDEX_MMAP_SIZE_MB,
+  indexMmapSizeMb: INDEX_MMAP_SIZE_MB,
+  enableMmap: MMAP_ENABLED,
   searchProcessRecycleImmediate: SEARCH_PROCESS_RECYCLE_IMMEDIATE,
   searchProcessIdleMs: SEARCH_PROCESS_IDLE_MS,
   searchQueueMax: SEARCH_QUEUE_MAX,
   searchQueueTimeoutMs: SEARCH_QUEUE_TIMEOUT_MS,
+  filesCompress: FILES_COMPRESS_ENABLED,
+  filesRewriteOnRebuild: FILES_REWRITE_ON_REBUILD,
 };
 
 /** 把配置里的库路径解析为绝对路径：绝对路径原样使用，相对路径基于项目根目录 */
@@ -74,15 +89,22 @@ export function resolveDbPath(p) {
 
 /** 源库（其他应用写入）默认路径 */
 export const DEFAULT_DB_PATH = path.join(ROOT_DIR, 'data', 'magnet.db');
-/** 影子索引库默认路径 */
+/** 影子索引库（热库）默认路径 */
 export const DEFAULT_INDEX_DB_PATH = path.join(ROOT_DIR, 'data', 'dht.search.db');
+/** 冷库（大对象：files 原文 + 预览小列）默认路径 */
+export const DEFAULT_FILES_DB_PATH = path.join(ROOT_DIR, 'data', 'dht.files.db');
 
 /** 源库主表名 */
 export const TABLE = 'magnets';
-/** 影子索引库中的 contentless FTS5 表名 */
+/** 热库中的 contentless FTS5 表名 */
 export const FTS_TABLE = 'magnets_fts';
-/** 影子索引库中的去规范化副本表名（展示/排序用） */
+/** 热库中的副本表名（窄表：只放检索 / 排序 / 筛选要用的列） */
 export const DOCS_TABLE = 'magnets_docs';
+
+/** 冷库中的 files 原表（按 id 点查，列表路径从不访问） */
+export const FILES_TABLE = 'magnets_files';
+/** 冷库中的预览小列（列表按需按 id 批量回查，每次仅一页的条数） */
+export const PREVIEW_TABLE = 'magnets_preview';
 
 /** 热词统计表名（构建索引时随 populate 统计写入） */
 export const KEYWORD_TABLE = 'keyword_stats';
@@ -98,36 +120,100 @@ export const STATE_TABLE = 'sync_meta';
 /**
  * 每项为 [列名, 类型与约束]。`id` 是主键、建表时必在，不参与老库补列。
  *
- * 副本表的列定义只有这一处，以下四处都由它派生：
+ * 副本表的列定义只有这一处，以下三处都由它派生：
  *   DOCS_COLUMN_DEFS ─┬→ index/ddl.js：建表 SQL + 老库补列语句
  *                     ├→ RECORD_COLUMNS：db.js 读源库的列 + 源表列校验
- *                     └→ DOCS_SELECT_COLUMNS：search/api.js 的检索取列白名单
+ *                     └→ DOCS_LIST_SELECT：search/api.js 的检索取列白名单
+ *
+ * **列顺序刻意「整型列在前、文本列在后」**：SQLite 按列顺序编码记录，读第 N 列要
+ * 跳过前 N−1 个 serial type。把 totalSize / fetchedAt / fileCount 放最前，让
+ * 「只取排序列」的扫描（count + 大小筛选、列排序回退形状）停在记录头部。
+ *
+ * **不含 files 与 preview 两个大列**：它们在冷库（见 FILES_TABLE / PREVIEW_TABLE）。
+ * 这是 v4 提速的根本——窄表让 313 万行的副本表从 8.8GB 降到 ~0.7GB，随机主键回查
+ * 从磁盘 IO 变成缓存命中。
  */
 export const DOCS_COLUMN_DEFS = Object.freeze([
   ['id', 'INTEGER PRIMARY KEY'],
+  ['totalSize', 'INTEGER NOT NULL DEFAULT 0'],
+  ['fetchedAt', 'INTEGER NOT NULL DEFAULT 0'],
+  ['fileCount', 'INTEGER NOT NULL DEFAULT 0'],
   ['name', "TEXT NOT NULL DEFAULT ''"],
   ['infohash', 'TEXT'],
   ['magnet', 'TEXT'],
-  ['files', 'TEXT'],
-  ['fileCount', 'INTEGER NOT NULL DEFAULT 0'],
-  ['totalSize', 'INTEGER NOT NULL DEFAULT 0'],
-  ['fetchedAt', 'INTEGER NOT NULL DEFAULT 0'],
 ]);
 
 /** 列名数组（顺序即 DDL 顺序） */
 export const DOCS_COLUMN_NAMES = Object.freeze(DOCS_COLUMN_DEFS.map(([name]) => name));
 
-/** 索引期派生列：源库没有这些列，由 index/transform.js 在索引时算出 */
-const DERIVED_COLUMNS = Object.freeze(['fileCount']);
+/**
+ * 索引期派生列：源库没有这些列，由 index/transform.js 在索引时算出。
+ *   fileCount → 落在副本表（列表要显示文件数，且是廉价整型列）
+ *   preview   → 落在冷库（体积可达 GB 级，列表按页按需回查）
+ */
+const DERIVED_COLUMNS = Object.freeze(['fileCount', 'preview']);
 
-/** 源库（magnets）必需列 = 副本表列清单 − 派生列；读源库的 SELECT 与源表列校验共用 */
-export const RECORD_COLUMNS = DOCS_COLUMN_NAMES.filter((n) => !DERIVED_COLUMNS.includes(n)).join(', ');
+/**
+ * 源库（magnets）必需列 = 副本表列 − 派生列 + files。
+ * files 不进副本表（改存冷库），但索引期必须读它来派生 ftsText / fileCount / preview。
+ */
+export const RECORD_COLUMNS = [
+  ...DOCS_COLUMN_NAMES.filter((n) => !DERIVED_COLUMNS.includes(n)),
+  'files',
+].join(', ');
 
 /**
  * 带 `m.` 前缀的列清单：检索 JOIN 的取列白名单（别名 m 指向副本表）。
- * 含 `files` 是因为服务端要据此挑预览，响应体里会丢掉它、只下发 `preview`。
+ * @deprecated 与 DOCS_LIST_SELECT 已等价（副本表不再含大列），保留仅为兼容旧引用。
  */
 export const DOCS_SELECT_COLUMNS = DOCS_COLUMN_NAMES.map((name) => `m.${name}`).join(', ');
+
+/**
+ * 列表路径取列：副本表全列（v4 起已是窄表，不再需要 CASE 回退去读 files）。
+ * preview 不在其中——它由冷库按页回查后附着（见 search/api.js 的 attachPreviews）。
+ */
+export const DOCS_LIST_SELECT = DOCS_SELECT_COLUMNS;
+
+/* ------------------------------------------------------------------ */
+/* 冷库表（magnets_files / magnets_preview）列清单                     */
+/* ------------------------------------------------------------------ */
+
+/** 冷库 files 表的存储格式：0 = 原始 UTF-8 文本，1 = zlib deflate */
+export const FILES_FMT = Object.freeze({ raw: 0, zlib: 1 });
+
+/**
+ * 冷库 files 表列定义。
+ * `srclen` 是源库 files 原文的字节长度，用作「内容是否变过」的廉价指纹：
+ * 全量重建时靠它逐批比对，只重写真正变过的行，其余整批跳过——既保留了
+ * 「重建不必重写几个 GB 大对象」的收益，又不会让源库的 UPDATE 静默失效。
+ */
+export const FILES_COLUMN_DEFS = Object.freeze([
+  ['id', 'INTEGER PRIMARY KEY'],
+  ['fmt', 'INTEGER NOT NULL DEFAULT 0'],
+  ['srclen', 'INTEGER NOT NULL DEFAULT 0'],
+  ['files', 'BLOB NOT NULL'],
+]);
+
+/** 冷库预览表列定义（preview 与 files 分表：详情读 files，列表只读 preview） */
+export const PREVIEW_COLUMN_DEFS = Object.freeze([
+  ['id', 'INTEGER PRIMARY KEY'],
+  ['preview', 'TEXT NOT NULL'],
+]);
+
+/* ------------------------------------------------------------------ */
+/* 二级索引（副本表）—— 排序 / 点查的驱动索引                          */
+/* ------------------------------------------------------------------ */
+/**
+ * 复合 + 显式 DESC：索引条目本身就是 (col, id) 有序的，正向扫描即降序输出，
+ * 省掉一次反向扫描或额外排序。检索侧用 INDEXED BY 强制走它（见 search/api.js）。
+ */
+export const DOCS_INDEX_DEFS = Object.freeze([
+  ['totalSize', 'idx_magnets_docs_totalSize'],
+  ['fetchedAt', 'idx_magnets_docs_fetchedAt'],
+]);
+
+/** infohash 表达式索引名（lower(infohash)：hash 检索点查 + 前缀 LIKE） */
+export const DOCS_INFOHASH_INDEX = 'idx_magnets_docs_infohash_lower';
 
 /**
  * 索引状态表的键。按写入时机分三类，混用会破坏失败恢复：

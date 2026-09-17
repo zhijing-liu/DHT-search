@@ -23,8 +23,29 @@
  * 本地请改成你的绝对路径，例如 'G:/active_project/DHT/data/magnet.db' */
 export const SOURCE_DB_PATH = 'data/magnet.db';
 
-/** 影子索引库路径：本服务维护的 FTS5 倒排索引 + 去规范化副本都在此库；相对路径基于项目根目录 */
+/** 影子索引库（热库）路径：FTS5 倒排索引 + 去规范化副本（窄表）都在此库；相对路径基于项目根目录 */
 export const INDEX_DB_PATH = 'data/dht.search.db';
+
+/**
+ * 冷库路径：files 原文与预览小列存这里（都是「按 id 点查、列表路径不碰」的大对象）。
+ * 拆分后热库只放检索/排序/筛选要用的窄列，随机主键回查从磁盘 IO 变成缓存命中
+ * （313 万行实测：宽词列排序 30s → 1.4s）。可指向另一块盘。
+ */
+export const FILES_DB_PATH = 'data/dht.files.db';
+
+/**
+ * 冷库 files 是否压缩存储（zlib level 1，实测约 5× 压缩率）。
+ * 只在「查看全部文件」时付一次解压开销，列表检索完全不受影响。
+ */
+export const FILES_COMPRESS = true;
+
+/**
+ * 全量重建时是否重写冷库已有行。
+ * false（默认）：只追加缺失 id —— files 按 id 不可变，重建因此不必重写几个 GB 的大对象，
+ *   这是拆分冷库最大的重建收益；代价是源库若 UPDATE 了既有行的 files，重建不会反映。
+ * true：重建时全量重写冷库（能反映 UPDATE，代价是每次重建重写全部大对象）。
+ */
+export const FILES_REWRITE_ON_REBUILD = false;
 
 /** HTTP 服务监听端口 */
 export const PORT = 3000;
@@ -72,8 +93,19 @@ export const SEARCH_MAX_PROCESSES = 2;
 /** 每个搜索子进程的 SQLite page cache 上限（KiB，每进程一份，总额需乘以进程数） */
 export const SEARCH_PROCESS_CACHE_SIZE_KB = 2048;
 
-/** 每个搜索子进程的 SQLite mmap 上限（MB）；0 = 关闭 */
-export const SEARCH_PROCESS_MMAP_SIZE_MB = 32;
+/**
+ * 是否启用 SQLite mmap（内存映射索引文件）：映射页可被 OS 页缓存共享、随连接复用，
+ * 命中时省去 buffer cache 拷贝，对多 GB 级索引库的随机读有显著提速。
+ * false = 全部读连接 mmap_size=0（纯 buffer cache，行为等价、内存更可控）。
+ */
+export const ENABLE_MMAP = true;
+
+/**
+ * 索引库读连接的 mmap 窗口上限（MB）：同时作用于「主进程只读连接」与「搜索子进程」，
+ * 0 = 关闭（等价于 ENABLE_MMAP=false）。12GB 索引库建议 256~1024，使热区常驻内存。
+ * 兼容旧配置：未设置本项时回退到 SEARCH_PROCESS_MMAP_SIZE_MB（若该旧项仍存在）。
+ */
+export const INDEX_MMAP_SIZE_MB = 256;
 
 /**
  * 搜索进程是否「立即回收」：true = 查询一完成就回收，内存最省但每次查询要付进程冷启动；

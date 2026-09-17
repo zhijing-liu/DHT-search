@@ -2,11 +2,18 @@
  * magnets 表数据访问模块（影子索引架构，drizzle-orm 驱动）
  * ------------------------------------------------------------------
  * 源库（data/magnet.db，由其他应用写入）以只读方式打开读取，查询期不触碰源库。
- * 本模块在另一可写库（默认 data/dht.search.db）中维护：
- *   - magnets_fts    contentless FTS5 倒排索引（索引 name 与 files 的纯路径文本）
- *   - magnets_docs   去规范化副本（id + 展示/排序列 + fileCount），供检索 JOIN；
- *                    其 files 列存源库原文，详情接口按需据此构建扁平树
- *   - sync_meta      索引状态（数据水位 / 格式版本 / 维护状态）
+ * 本模块在另两个可写库中维护索引，按「访问频率」分冷热：
+ *
+ *   热库（默认 data/dht.search.db）
+ *     - magnets_fts    contentless FTS5 倒排索引（索引 name 与 files 的纯路径文本）
+ *     - magnets_docs   去规范化副本（窄表：只放检索 / 排序 / 筛选要用的列）
+ *     - sync_meta      索引状态（数据水位 / 格式版本 / 维护状态）
+ *
+ *   冷库（默认 data/dht.files.db）—— 只按 id 点查、只追加，列表路径从不访问
+ *     - magnets_files   源库 files 原文（zlib 压缩），详情接口据此构建扁平树
+ *     - magnets_preview 预览小列，列表按页回查
+ *
+ * 拆分的动机与实测收益见 src/index/files-store.js 文件头。
  *
  * 常规表用 drizzle 查询构造器；FTS5 虚表无 drizzle 原生支持，检索与 DDL 走参数化 raw SQL。
  * 底层驱动由 ./db-driver.js 自动选择（Node → better-sqlite3，Bun → bun:sqlite）。
@@ -49,9 +56,23 @@ import {
 import { sql, eq } from 'drizzle-orm';
 import { syncMeta } from './schema.js';
 import { spawnChild } from './child-process.js';
-import { ensureSchema, resetIndexTables, hasTable, DEFAULT_FTS_CAPS, INDEX_FORMAT } from './index/ddl.js';
+import {
+  ensureSchema,
+  resetIndexTables,
+  ensureDocsIndexes,
+  hasTable,
+  DEFAULT_FTS_CAPS,
+  INDEX_FORMAT,
+} from './index/ddl.js';
 import { createIndexTimer, NOOP_TIMER, formatPhases } from './index/timing.js';
 import { transformFiles } from './index/transform.js';
+import {
+  openFilesDb,
+  ensureFilesSchema,
+  closeFilesDb,
+  createFilesWriter,
+  readFiles,
+} from './index/files-store.js';
 import {
   SCAN_BATCH,
   WRITE_BATCH_ROWS,
@@ -66,6 +87,7 @@ import {
   resolveDbPath,
   DEFAULT_DB_PATH,
   DEFAULT_INDEX_DB_PATH,
+  DEFAULT_FILES_DB_PATH,
   TABLE,
   FTS_TABLE,
   DOCS_TABLE,
@@ -77,7 +99,7 @@ import {
   STATE_KEYS,
   BUILD_MODES,
 } from './store.js';
-import { SOURCE_READ_MMAP_MB } from './settings.js';
+import { SOURCE_READ_MMAP_MB, MMAP_ENABLED, INDEX_MMAP_SIZE_MB } from './settings.js';
 import { buildSearchApi } from './search/api.js';
 
 // 对外 API 保持不变：检索侧的归一化 / MATCH 表达式 / 实现已拆到 search/，
@@ -132,13 +154,25 @@ export { normalizeKeyword };
 /* 源库只读连接                                                        */
 /* ------------------------------------------------------------------ */
 
-/** 以只读方式打开源库（构建索引时读取用，查询期不持有） */
+/**
+ * 以只读方式打开源库（构建索引时读取用，查询期不持有）。
+ *
+ * 先显式判存在：源库由外部采集程序写入，本服务从不创建它。路径配错时直接报
+ * 「文件不存在 + 指向 SOURCE_DB_PATH」，而不是让驱动建一个空库、再报一句
+ * 「源库中不存在 magnets 表」——后者把人往错误方向引，还会在错误位置留下 0 字节空壳。
+ */
 function openSourceRO(sourcePath) {
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(
+      `源库文件不存在：${sourcePath}（请检查 config.js 的 SOURCE_DB_PATH；本服务不会创建源库）`
+    );
+  }
   const src = openDatabase(sourcePath, { readonly: true });
   // 双重保险：连接层只读 + 引擎级禁止任何写入语句
   setPragma(src, 'query_only', 'ON');
-  // mmap 预取窗口（SOURCE_READ_MMAP_MB 可调，0 = 关闭），用于提升顺序扫描吞吐
-  const mmapMb = Number(SOURCE_READ_MMAP_MB);
+  // mmap 预取窗口（SOURCE_READ_MMAP_MB 可调，0 = 关闭；ENABLE_MMAP=false 时整体关闭）
+  // 用于提升顺序扫描吞吐
+  const mmapMb = MMAP_ENABLED ? Number(SOURCE_READ_MMAP_MB) : 0;
   const mmapBytes = Number.isFinite(mmapMb) && mmapMb > 0 ? Math.floor(mmapMb) * 1024 * 1024 : 0;
   setPragma(src, 'mmap_size', mmapBytes);
   setPragma(src, 'cache_size', -16000);
@@ -251,16 +285,24 @@ function* scanById(src, { from = 0, size = SCAN_BATCH, timer = NOOP_TIMER } = {}
  * @param {object}    [timer]       分段计时器（createIndexTimer()），未传则零开销
  * @param {object}    [opts]
  * @param {boolean}   [opts.watermark=false] 是否每批同事务推进数据水位（增量 / 重建都开）
+ * @param {object}    [opts.filesWriter] 冷库批写入器（createFilesWriter()）；缺省则不写冷库
  */
-function populate(db, rowsIterable, onFlush, timer = NOOP_TIMER, { watermark = false } = {}) {
+function populate(
+  db,
+  rowsIterable,
+  onFlush,
+  timer = NOOP_TIMER,
+  { watermark = false, filesWriter = null } = {}
+) {
   // drizzle 实例上的 $client 即底层原生连接（bun:sqlite 或 better-sqlite3）
   const raw = db.$client ?? db.session?.client;
 
   const insertFts = prepareStmt(raw, `INSERT INTO ${FTS_TABLE} (rowid, name, files) VALUES (?, ?, ?)`);
   // 副本表用 OR REPLACE（重复 id 覆盖）；contentless FTS5 不支持 REPLACE，FTS 侧必须普通 INSERT
+  // 列顺序与 DOCS_COLUMN_DEFS 一致（整型列在前、不含 files / preview 两个大列）
   const insertDoc = prepareStmt(raw, `INSERT OR REPLACE INTO ${DOCS_TABLE}
-      (id, name, infohash, magnet, files, fileCount, totalSize, fetchedAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+      (id, totalSize, fetchedAt, fileCount, name, infohash, magnet)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`);
   const upsertKw = prepareStmt(raw, `INSERT INTO ${KEYWORD_TABLE} (term, doc_count, occurrences) VALUES (?, ?, ?)
      ON CONFLICT(term) DO UPDATE SET
        doc_count = doc_count + excluded.doc_count,
@@ -284,8 +326,8 @@ function populate(db, rowsIterable, onFlush, timer = NOOP_TIMER, { watermark = f
     timer.measure('docs', () => {
       for (const e of entries) {
         const r = e.row;
-        // files 存源库原文（列表只下发 fileCount + 预览，详情接口再按需建树）
-        runStmt(insertDoc, [r.id, r.name, r.infohash, r.magnet, r.files, e.fileCount, r.totalSize, r.fetchedAt]);
+        // 副本表只存窄列；files 原文与 preview 小列进冷库（详情 / 列表按需点查）
+        runStmt(insertDoc, [r.id, r.totalSize, r.fetchedAt, e.fileCount, r.name, r.infohash, r.magnet]);
       }
     });
     timer.measure('keyword', () => {
@@ -310,6 +352,13 @@ function populate(db, rowsIterable, onFlush, timer = NOOP_TIMER, { watermark = f
   const flush = () => {
     if (!buf.length) return;
     traceIndexing(`populate 写入批次开始: rows=${buf.length} kw=${kwMap.size}`);
+    // 冷库先落盘：它是「只追加」的，失败也只影响详情 / 预览，不影响检索可用性
+    if (filesWriter) {
+      timer.measure('files', () => {
+        for (const e of buf) filesWriter.add(e.row.id, e.row.files, e.preview);
+        filesWriter.flush();
+      });
+    }
     // exclude 而非 measure：本调用包着 fts/docs/keyword 三段（已各自计时），
     // 只有「扣除它们之后的净耗时」才应记为 txn —— 即 COMMIT 与 WAL 落页
     timer.exclude('txn', () => runBatch(buf, kwMap));
@@ -324,8 +373,8 @@ function populate(db, rowsIterable, onFlush, timer = NOOP_TIMER, { watermark = f
   for (const r of rowsIterable) {
     // 索引期只做「parse + 拼路径 + 计数」这一份最小转换（见 index/transform.js）；
     // 放在事务外，避免拉长写锁持有时间。
-    const { ftsText, fileCount } = transformFiles(r.files);
-    buf.push({ row: r, ftsText, fileCount });
+    const { ftsText, fileCount, preview } = transformFiles(r.files);
+    buf.push({ row: r, ftsText, fileCount, preview });
     // 字节阈值按**源原文**估算：写进 docs 的就是原文，事务体量应与它同口径
     bytes += (r.name?.length ?? 0) + (r.files?.length ?? 0);
     // 热词统计：同一文档内去重，doc_count 只计一次（就地累加，不分配中间数组）
@@ -408,13 +457,14 @@ function removeDbFiles(dbPath) {
  *
  * @param {object} db
  * @param {object} src   源库只读连接（打开/关闭由调用方负责）
- * @param {{ reset: boolean }} opts reset=true 重建（清空 + 写结构水位），false 增量补录
+ * @param {{ reset: boolean, filesRaw?: object }} opts
+ *   reset=true 重建（清空 + 写结构水位），false 增量补录；filesRaw=冷库可写连接（可选）
  * @param {(p: object) => void} [onFlush] 每个阶段开始时 / 每批落库后回调，见下方 report()
  * @param {object} [timer] 分段计时器（createIndexTimer()），可选
  * @returns {{ rows: number, total: number, from: number, max: number, changed: boolean }}
  *   rows=实际写入行数；total=id 跨度；from=扫描起点（开区间）；max=源库最大 id；changed=是否有新行
  */
-function indexPass(db, src, { reset }, onFlush, timer = NOOP_TIMER) {
+function indexPass(db, src, { reset, filesRaw = null }, onFlush, timer = NOOP_TIMER) {
   const raw = db.$client ?? db.session?.client;
 
   // 维护状态：崩溃（SIGKILL）时走不到收尾的归位写，build_mode 会留在 full / incremental，
@@ -451,6 +501,14 @@ function indexPass(db, src, { reset }, onFlush, timer = NOOP_TIMER) {
     const base = { rows, done, step, stepIndex: steps.indexOf(step) + 1, stepCount: steps.length };
     onFlush?.(step === 'scan' ? { ...base, scanned, total } : base);
   };
+  // 冷库写入器：追加模式下对「已在冷库里的 id」直接跳过，故全量重建也不必重写大对象
+  // （这是拆分冷库最大的重建收益）。重建且显式开启重写时才走 rewrite 模式。
+  const filesWriter = filesRaw
+    ? createFilesWriter(filesRaw, {
+        mode: reset && CONFIG.filesRewriteOnRebuild ? 'rewrite' : 'append',
+        compress: CONFIG.filesCompress !== false,
+      })
+    : null;
   try {
     if (reset) {
       // schema 重置（FTS / docs / keyword_stats）必须整体在一个事务里：与查询并发时，
@@ -477,36 +535,38 @@ function indexPass(db, src, { reset }, onFlush, timer = NOOP_TIMER) {
         done += rows;
         if (lastId != null) scanned = Number(lastId) - from;
         report('scan', rows);
-      }, timer, { watermark: true });
+      }, timer, { watermark: true, filesWriter });
       traceIndexing(`indexPass: populate 完成 rows=${done}`);
     }
 
     if (reset) {
       // 二级索引在灌数据之后建（空表带索引会让每条 INSERT 都维护 B-Tree，慢 2~3 倍）
-      //  - totalSize：按大小排序（两步法）使用，见 search/api.js 的 plainColSort
-      //  - lower(infohash)：hash 检索（?by=hash）走点查；无此索引会对 313 万行全表扫，
-      //    表达式索引同时服务前缀 LIKE。实测 EXPLAIN 由 SCAN 变为 COVERING INDEX 查找
-      //  - 刻意不建 fetchedAt 索引：两步法「WHERE m.id IN(...) ORDER BY m.fetchedAt」下
-      //    planner 永远走 TEMP B-TREE（宽词 21s→21s 零收益），加了只增写放大
+      //  - (totalSize DESC, id DESC) / (fetchedAt DESC, id DESC)：列排序快路径的驱动索引，
+      //    检索侧 INDEXED BY 强制沿它扫描（覆盖索引，不回表），宽词 30s → 1.4s
+      //  - lower(infohash)：hash 检索（?by=hash）走点查；无此索引会对 313 万行全表扫
       report('index');
-      timer.measure('index', () => {
-        db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`);
-        db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_infohash_lower`)} ON ${sql.raw(DOCS_TABLE)}(lower(infohash))`);
-      });
+      timer.measure('index', () => ensureDocsIndexes(db));
       // 结构水位：只有整库重建成功走到这里才写，中途失败留在旧值，下次启动仍判定需重建
       setMeta(db, STATE_KEYS.tokenizer, TOKENIZER);
       setMeta(db, STATE_KEYS.filesFormat, INDEX_FORMAT);
       // 数据水位取源库当前 max：覆盖重建期间新增的行
       setMeta(db, STATE_KEYS.dataWatermark, String(maxSourceId(src)));
     } else {
-      // 自修复：已存在但未触发整库重建的库（部署前建、INDEX_FORMAT 未变）可能缺新二级索引；
+      // 自修复：已存在但未触发整库重建的库（部署前建、索引被外部删掉）可能缺二级索引；
       // IF NOT EXISTS 保证只对缺失索引建一次（建 313 万行索引是一次性开销），之后仅为目录探查
-      db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_totalSize`)} ON ${sql.raw(DOCS_TABLE)}(totalSize)`);
-      db.run(sql`CREATE INDEX IF NOT EXISTS ${sql.raw(`idx_${DOCS_TABLE}_infohash_lower`)} ON ${sql.raw(DOCS_TABLE)}(lower(infohash))`);
+      ensureDocsIndexes(db);
       if (max > from) {
         // 数据水位取扫描前的 max（本轮补录到的行）。只在真有新增时推进：写小会导致下次重扫
         setMeta(db, STATE_KEYS.dataWatermark, String(max));
       }
+    }
+
+    // 统计信息：planner（含 INDEXED BY 形状下的 bloom filter 决策）依赖 sqlite_stat1。
+    // analysis_limit 把每个索引的采样行数钳住，控制 313 万行下的分析耗时（一次性秒级）。
+    // 重建后必做；增量路径只在统计表尚不存在时补做（避免每次增量都全量重分析）。
+    if (reset || !hasTable(db, 'sqlite_stat1')) {
+      execRaw(raw, 'PRAGMA analysis_limit = 1000');
+      execRaw(raw, 'ANALYZE');
     }
 
     // FTS 合并：重建一次彻底合并（optimize）；增量按「自上次合并后累计写入行数」节流做部分合并
@@ -559,10 +619,10 @@ function needsFullRebuild(db) {
  * 启动同步：索引表缺失 / tokenizer 变更 / files 格式变更时全量重建，否则按 last_rowid
  * 增量补录源库新增行。两种情形都由 indexPass 实现，这里只剩一个 reset 判定。
  */
-function syncIndex(db, src, onFlush) {
+function syncIndex(db, src, onFlush, filesRaw = null) {
   const timer = createIndexTimer();
   try {
-    indexPass(db, src, { reset: needsFullRebuild(db) }, onFlush, timer);
+    indexPass(db, src, { reset: needsFullRebuild(db), filesRaw }, onFlush, timer);
   } finally {
     runtimeStats.indexing.phases = timer.snapshot();
     traceIndexing(`syncIndex 分段耗时: ${timer.summary()}`);
@@ -576,9 +636,10 @@ function syncIndex(db, src, onFlush) {
 /**
  * 打开影子索引库并构建/同步索引，返回查询句柄。
  *
- * @param {Object|string} [options] 源库路径字符串，或 { source, indexDbPath }
+ * @param {Object|string} [options] 源库路径字符串，或 { source, indexDbPath, filesDbPath }
  * @param {string} [options.source]      源库路径，默认 config.js 的 SOURCE_DB_PATH（data/magnet.db）
- * @param {string} [options.indexDbPath] 影子索引库路径，默认 config.js 的 INDEX_DB_PATH（data/dht.search.db）
+ * @param {string} [options.indexDbPath] 影子索引库（热库）路径，默认 config.js 的 INDEX_DB_PATH
+ * @param {string} [options.filesDbPath] 冷库路径，默认 config.js 的 FILES_DB_PATH（data/dht.files.db）
  * @param {boolean} [options.sync=true]  打开时是否执行同步（全量重建 / 增量补录）；
  *        传 false 则只建立连接不建索引，供 reindex worker 使用
  */
@@ -591,8 +652,19 @@ export function createMagnetDb(options = {}) {
   const indexPath = resolveDbPath(
     opts.indexDbPath ?? CONFIG.indexDbPath ?? DEFAULT_INDEX_DB_PATH
   );
+  // 冷库路径的三级回退，顺序有意为之：
+  //   1. 调用方显式指定（重建子进程必须走这条：它写的是影子索引库，但冷库要写正式的那份）
+  //   2. 调用方显式指定了索引库却没指定冷库 → 冷库跟随索引库命名。
+  //      这样多实例（测试里每个 section 一个索引库）天然各自一份冷库，不会互相污染，
+  //      也不会把测试行写进生产冷库。
+  //   3. 都没有 → config.js 的 FILES_DB_PATH（生产默认 data/dht.files.db）
+  const filesPath = resolveDbPath(
+    opts.filesDbPath ??
+      (opts.indexDbPath ? `${indexPath}.files.db` : CONFIG.filesDbPath ?? DEFAULT_FILES_DB_PATH)
+  );
 
   fs.mkdirSync(path.dirname(path.resolve(indexPath)), { recursive: true });
+  fs.mkdirSync(path.dirname(path.resolve(filesPath)), { recursive: true });
 
   // 引擎能力探测（进程内一次）：结果只决定 contentless_delete ——
   // 不支持该选项的引擎建表会直接失败，必须实际试一次
@@ -611,6 +683,14 @@ export function createMagnetDb(options = {}) {
   /** 切换完成（或失败回滚）后的钩子：让 HTTP 层解除前一个钩子造成的暂停 */
   let afterSwap = null;
 
+  /* ------------------------------------------------------------------ */
+  /* 冷库连接（不参与索引库的原子切换）                                   */
+  /* ------------------------------------------------------------------ */
+  // files 只追加、不随重建替换，故连接生命周期与整个句柄一致，切换索引库时无需重开。
+  // 一个连接兼顾读写：写入只在索引维护时发生，读取（详情 / 预览）与之共享同一份页缓存。
+  const { raw: filesRaw, db: filesRO } = openFilesDb(filesPath);
+  ensureFilesSchema(filesRaw);
+
   /** 打开索引库的可写 / 只读连接：首次打开与原子切换后重开共用同一段逻辑 */
   function openIndexConnections() {
     // 可写连接：仅供 syncIndex / reindex 等索引维护使用
@@ -626,8 +706,10 @@ export function createMagnetDb(options = {}) {
     if (INDEX_THREADS > 0 && probe.threads != null) setPragma(wdb, 'threads', INDEX_THREADS);
     db = createDrizzle(wdb);
 
-    // 建表语句收敛在 index/ddl.js（幂等）：全新 / 子进程内打开的库也能被安全读写
-    ensureSchema(db, caps);
+    // 建表语句收敛在 index/ddl.js（幂等）：全新 / 子进程内打开的库也能被安全读写。
+    // 索引先不建：若本次就要全量重建，建索引是白等（重建会重建）且会同步阻塞启动。
+    ensureSchema(db, caps, { indexes: false });
+    if (!needsFullRebuild(db)) ensureDocsIndexes(db);
 
     // 上次维护是否被中断（build_mode 非 idle 即上次没走完）
     const interrupted = getMeta(db, STATE_KEYS.buildMode);
@@ -642,13 +724,15 @@ export function createMagnetDb(options = {}) {
     setPragma(rdb, 'busy_timeout', 5000);
     // 主进程只读连接只服务计数 / 热词榜等轻量查询（搜索子进程的配额见 config.js）
     setPragma(rdb, 'cache_size', -2000);
-    setPragma(rdb, 'mmap_size', 33554432);
+    // 索引读连接 mmap 窗口：统一由 INDEX_MMAP_SIZE_MB 控制（ENABLE_MMAP=false 或 0 时关闭）
+    setPragma(rdb, 'mmap_size', MMAP_ENABLED ? Math.floor(INDEX_MMAP_SIZE_MB) * 1024 * 1024 : 0);
     // 排序临时 B-Tree 放内存：宽泛词排序的匹配量可达数十万，落盘慢数倍
     setPragma(rdb, 'temp_store', 'MEMORY');
     dbRO = createDrizzle(rdb);
 
-    // 检索实现绑定当前只读连接 —— 切换索引库后必须重建，否则仍指向被替换掉的旧文件
-    search = buildSearchApi(dbRO);
+    // 检索实现绑定当前只读连接 —— 切换索引库后必须重建，否则仍指向被替换掉的旧文件。
+    // 冷库连接不受切换影响，可原样传给新的检索实例。
+    search = buildSearchApi(dbRO, filesRO);
   }
 
   /** 释放索引库连接（原子切换前必须调用：Windows 下持有句柄无法改名文件） */
@@ -696,7 +780,7 @@ export function createMagnetDb(options = {}) {
           logged = done;
           log.progress(`已索引 ${done} 行`);
         }
-      });
+      }, filesRaw);
       // 末批不足一个阈值时上面不会触发，这里补打总数
       if (done > logged) log.ok(`索引完成，共 ${done} 行`);
     }
@@ -725,7 +809,9 @@ export function createMagnetDb(options = {}) {
     return new Promise((resolve, reject) => {
       const env = {
         ...process.env,
-        DHT_REINDEX_JOB: JSON.stringify({ sourcePath, indexPath: targetPath, mode }),
+        // filesPath 必须显式透传：重建写的是影子索引库，而冷库要写正式那一份
+        // （它只追加、不随影子库切换，重建因此不必重写大对象）
+        DHT_REINDEX_JOB: JSON.stringify({ sourcePath, indexPath: targetPath, filesPath, mode }),
       };
       const child = spawnChild({
         entryPath: REINDEX_WORKER_PATH,
@@ -915,7 +1001,7 @@ export function createMagnetDb(options = {}) {
     const s = openSourceRO(sourcePath);
     const timer = createIndexTimer();
     try {
-      const r = indexPass(db, s, { reset: true }, onProgress, timer);
+      const r = indexPass(db, s, { reset: true, filesRaw }, onProgress, timer);
       traceIndexing(`rebuildSync: 全量重建完成 rows=${r.rows} total=${r.total}`);
     } finally {
       s.close();
@@ -1088,7 +1174,7 @@ export function createMagnetDb(options = {}) {
     try {
       const reset = needsFullRebuild(db);
       if (reset) traceIndexing('syncIncrementalSync: 索引结构过期，改跑全量重建');
-      const r = indexPass(db, src, { reset }, onFlush, timer);
+      const r = indexPass(db, src, { reset, filesRaw }, onFlush, timer);
       // added 口径：正常增量返回 id 跨度；因结构过期改跑重建时返回实际写入行数
       return { skipped: false, added: reset ? r.rows : r.changed ? r.total : 0 };
     } finally {
@@ -1133,6 +1219,7 @@ export function createMagnetDb(options = {}) {
       reindexWorker = null;
     }
     closeIndexConnections();
+    closeFilesDb(filesRaw);
   }
 
   return {
@@ -1142,6 +1229,7 @@ export function createMagnetDb(options = {}) {
     },
     // 实际解析后的路径，供调用方（如搜索子进程池）复用，避免各自再猜一遍路径
     indexPath,
+    filesPath,
     sourcePath,
     countMagnets,
     getMagnetFiles,

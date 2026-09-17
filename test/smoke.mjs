@@ -708,6 +708,19 @@ console.log('\n[15c] 数据水位与数据同事务推进（断点续跑幂等�
 
 console.log('\n[16] 源库 schema 校验 + 维护失败传播');
 {
+  // 情形 0：源库文件不存在 → 必须明确报错，且绝不创建空库。
+  // 路径配错时若让驱动隐式建库，会在错误位置留下 0 字节空壳，并把后续报错
+  // 误导成「源库中不存在 magnets 表」，排查成本极高。
+  const MISSING = path.join(DATA_DIR, 'smoke.missing.db');
+  fs.rmSync(MISSING, { force: true });
+  check('源库文件不存在时明确报错，且不在错误位置留下空库', () => {
+    assert.throws(
+      () => createMagnetDb({ source: MISSING, indexDbPath: idxFor('16m'), sync: false }),
+      /源库文件不存在/
+    );
+    assert.equal(fs.existsSync(MISSING), false, '不应创建出 0 字节的空源库');
+  });
+
   // 情形 1：表存在但缺列 → 打开索引库时就应给出明确错误。
   // 必须显式校验列：indexPass 只在「有内容」时才扫描（max > from 才 populate），
   // 空源库不触发扫描，靠 SQL 顺带抛错会漏检。

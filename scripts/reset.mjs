@@ -9,17 +9,24 @@
  *   npm run reset                      # 删索引库与衍生文件（幂等）
  *   npm run reset -- --dry-run         # 只列出将删除的文件，不实际删除
  *   npm run reset -- --source --yes     # 连源库一起删（必须显式 --yes）
+ *   npm run reset -- --files --yes      # 连冷库一起删（files/preview，删了要重建才能回填）
  *   npm run reset -- --tests           # 顺带清空 test/data（测试夹具，会自动重建）
  *
- * 路径来源：DHT_INDEX_DB_PATH / DHT_DB_PATH 环境变量优先，否则取 config.js。
+ * 路径来源：DHT_INDEX_DB_PATH / DHT_DB_PATH / DHT_FILES_DB_PATH 环境变量优先，否则取 config.js。
  * 只依赖 Node 内置模块（不加载 SQLite 驱动），依赖装坏时同样可运行。
  * 服务运行中执行会因文件被占用而失败（脚本会明确指出，退出码 1），请先停止服务。
- * 索引库删除后下次启动会自动重建（全量灌入，耗时取决于源库规模）。
+ * 索引库删除后下次启动会自动重建（全量灌入，耗时取决于源库规模）；
+ * 冷库删除后新增行会被重新灌入，但既有行的 files 不会再补——需要它就得整库重建。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SOURCE_DB_PATH, INDEX_DB_PATH } from '../config.js';
+// 命名空间导入而非具名导入：FILE_DB_PATH 是本版新增项，老 config.js 里没有它，
+// 具名导入会在链接阶段直接抛 "does not provide an export named"（连脚本都起不来）
+import * as CONFIG from '../config.js';
+
+const { SOURCE_DB_PATH, INDEX_DB_PATH } = CONFIG;
+const FILES_DB_PATH = CONFIG.FILES_DB_PATH;
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -32,6 +39,7 @@ const resolvePath = (p) => (path.isAbsolute(p) ? p : path.join(ROOT, p));
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
 const withSource = args.includes('--source');
+const withFiles = args.includes('--files');
 const withTests = args.includes('--tests');
 const confirmed = args.includes('--yes') || args.includes('-y');
 
@@ -39,6 +47,10 @@ const confirmed = args.includes('--yes') || args.includes('-y');
 const indexPath = path.resolve(process.env.DHT_INDEX_DB_PATH || resolvePath(INDEX_DB_PATH));
 /** 源库路径：同上 */
 const sourcePath = path.resolve(process.env.DHT_DB_PATH || resolvePath(SOURCE_DB_PATH));
+/** 冷库路径：同上（缺失配置时回退到索引库同名的 .files.db，与 db.js 的默认规则一致） */
+const filesPath = path.resolve(
+  process.env.DHT_FILES_DB_PATH || resolvePath(FILES_DB_PATH || `${INDEX_DB_PATH}.files.db`)
+);
 
 /** SQLite 库的伴生文件后缀：主库 / WAL / SHM */
 const DB_SUFFIXES = ['', '-wal', '-shm'];
@@ -108,20 +120,25 @@ if (indexPath === sourcePath) {
   console.error(`✗ 索引库与源库路径相同（${indexPath}），配置有误，已停止`);
   process.exit(1);
 }
-
-const indexFiles = collect(INDEX_BASES(indexPath));
-const sourceFiles = collect([sourcePath]);
-const testItems = withTests ? collectTestData() : [];
-
-if (withSource && !confirmed) {
-  console.log('将删除的文件（含源库）：');
-  for (const f of [...indexFiles, ...sourceFiles]) console.log(`  ${human(f.size).padStart(9)}  ${f.file}`);
-  console.error('\n✗ 源库是爬取数据，删除后无法恢复。确认要删请显式加 --yes：');
-  console.error('  npm run reset -- --source --yes');
+if (withFiles && filesPath === sourcePath) {
+  console.error(`✗ 冷库与源库路径相同（${filesPath}），配置有误，已停止`);
   process.exit(1);
 }
 
-const targets = withSource ? [...indexFiles, ...sourceFiles] : indexFiles;
+const indexFiles = collect(INDEX_BASES(indexPath));
+const filesDbFiles = withFiles ? collect(INDEX_BASES(filesPath)) : [];
+const sourceFiles = collect([sourcePath]);
+const testItems = withTests ? collectTestData() : [];
+
+if ((withSource || withFiles) && !confirmed) {
+  console.log(`将删除的文件（含${withSource ? '源库' : ''}${withSource && withFiles ? '与' : ''}${withFiles ? '冷库' : ''}）：`);
+  for (const f of [...indexFiles, ...filesDbFiles, ...sourceFiles]) console.log(`  ${human(f.size).padStart(9)}  ${f.file}`);
+  console.error(`\n✗ ${withSource ? '源库是爬取数据，删除后无法恢复' : '冷库删除后既有行的 files 不会再补，需整库重建'}。确认要删请显式加 --yes：`);
+  console.error(`  npm run reset -- ${[withSource && '--source', withFiles && '--files', '--yes'].filter(Boolean).join(' ')}`);
+  process.exit(1);
+}
+
+const targets = [...indexFiles, ...filesDbFiles, ...(withSource ? sourceFiles : [])];
 
 if (targets.length === 0 && testItems.length === 0) {
   console.log('没有需要清理的文件（索引库不存在，可能已经重置过）');
@@ -140,7 +157,7 @@ if (dryRun) {
 const failed = removeAll([...targets, ...testItems]);
 const removed = targets.length + testItems.length - failed.length;
 
-console.log(`\n已删除 ${removed} 项${withSource ? '（含源库）' : ''}`);
+console.log(`\n已删除 ${removed} 项${withSource ? '（含源库）' : ''}${withFiles ? '（含冷库）' : ''}`);
 if (!withSource && sourceFiles.length > 0) {
   console.log(`源库未删除：${sourcePath}`);
   console.log('如需连源库一起删：npm run reset -- --source --yes');

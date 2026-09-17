@@ -83,7 +83,10 @@ npm run build:web           # web/ → public/（Vite + Tailwind）
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
 | `SOURCE_DB_PATH` | `data/magnet.db` | 源库路径（含 `magnets` 表） |
-| `INDEX_DB_PATH` | `data/dht.search.db` | 影子索引库路径 |
+| `INDEX_DB_PATH` | `data/dht.search.db` | 影子索引库（热库）路径 |
+| `FILES_DB_PATH` | `data/dht.files.db` | 冷库路径：`files` 原文 + 预览小列，只按 id 点查、不参与原子切换，可指向另一块盘 |
+| `FILES_COMPRESS` | `true` | 冷库 `files` 用 zlib 压缩（实测约 5×），仅详情接口付一次解压 |
+| `FILES_REWRITE_ON_REBUILD` | `false` | 全量重建时是否无条件重写冷库。默认 `false`：按「源文长度指纹」只重写真正变过的行，重建因此不必重写几个 GB 的大对象 |
 | `PORT` | `3000` | HTTP 服务端口 |
 | `WEB_BASE_PATH` | `'/dht'` | 前端产物部署前缀：空 = 站点根；`/dht` 适合反代子路径。改后需重新构建前端 |
 | `MAX_RESULTS` | `2000` | 「整集拉取」（`limit=all`）单次返回上限，超出标记 `truncated` |
@@ -221,19 +224,36 @@ dist/
 
 ### 影子索引
 
-源库在查询期完全不触碰，所有检索打在另一份可写索引库上：
+源库在查询期完全不触碰，所有检索打在本服务维护的两份库上（按访问频率分冷热）：
 
 | 库 | 文件 | 角色 | 访问方式 |
 |----|------|------|----------|
 | 源库 | `data/magnet.db` | 外部爬虫写入的原始数据 | 构建 / 同步索引时只读打开 |
-| 索引库 | `data/dht.search.db` | FTS5 索引 + 副本 + 同步水位 + 热词 | 查询只命中这里 |
+| 热库 | `data/dht.search.db` | FTS5 索引 + **窄表**副本 + 同步水位 + 热词 | 检索 / 排序 / 筛选只命中这里 |
+| 冷库 | `data/dht.files.db` | `files` 原文（zlib 压缩）+ 预览小列 | 只按 id 点查，列表路径从不扫描 |
 
-索引库内含 4 类对象：
+热库内含 4 类对象：
 
 - `magnets_fts`：contentless FTS5 虚表，索引 `name` 与 `files` 的纯路径文本；
-- `magnets_docs`：`magnets` 的去规范化副本（含 `fileCount` 列），供检索 JOIN；`files` 列存源库原文，详情接口据其构建扁平树；
+- `magnets_docs`：`magnets` 的**窄表**副本——只放检索 / 排序 / 筛选要用的列
+  （`id, totalSize, fetchedAt, fileCount, name, infohash, magnet`，整型列刻意前置），
+  带 `(totalSize DESC, id DESC)`、`(fetchedAt DESC, id DESC)`、`lower(infohash)` 三个索引；
 - `sync_meta`：索引状态（数据水位 `last_rowid` / 格式版本 `files_format` / 维护状态 `build_mode` / FTS 合并计数 `fts_pending`）；
 - `keyword_stats` / `keyword_filter`：热词统计与过滤表。
+
+冷库内含 2 张表（`magnets_files` / `magnets_preview`）。**为什么要拆**：`files` + `preview` 占
+原副本表体积的 94%（313 万行实测 8.8GB → 0.68GB），而所有慢查询的形状都是「取到 N 个匹配
+rowid → 逐个回表主键查找」，成本取决于副本表的页数——表宽时必然随机磁盘 IO，窄表则整个
+装得进缓存。同条件实测（搜索子进程 `cache_size=2MB`）：
+
+| 查询（关键词 `mp4`，105 万匹配） | 拆分前 | 拆分后 |
+|---|---:|---:|
+| `count` + 大小筛选（105 万次主键回查） | 31.6 s | 0.87 s |
+| 按抓取时间排序（缺该索引时的退化形状） | 30.8 s | 1.22 s |
+| 资源库深分页 `OFFSET 100000` | 225 ms | 4 ms |
+
+冷库只追加、不参与索引库的原子切换，因此全量重建不必重写几个 GB 的大对象；
+`FILE_REWRITE_ON_REBUILD` 可切回无条件全量重写。
 
 ### 同步策略
 
@@ -287,8 +307,9 @@ DHT-search/
 ├── src/
 │   ├── db.js                  # 门面：createMagnetDb 组装（索引维护 + 检索 + 热词）
 │   ├── index/                 # 索引子系统
-│   │   ├── ddl.js             # 索引库 DDL 唯一来源（ensureSchema / resetIndexTables）
-│   │   ├── transform.js       # 索引期行转换（files 原文 → FTS 纯路径文本 + fileCount）
+│   │   ├── ddl.js             # 热库 DDL 唯一来源（ensureSchema / resetIndexTables / ensureDocsIndexes）
+│   │   ├── files-store.js     # 冷库访问层（连接 / 压缩编解码 / 批写入 / 点查）
+│   │   ├── transform.js       # 索引期行转换（files 原文 → FTS 纯路径文本 + fileCount + preview）
 │   │   ├── tuning.js          # 调优参数（批大小 / 重建期 PRAGMA / 排序线程）
 │   │   └── timing.js          # 索引流水线分段计时
 │   ├── search/                # 检索子系统
@@ -403,7 +424,7 @@ npm run bench:index      # 重建性能基准（test/bench-index.mjs）
 - **磁盘预留**：重建期禁用 WAL 自动 checkpoint，WAL 会增长到接近索引体积、结束时一次性回写，建议预留约 2 倍索引体积的磁盘空间。
 - **分段耗时**：每次重建（及确有补录的增量同步）结束会打印一行阶段明细（`schema / scan / fts / docs / txn / js / index / merge / checkpoint`），口径见 `src/index/timing.js`。
 - **版本升级**：索引格式变更时，打开旧索引库会自动补齐缺失列（旧库仍可回答查询，新字段取默认值）；启动检测到格式过期会无视 `SYNC_ON_START` 在后台跑一次全量重建，期间线上一直用旧索引服务。回退旧版本同样安全（旧代码会重建回旧格式）。
-- **重置应用**：`npm run reset` 删除索引库及其衍生文件——索引库本体、构建中的影子库（`.build`）、切换备份（`.old`）以及各自的 WAL / SHM。索引可再生，下次启动会自动重建（全量灌入）。**源库默认不动**（爬取数据删了无法恢复），确需一并删除时用 `npm run reset -- --source --yes`（缺 `--yes` 会拒绝执行）。`--dry-run` 先看清单，`--tests` 顺带清空 `test/data` 夹具。服务运行中执行会因文件占用失败，请先停止服务。
+- **重置应用**：`npm run reset` 删除索引库及其衍生文件——索引库本体、构建中的影子库（`.build`）、切换备份（`.old`）以及各自的 WAL / SHM。索引可再生，下次启动会自动重建（全量灌入）。**源库默认不动**（爬取数据删了无法恢复），确需一并删除时用 `npm run reset -- --source --yes`；冷库同理用 `--files --yes`（删后既有行的 `files` 不会再补，需整库重建）。`--dry-run` 先看清单，`--tests` 顺带清空 `test/data` 夹具。服务运行中执行会因文件占用失败，请先停止服务。
 - **调参**：批大小、重建期 PRAGMA、排序线程集中在 `src/index/tuning.js`，各项均支持环境变量临时覆盖（仅供压测）；`npm run bench:index` 可在本机复现对比。FTS 合并策略：重建做一次 `optimize`，增量按累计行数阈值做部分 `merge`。
 
 ## RPC 推送（aria2 / Motrix）

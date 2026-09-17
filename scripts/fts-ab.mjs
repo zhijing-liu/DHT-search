@@ -156,16 +156,32 @@ function runConfig(cfg, rows, textMode, queries) {
   try {
     const db = createDrizzle(raw);
     resetIndexTables(db, cfg.caps);
+    // 本脚本要按 files 原文统计相关性，而副本表（v4 起）已不含 files 列，
+    // 故在临时库里额外留一张旁路表专存原文，只服务下面的 precision 统计。
+    execRaw(raw, 'CREATE TABLE ab_files (id INTEGER PRIMARY KEY, files TEXT)');
 
     const insertFts = prepareStmt(raw, `INSERT INTO ${FTS_TABLE} (rowid, name, files) VALUES (?, ?, ?)`);
     const insertDoc = prepareStmt(
       raw,
-      `INSERT INTO ${DOCS_TABLE} (id, name, infohash, magnet, files, totalSize, fetchedAt)
+      `INSERT INTO ${DOCS_TABLE} (id, totalSize, fetchedAt, fileCount, name, infohash, magnet)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
+    const insertRaw = prepareStmt(raw, 'INSERT INTO ab_files (id, files) VALUES (?, ?)');
     const batch = transaction(raw, (list) => {
       for (const r of list) runStmt(insertFts, [r.id, r.name ?? '', toFtsText(r.files, textMode)]);
-      for (const r of list) runStmt(insertDoc, [r.id, r.name ?? '', r.infohash, r.magnet, r.files, r.totalSize, r.fetchedAt]);
+      for (const r of list) {
+        const paths = textMode === 'paths' ? extractPaths(r.files) : [];
+        runStmt(insertDoc, [
+          r.id,
+          r.totalSize ?? 0,
+          r.fetchedAt ?? 0,
+          textMode === 'paths' ? paths.length : 0,
+          r.name ?? '',
+          r.infohash,
+          r.magnet,
+        ]);
+        runStmt(insertRaw, [r.id, r.files ?? '']);
+      }
     });
 
     const t0 = performance.now();
@@ -211,7 +227,7 @@ function runConfig(cfg, rows, textMode, queries) {
       const ids = topByQuery.get(q) ?? [];
       if (ids.length === 0) continue;
       const placeholders = ids.map(() => '?').join(',');
-      const rowsInTop = allRows(raw, `SELECT files FROM ${DOCS_TABLE} WHERE id IN (${placeholders})`, ids);
+      const rowsInTop = allRows(raw, `SELECT files FROM ab_files WHERE id IN (${placeholders})`, ids);
       for (const row of rowsInTop) {
         total += 1;
         if (extractPaths(row.files).some((p) => p.toLowerCase().includes(q.toLowerCase()))) hit += 1;

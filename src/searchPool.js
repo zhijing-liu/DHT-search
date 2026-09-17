@@ -27,7 +27,8 @@ export class SearchExecutor {
    * @param {number} [opts.queueMax=16]          等待队列上限
    * @param {number} [opts.queueTimeoutMs=10000] 排队超时（ms），0 = 不限时
    * @param {boolean} [opts.recycleImmediate=false] 查询完成即回收进程；为 true 时 idleMs 被忽略
-   * @param {string} [opts.indexPath]            主进程解析出的索引库路径，透传给子进程
+   * @param {string} [opts.indexPath]            主进程解析出的索引库（热库）路径，透传给子进程
+   * @param {string} [opts.filesPath]            主进程解析出的冷库路径，透传给子进程
    */
   constructor({
     maxProcesses = 2,
@@ -36,6 +37,7 @@ export class SearchExecutor {
     queueTimeoutMs = 10_000,
     recycleImmediate = false,
     indexPath,
+    filesPath,
   } = {}) {
     this.maxProcesses = clampInt(maxProcesses, 2, 1, 16);
     this.idleMs = clampInt(idleMs, 60_000, 0, Number.MAX_SAFE_INTEGER);
@@ -44,6 +46,7 @@ export class SearchExecutor {
     // 严格判等：config 里若误写成字符串 'false'，也应走「延迟回收」而非「立即回收」
     this.recycleImmediate = recycleImmediate === true;
     this.indexPath = indexPath;
+    this.filesPath = filesPath;
 
     /** 存活的进程槽位；初始为空，随查询按需增长、随空闲/断开收缩 */
     /** @type {Array<{child: object, busy: boolean, dead: boolean, seq: number, task: object|null, lastUsed: number}>} */
@@ -86,10 +89,10 @@ export class SearchExecutor {
 
   /** 派生一个子进程并挂进池中（按需调用：池初始为空，首个查询才走到这里） */
   _spawn() {
-    // 通过环境变量把主进程解析好的索引库路径交给子进程（比 IPC 消息更早生效，无竞态）
-    const env = this.indexPath
-      ? { ...process.env, DHT_SEARCH_INDEX_DB_PATH: this.indexPath }
-      : process.env;
+    // 通过环境变量把主进程解析好的库路径交给子进程（比 IPC 消息更早生效，无竞态）
+    let env = process.env;
+    if (this.indexPath) env = { ...env, DHT_SEARCH_INDEX_DB_PATH: this.indexPath };
+    if (this.filesPath) env = { ...env, DHT_SEARCH_FILES_DB_PATH: this.filesPath };
     // 统一派生入口：源码态跑脚本，编译态由 exe 自拉起（见 src/child-process.js）
     const child = spawnChild({ entryPath: CHILD_PATH, flag: SEARCH_WORKER_FLAG, env });
     const slot = {

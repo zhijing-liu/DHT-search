@@ -28,6 +28,7 @@ if (!loaded) loaded = await import('../config.js');
 export const {
   SOURCE_DB_PATH,
   INDEX_DB_PATH,
+  FILES_DB_PATH,
   PORT,
   WEB_BASE_PATH,
   MAX_RESULTS,
@@ -47,4 +48,33 @@ export const {
   ACCESS_CONTROL_MODE,
   ALLOWED_CLIENTS,
   TRUST_PROXY,
+  ENABLE_MMAP,
+  FILES_COMPRESS,
+  FILES_REWRITE_ON_REBUILD: FILES_REWRITE_ON_REBUILD_RAW,
 } = loaded;
+
+/** mmap 总开关：默认开启（仅显式 false 才关闭），避免缺失配置时静默关掉加速 */
+export const MMAP_ENABLED = ENABLE_MMAP !== false;
+
+/**
+ * 冷库 files 是否压缩存储（zlib level 1）。
+ * 路径文本重复度高，实测 5× 左右压缩率；只在详情接口付一次解压开销，
+ * 列表路径完全不受影响。默认开启（仅显式 false 才关闭）。
+ */
+export const FILES_COMPRESS_ENABLED = FILES_COMPRESS !== false;
+
+/**
+ * 全量重建时是否重写冷库已有行。
+ * 默认 false = 只追加缺失 id（files 按 id 不可变，重建不必重写 8GB 大对象，
+ * 这是拆分冷库最大的重建收益）。源库会 UPDATE 既有行时改 true，代价是每次重建全量重写。
+ */
+export const FILES_REWRITE_ON_REBUILD = FILES_REWRITE_ON_REBUILD_RAW === true;
+
+/**
+ * 索引库读连接 mmap 窗口（MB）：统一控制主进程只读连接与搜索子进程。
+ * 未设置新项时回退旧配置 SEARCH_PROCESS_MMAP_SIZE_MB；再缺失则用 256 兜底。
+ */
+export const INDEX_MMAP_SIZE_MB = (() => {
+  const v = loaded.INDEX_MMAP_SIZE_MB ?? loaded.SEARCH_PROCESS_MMAP_SIZE_MB;
+  return Number.isFinite(Number(v)) ? Number(v) : 256;
+})();

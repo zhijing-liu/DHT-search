@@ -45,9 +45,17 @@ export { isBun, Database };
 /* 连接管理                                                            */
 /* ------------------------------------------------------------------ */
 
-/** 打开连接：抹平构造选项差异（bun 无 fileMustExist，缺失即报错） */
+/**
+ * 打开连接：抹平构造选项差异，并统一「只读 = 文件必须已存在」的语义。
+ *
+ * 只读打开一律不允许隐式建库：源库 / 索引库路径配错时，宁可直接报错，
+ * 也不要在错误的位置留下一个 0 字节的空库（历史上就因此在项目 data/ 下
+ * 留下过空的 magnet.db，排查时极易误导）。
+ *   - Node：better-sqlite3 的 fileMustExist
+ *   - Bun ：bun:sqlite 的 create（默认 true，必须显式关掉才是「缺失即报错」）
+ */
 export function openDatabase(filePath, { readonly = false } = {}) {
-  if (isBun) return new Database(filePath, { readonly, create: true });
+  if (isBun) return new Database(filePath, { readonly, create: !readonly });
   return new Database(filePath, readonly ? { readonly: true, fileMustExist: true } : {});
 }
 

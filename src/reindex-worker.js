@@ -22,8 +22,8 @@ const DBG = process.env.DHT_REINDEX_DEBUG === '1';
 const trace = (...args) => { if (DBG) console.log('[reindex-worker]', ...args); };
 
 function main() {
-  const { sourcePath, indexPath, mode } = JSON.parse(process.env.DHT_REINDEX_JOB || '{}');
-  trace(`执行体启动 mode=${mode} indexPath=${indexPath}`);
+  const { sourcePath, indexPath, filesPath, mode } = JSON.parse(process.env.DHT_REINDEX_JOB || '{}');
+  trace(`执行体启动 mode=${mode} indexPath=${indexPath} filesPath=${filesPath}`);
 
   /** 回传通道：子进程 IPC */
   const post = (msg) => {
@@ -32,8 +32,9 @@ function main() {
 
   let api;
   try {
-    // sync: false —— 执行体只为维护索引而来，不必先跑一次增量同步
-    api = createMagnetDb({ source: sourcePath, indexDbPath: indexPath, sync: false });
+    // sync: false —— 执行体只为维护索引而来，不必先跑一次增量同步。
+    // filesDbPath 显式传入正式冷库：本进程写的是影子索引库，但冷库全进程共用一份。
+    api = createMagnetDb({ source: sourcePath, indexDbPath: indexPath, filesDbPath: filesPath, sync: false });
     trace('createMagnetDb 打开完成，开始执行索引维护');
     if (mode === 'full') {
       trace('开始 rebuildSync（全量重建）');

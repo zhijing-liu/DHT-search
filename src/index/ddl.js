@@ -17,6 +17,8 @@ import {
   FTS_TABLE,
   DOCS_TABLE,
   DOCS_COLUMN_DEFS,
+  DOCS_INDEX_DEFS,
+  DOCS_INFOHASH_INDEX,
   KEYWORD_TABLE,
   KEYWORD_FILTER_TABLE,
   TOKENIZER,
@@ -24,9 +26,12 @@ import {
 
 /**
  * 索引格式版本：写入 sync_meta.files_format，与库中值不一致即触发一次全量重建
- * （v2：FTS 索引文本改为纯路径、docs 增加 fileCount 列、FTS5 表参数纳入探测）。
+ * （v2：FTS 索引文本改为纯路径、docs 增加 fileCount 列、FTS5 表参数纳入探测；
+ *   v3：docs 增加 preview 派生列——列表路径不再拉 files 大列；
+ *   v4：files / preview 移出副本表进冷库，副本表瘦身为窄表并重排列顺序，
+ *       排序索引改为 (col DESC, id DESC) 复合形式）。
  */
-export const INDEX_FORMAT = 'v2';
+export const INDEX_FORMAT = 'v4';
 
 /** FTS5 建表参数默认值（detail / columnsize 保留 full + 1：降档会使 bm25 失效） */
 
@@ -84,10 +89,40 @@ export function hasTable(db, name) {
 }
 
 /**
+ * 副本表的二级索引（幂等，缺失才建）。
+ *
+ * (col DESC, id DESC) 复合形式：索引条目自带次排序键，正向扫描即得到查询要的顺序，
+ * 省掉一次反向扫描或额外排序；检索侧用 INDEXED BY 强制走它（见 search/api.js）。
+ *
+ * 这三个索引是「列排序快路径」的唯一保障：没有它们，planner 会退化成
+ * 「取全部匹配 rowid → 逐个回表主键查找 → TEMP B-TREE 排序」，实测 30s 级。
+ *
+ * @param {object} db drizzle 可写连接
+ */
+export function ensureDocsIndexes(db) {
+  for (const [col, indexName] of DOCS_INDEX_DEFS) {
+    db.run(
+      sql`CREATE INDEX IF NOT EXISTS ${sql.raw(indexName)}
+          ON ${sql.raw(DOCS_TABLE)}(${sql.raw(col)} DESC, id DESC)`
+    );
+  }
+  db.run(
+    sql`CREATE INDEX IF NOT EXISTS ${sql.raw(DOCS_INFOHASH_INDEX)}
+        ON ${sql.raw(DOCS_TABLE)}(lower(infohash))`
+  );
+}
+
+/**
  * 幂等建表：全新索引库 / sync:false 打开时使用，并给老库补齐缺失列
  * （格式迁移期间线上仍用旧库回答查询，缺列会直接报 "no such column"）。
+ *
+ * @param {object} db
+ * @param {object} [caps]
+ * @param {{ indexes?: boolean }} [opts] indexes=false 时跳过二级索引的幂等确保。
+ *   用于「本次启动就要全量重建」的库：那种情况下建索引纯属白等（重建会重建），
+ *   而它是在打开连接时同步执行的，会实打实阻塞启动。
  */
-export function ensureSchema(db, caps = DEFAULT_FTS_CAPS) {
+export function ensureSchema(db, caps = DEFAULT_FTS_CAPS, { indexes = true } = {}) {
   // 同步水位表（drizzle 不自动建表，由 raw DDL 维护）
   db.run(sql`CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT)`);
   // 热词统计表（全量重建时会 DROP 重建，保证干净）
@@ -103,6 +138,9 @@ export function ensureSchema(db, caps = DEFAULT_FTS_CAPS) {
   // 老库补列（历史行的新列取默认值，重建后即被真实数据覆盖）
   ensureColumns(db, DOCS_TABLE, DOCS_ADDITIVE_COLUMNS);
   db.run(sql.raw(ftsDdl(caps, { ifNotExists: true })));
+  // 二级索引同样幂等确保：已有索引时只是目录探查，却能让「全新库 / 索引被删掉的旧库」
+  // 一打开就具备列排序快路径，不必等下一次重建
+  if (indexes) ensureDocsIndexes(db);
 }
 
 /**

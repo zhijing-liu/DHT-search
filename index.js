@@ -2,7 +2,8 @@
  * Express 检索服务入口
  * ------------------------------------------------------------------
  *   GET  /                    重定向到 /index.html
- *   GET  /api/search          FTS5 检索（参数：q 必填；sortBy / order / limit / offset 可选）
+ *   GET  /api/search          FTS5 检索（参数：q 必填；sortBy / order / limit / offset / searchIn 可选；
+ *                              searchIn=name 只搜种子名，缺省搜 name+files）
  *   GET  /api/latest          最新入库列表（不经 FTS，按入库顺序从新到旧）
  *   GET  /api/magnet/:id/files 某条资源的完整文件树
  *   POST /api/reindex         手动全量重建；POST /api/sync 手动增量补录
@@ -74,6 +75,7 @@ const searchExecutor = createSearchExecutor({
   queueMax: CONFIG.searchQueueMax,
   queueTimeoutMs: CONFIG.searchQueueTimeoutMs,
   indexPath: api.indexPath,
+  filesPath: api.filesPath,
 });
 
 // 索引库原子切换的前后钩子（重建写影子库，完成后由 db.js 的 swapIndex 调用）：
@@ -220,7 +222,7 @@ app.use(express.json());
 
 /** 构造搜索缓存键：由归一化后的检索参数派生（新增参数时不易漏改） */
 function searchCacheKey(s) {
-  return JSON.stringify([s.query, s.by, s.sortBy, s.order, s.limit, s.offset, s.minSize, s.maxSize]);
+  return JSON.stringify([s.query, s.by, s.sortBy, s.order, s.limit, s.offset, s.minSize, s.maxSize, s.cursor, s.searchIn]);
 }
 
 /** 检索日志描述串（缓存 HIT / MISS / 客户端取消三处共用） */

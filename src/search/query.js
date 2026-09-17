@@ -34,20 +34,23 @@ const DEFAULT_LATEST_LIMIT = 30;
  * AND 连接，末位 token 追加 '*' 实现前缀匹配（原始输入直接拼入会抛 fts5: syntax error）。
  *
  * @param {unknown} input 用户输入的搜索串
+ * @param {string} [field] 限定检索字段：'name' 只搜 name 列；不传/其它值搜全部列（name+files）
  * @returns {string|null} 清洗后的 MATCH 表达式；无有效 token 时返回 null
  */
-export function buildMatchExpression(input) {
+export function buildMatchExpression(input, field) {
   if (input === null || input === undefined) return null;
   const tokens = String(input).match(TOKEN_PATTERN);
   if (!tokens || tokens.length === 0) return null;
 
-  return tokens
+  const inner = tokens
     .map((token, index) => {
       const isLast = index === tokens.length - 1;
       // unicode61 会做大小写折叠，这里统一转小写保证确定性
       return `"${token.toLowerCase()}"${isLast ? '*' : ''}`;
     })
     .join(' AND ');
+  // 只搜 name 列：用列过滤语法 `name:(...)` 把整段表达式限定到该列（FTS5 虚表列名即 name/files）
+  return field === 'name' ? `name:(${inner})` : inner;
 }
 
 /**
@@ -87,8 +90,11 @@ export function orderSqlFor({ sortBy, order }) {
  *
  * @param {object} [raw] 原始检索参数
  * @returns {{ query: string, sortBy: string|undefined, order: 'asc'|'desc',
- *             by: 'hash'|'fts', minSize: number|undefined, maxSize: number|undefined,
- *             limit: number, offset: number }} limit 为 -1 表示整集拉取
+ *             by: 'hash'|'fts', searchIn: string|undefined,
+ *             minSize: number|undefined, maxSize: number|undefined,
+ *             limit: number, offset: number, cursor: string|undefined }}
+ *   limit 为 -1 表示整集拉取；cursor 为 keyset 深翻页游标（opaque token，原样回传）；
+ *   searchIn 为 'name' 时只搜 name 列，其它/缺省搜全部列（name+files）
  */
 export function normalizeSearchQuery(raw = {}) {
   const source = raw ?? {};
@@ -99,10 +105,17 @@ export function normalizeSearchQuery(raw = {}) {
     sortBy: SORT_COLUMNS.includes(source.sortBy) ? source.sortBy : undefined,
     order: String(source.order).toLowerCase() === 'asc' ? 'asc' : 'desc',
     by: source.by === 'hash' ? 'hash' : 'fts',
+    // 搜索范围：仅 'name' 为"只搜种子名"；其余（含缺省）搜 name+files（文件名/路径）
+    searchIn: source.searchIn === 'name' ? 'name' : undefined,
     minSize: toSize(source.minSize),
     maxSize: toSize(source.maxSize),
     limit: toLimit(source.limit),
     offset: clampInt(source.offset, 0, 0, Number.MAX_SAFE_INTEGER),
+    // 游标是 opaque token（base64url(JSON {v,i})），只透传给检索层解码；长度钳制防滥用
+    cursor:
+      typeof source.cursor === 'string' && source.cursor.length > 0 && source.cursor.length <= 256
+        ? source.cursor
+        : undefined,
   };
 }
 

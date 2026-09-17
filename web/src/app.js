@@ -121,6 +121,7 @@ function readUrlParams() {
     page: params.get('page'),
     pageSize: params.get('pageSize'),
     sizeRange: params.get('sizeRange'),
+    searchIn: params.get('searchIn'),
   };
 }
 
@@ -145,6 +146,8 @@ export function registerApp() {
     sizeRange: 'all',
     sortBy: '',
     order: 'desc',
+    /** 搜索范围：'' = name+files（默认），'name' = 只搜种子名 */
+    searchIn: '',
 
     /** 是否有请求在途：用于防重复触发与取消，与蒙层显隐解耦 */
     searching: false,
@@ -431,6 +434,7 @@ export function registerApp() {
       params.q = this.query;
       params.order = this.order;
       if (this.sortBy) params.sortBy = this.sortBy;
+      if (this.searchIn === 'name') params.searchIn = 'name';
       if (isInfohash(this.query)) params.by = 'hash';
 
       const range = SIZE_RANGES.find((r) => r.value === this.sizeRange) || SIZE_RANGES[0];
@@ -574,6 +578,12 @@ export function registerApp() {
 
     setSort(sortBy) {
       this.sortBy = sortBy;
+      this.submitSearch();
+    },
+
+    /** 切换搜索范围（仅种子名 / 名称+文件）并提交检索 */
+    setSearchIn(v) {
+      this.searchIn = v === 'name' ? 'name' : '';
       this.submitSearch();
     },
 
@@ -948,6 +958,7 @@ export function registerApp() {
         if (this.sortBy) params.set('sortBy', this.sortBy);
         if (this.order !== 'desc') params.set('order', this.order);
         if (this.sizeRange !== 'all') params.set('sizeRange', this.sizeRange);
+        if (this.searchIn === 'name') params.set('searchIn', 'name');
       }
       if (this.page > 1) params.set('page', String(this.page));
       if (this.pageSize !== DEFAULT_PAGE_SIZE) params.set('pageSize', String(this.pageSize));
@@ -975,6 +986,7 @@ export function registerApp() {
         this.sortBy = SORT_KEYS.some((k) => k.value === p.sortBy) ? p.sortBy : '';
         this.order = p.order === 'asc' ? 'asc' : 'desc';
         this.sizeRange = SIZE_RANGES.some((r) => r.value === p.sizeRange) ? p.sizeRange : 'all';
+        this.searchIn = p.searchIn === 'name' ? 'name' : '';
       }
       this.jumpValue = String(this.page);
     },
