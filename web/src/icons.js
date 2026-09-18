@@ -4,14 +4,7 @@
  */
 const SVG = 'viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
 
-const X = (size, stroke) =>
-  `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
-
 export const ICONS = {
-  /** 热词气泡右侧的「加入黑名单」 */
-  closeSm: X(12, 2.5),
-  /** 黑名单条目的「移出黑名单」 */
-  close: X(14, 2.5),
   /** 上一页 / 下一页 */
   prev: `<svg ${SVG}><polyline points="15 18 9 12 15 6"/></svg>`,
   next: `<svg ${SVG}><polyline points="9 18 15 12 9 6"/></svg>`,

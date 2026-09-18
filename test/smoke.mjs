@@ -12,7 +12,7 @@ import { sql } from 'drizzle-orm';
 import { createMagnetDb } from '../src/db.js';
 import { normalizeSearchQuery } from '../src/search/query.js';
 import { runtimeStats } from '../src/stats.js';
-import { MAX_LIMIT } from '../src/store.js';
+import { MAX_LIMIT, HOT_WORDS_MAX } from '../src/store.js';
 import { INDEX_FORMAT } from '../src/index/ddl.js';
 import { IndexTimer } from '../src/index/timing.js';
 import { openDatabase, setPragma, execRaw, closeDb, allRows } from '../src/db-driver.js';
@@ -129,7 +129,9 @@ writeSource((src) => {
   })(FIXTURES);
 });
 
-const openApi = () => createMagnetDb({ source: SMOKE_DB, indexDbPath: SMOKE_INDEX });
+// hotMinDocCount: 1 —— 夹具的词频只有个位数，用默认阈值（≥50）会把词表整份筛空，
+// 而热词/过滤相关的断言都依赖这些夹具词出现在词表里
+const openApi = () => createMagnetDb({ source: SMOKE_DB, indexDbPath: SMOKE_INDEX, hotMinDocCount: 1 });
 
 // 各 section 用独立影子索引库，互不干扰（文件名前缀 smoke，会被 cleanup 通配删除）
 const idxFor = (n) => path.join(DATA_DIR, `smoke.idx${n}.db`);
@@ -442,24 +444,28 @@ console.log('\n[9] infohash 精确检索（by=hash）');
 console.log('\n[10] 热词统计（keyword_stats / topKeywords）');
 {
   const api = openApi();
-  check('topKeywords 返回热词且 doc_count 正确（brunette 出现在 2 个文档）', () => {
+  check('topKeywords 返回按热度降序的词（只含 term 字符串）', () => {
     const kw = api.topKeywords();
     assert.ok(Array.isArray(kw));
-    const brunette = kw.find((k) => k.term === 'brunette');
-    assert.ok(brunette, '热词表中应存在 brunette');
-    assert.equal(brunette.doc_count, 2);
-    assert.ok(brunette.occurrences >= 2);
+    // 顺序即热度排名，故不再下发 doc_count / occurrences —— 只传 term
+    assert.ok(kw.every((t) => typeof t === 'string'), '每项应是 term 字符串');
+    assert.ok(kw.includes('brunette'), '热词表中应存在 brunette');
   });
   check('热词不含单字符与纯数字噪声', () => {
     const kw = api.topKeywords(1000);
-    assert.ok(!kw.some((k) => k.term.length < 2 || /^\d+$/.test(k.term)));
+    assert.ok(!kw.some((t) => t.length < 2 || /^\d+$/.test(t)));
   });
   check('limit 生效（topKeywords(2) 返回 2 条）', () => {
     assert.equal(api.topKeywords(2).length, 2);
   });
-  check('limit 非法值回退默认且不抛错（数据不足 50 时返回全部）', () => {
+  check('limit 非法值回退默认且不抛错', () => {
     assert.doesNotThrow(() => api.topKeywords('abc'));
-    assert.ok(api.topKeywords(99999).length <= 1000);
+    assert.ok(api.topKeywords(99999).length <= HOT_WORDS_MAX);
+  });
+  check('完整统计仍保留在 keyword_stats（含 doc_count / occurrences）', () => {
+    const row = api.db.all(sql`SELECT doc_count, occurrences FROM keyword_stats WHERE term = 'brunette'`)[0];
+    assert.equal(Number(row?.doc_count ?? 0), 2);
+    assert.ok(Number(row?.occurrences ?? 0) >= 2);
   });
   api.close();
 }
@@ -468,11 +474,11 @@ console.log('\n[11] 热词过滤（keyword_filter）');
 {
   const api = openApi();
   check('默认热词包含 brunette', () => {
-    assert.ok(api.topKeywords().some((k) => k.term === 'brunette'));
+    assert.ok(api.topKeywords().includes('brunette'));
   });
   check('添加过滤词后 topKeywords 立即排除该词', () => {
     api.addKeywordFilter('brunette');
-    assert.ok(!api.topKeywords().some((k) => k.term === 'brunette'));
+    assert.ok(!api.topKeywords().includes('brunette'));
     assert.ok(api.listKeywordFilters().some((f) => f.term === 'brunette'));
   });
   check('增量补录时过滤词不再累计（doc_count 保持 2）', () => {
@@ -489,7 +495,7 @@ console.log('\n[11] 热词过滤（keyword_filter）');
   });
   check('删除过滤词后热词恢复', () => {
     api.removeKeywordFilter('brunette');
-    assert.ok(api.topKeywords().some((k) => k.term === 'brunette'));
+    assert.ok(api.topKeywords().includes('brunette'));
   });
   api.close();
 }

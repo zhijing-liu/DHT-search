@@ -20,7 +20,15 @@ import {
   matchSuggestions,
   saveRpcConfig,
   downloadText,
+  tokenize,
 } from './util.js';
+import {
+  buildPinyinIndex,
+  isPinyinEnabled,
+  isPreciseEnabled,
+  setPinyinEnabled,
+  setPreciseEnabled,
+} from './pinyin.js';
 
 /** 默认每页条数（与模板里 <select id="pageSize"> 的默认项一致） */
 const DEFAULT_PAGE_SIZE = 20;
@@ -63,9 +71,20 @@ const PAGE_DOTS_CLASS = 'inline-flex items-center justify-center h-9 px-1.5 text
 /** 当前页码的标记类（配合上面的 [&.active] 变体）；必须是完整类名字符串 */
 const PAGE_ACTIVE_CLASS = 'active';
 
-/** 热词：一次拉全量（联想候选要全），榜单只展示前 HOT_LIST_SIZE 条 */
-const HOT_FETCH_SIZE = 1000;
-const HOT_LIST_SIZE = 200;
+/**
+ * 榜单每次渲染的条数（懒加载步长）。
+ * 词表整份都在前端，首屏只建这么多按钮即可显示，往后滚一批加一批，直到全部渲染完
+ * （词表有 3 万条，一次建满会直接卡死首屏）。
+ */
+const HOT_PAGE_SIZE = 100;
+/** 距底多少像素时预加载下一批（留出余量，避免滚到底才开始建 DOM） */
+const HOT_PREFETCH_PX = 300;
+
+/**
+ * 联想下拉的候选条数。下拉容器是 max-h-[360px]（约 9 行可见）配滚动条，
+ * 取 12 让候选更全，超出一屏的滚动查看；再加收益递减（用户极少往下翻很多行）。
+ */
+const SUGGEST_MAX = 12;
 
 /**
  * 黑名单单屏渲染上限。
@@ -164,9 +183,11 @@ export const registerApp = () => {
     resultsVisible: false,
     countText: '加载中…',
 
-    /** 热词全量缓存：null=未加载（此时不展示浏览区，避免先闪一下空态）。
-     *  榜单与联想都从这一份派生，不再各存一份（见 hotItems / hotSuggestions） */
+    /** 热词全量词表：null=未加载（此时不展示浏览区，避免先闪一下空态）。
+     *  榜单与联想都从这一份派生，不再各存一份（见 hotList / hotSuggestions） */
     hotWords: null,
+    /** 榜单已渲染的条数（滚动懒加载的游标，见 hotList / onHotWordsScroll） */
+    hotVisible: HOT_PAGE_SIZE,
     editMode: false,
     blacklistItems: [],
     blacklistFilter: '',
@@ -178,6 +199,11 @@ export const registerApp = () => {
     settingsOpen: false,
     rpc: { url: '', secret: '' },
     hudOn: false,
+    /** 拼音联想：开关状态与词库就绪标记（索引本身见 _pinyinIndex，不参与渲染） */
+    pinyinOn: false,
+    pinyinPrecise: false,
+    pinyinLoading: false,
+    pinyinReady: false,
     busy: { sync: false, reindex: false, import: false },
     confirm: { open: false, message: '', danger: false, resolve: null },
 
@@ -196,6 +222,10 @@ export const registerApp = () => {
     _loadingTimer: null,
     /** 失焦延迟关闭联想的定时器（见 onQueryBlur / onQueryInput） */
     _blurTimer: null,
+    /** 拼音索引（见 pinyin.js）：只在词库就绪后非 null，未开启/加载中均为 null */
+    _pinyinIndex: null,
+    /** 热词榜 scroll 的 rAF 句柄（同帧多次 scroll 只处理一次，见 onHotWordsScroll） */
+    _hotScrollRaf: null,
 
     /* ============================ 派生值 ============================ */
 
@@ -204,18 +234,24 @@ export const registerApp = () => {
     },
     /** 浏览区（热词榜）：仅搜索视图、无关键词、且热词已加载 */
     get showBrowse() {
-      return this.mode === 'search' && !this.query && this.hotItems !== null;
-    },
-    /** 榜单条目：全量缓存的前 HOT_LIST_SIZE 条；null 表示尚未加载 */
-    get hotItems() {
-      return this.hotWords ? this.hotWords.slice(0, HOT_LIST_SIZE) : null;
+      return this.mode === 'search' && !this.query && this.hotWords !== null;
     },
     /** 联想候选：用全量（候选更全），与榜单共用同一份缓存 */
     get hotSuggestions() {
       return this.hotWords || [];
     },
+    /**
+     * 榜单实际渲染的条目：已「翻」到的前 hotVisible 条。
+     * 没有条数上限 —— 一直滚动会一直追加，直到整份词表渲染完。
+     */
     get hotList() {
-      return this.hotItems || [];
+      if (!this.hotWords) return [];
+      return this.hotWords.slice(0, this.hotVisible);
+    },
+    /** 榜单是否还有未渲染的条目（决定是否继续追加） */
+    get hotHasMore() {
+      if (!this.hotWords) return false;
+      return this.hotVisible < this.hotWords.length;
     },
     get refreshTitle() {
       return this.mode === 'latest' ? '刷新资源库' : '刷新搜索结果';
@@ -236,20 +272,24 @@ export const registerApp = () => {
     get suggestions() {
       if (this._suggestClosed) return [];
       const q = this.input.trim();
-      return q ? matchSuggestions(this.hotSuggestions, q) : [];
+      if (!q) return [];
+      // 拼音索引仅在就绪后参与；未开启或词库仍在加载时退回纯词面匹配
+      return matchSuggestions(this.hotSuggestions, q, SUGGEST_MAX, this.pinyinReady ? this._pinyinIndex : null);
     },
     /** 下拉是否展开：有候选才展开，无候选时不显示空框 */
     get suggestOpen() {
       return this.suggestions.length > 0;
     },
-    /** 联想下拉的可渲染行（命中片段已高亮为安全 HTML） */
+    /**
+     * 联想下拉的可渲染行（命中片段已高亮为安全 HTML）。
+     * 高亮用词表分词的结果：输入 "movie 1080p" 时两段分别高亮，而不是拿整串去匹配。
+     * 不再显示计数——词表顺序即热度排名，服务端已不下发 doc_count。
+     */
     get suggestionRows() {
-      const q = this.input.trim();
-      const tokens = q ? [q] : [];
-      return this.suggestions.map((it) => ({
-        term: it.term,
-        html: highlightHtml(it.term, tokens),
-        countText: `${formatCount(it.doc_count)} 条`,
+      const tokens = tokenize(this.input);
+      return this.suggestions.map((term) => ({
+        term,
+        html: highlightHtml(term, tokens),
       }));
     },
     /** 设置面板两个动作按钮的文案 */
@@ -347,6 +387,9 @@ export const registerApp = () => {
       this.rpc = getRpcConfig();
       this.hudOn = localStorage.getItem(STATS_HUD_KEY) === '1';
       this.syncHud();
+      // 拼音联想：上次开过就恢复开关；词库走浏览器缓存，真正下载只在首次
+      this.pinyinOn = isPinyinEnabled();
+      this.pinyinPrecise = this.pinyinOn && isPreciseEnabled();
 
       // 用箭头函数订阅：DOM 事件回调的 this 会被置为 currentTarget（window），
       // 直接传方法引用会让 this 丢失，故这里靠闭包固定住组件实例。
@@ -376,6 +419,7 @@ export const registerApp = () => {
       window.removeEventListener('hashchange', this._onLocationChange);
       clearTimeout(this._loadingTimer);
       clearTimeout(this._blurTimer);
+      cancelAnimationFrame(this._hotScrollRaf); // cancelAnimationFrame(null) 是安全的无操作
       this.stopStats();
     },
 
@@ -589,7 +633,12 @@ export const registerApp = () => {
       if (this.mode !== 'search') return;
       this.resultsVisible = false;
       this.items = [];
-      if (this.hotWords === null) this.loadHot();
+      if (this.hotWords === null) {
+        this.loadHot();
+        return;
+      }
+      // 榜单早已加载：容器刚由隐藏转为可见，补足一屏（宽屏下单批可能放不满）
+      this.$nextTick(() => this.fillHotViewport());
     },
 
     /* ============================ 排序 / 筛选 / 分页 ============================ */
@@ -706,10 +755,64 @@ export const registerApp = () => {
     /** 一次拉取热词（全量缓存）：榜单取前 HOT_LIST_SIZE 条，联想用全量 */
     async loadHot() {
       try {
-        this.hotWords = await api.fetchHot(HOT_FETCH_SIZE);
+        // 拉整份词表：联想在前端做，不再逐次请求服务端
+        this.hotWords = await api.fetchHot();
       } catch {
         this.hotWords = []; // 置空而非 null：失败后不再反复触发重新拉取
       }
+      this.hotVisible = HOT_PAGE_SIZE; // 榜单从首批重新开始渲染
+      // 词表换了就必须重建拼音索引：索引里的 i 是词表下标，换表后全部失效。
+      // 不 await —— 构建要等词库下载，不能卡住榜单首屏。
+      if (this.pinyinOn) this.loadPinyinIndex();
+      await this.$nextTick();
+      this.fillHotViewport(); // 首批可能不足一屏（宽屏），补齐后才可能产生滚动
+    },
+
+    /**
+     * 热词榜滚动懒加载：接近底部时再渲染一批。
+     *
+     * 用 requestAnimationFrame 把同一帧内的多次 scroll 合并成一次：scroll 是每秒几十次的
+     * 高频事件，而 loadMoreHot 要读 scrollHeight / scrollTop / clientHeight 三个布局属性，
+     * 浏览器每次都得先结算掉挂起的样式变更才能给出准确值（forced synchronous layout）。
+     * 合并后这笔开销与「帧数」同阶，而不再与「滚动事件数」同阶。
+     *
+     * 容器由 $refs 取得而非 event.target：回调已推迟到下一帧，不再依赖事件对象。
+     */
+    onHotWordsScroll() {
+      if (this._hotScrollRaf) return; // 本帧已排队，丢弃后续事件
+      this._hotScrollRaf = requestAnimationFrame(() => {
+        this._hotScrollRaf = null;
+        this.loadMoreHot(this.$refs.hotWords);
+      });
+    },
+
+    /**
+     * 追加一批并检查是否仍需补足。
+     *
+     * 必须递归补足：容器是 flex-wrap 的，若当前这批还没把容器撑出一屏，
+     * 就没有滚动条、也就永远触发不了 scroll 事件 —— 榜单会卡在第一批。
+     * 宽屏（一行放得下很多词）下尤其明显。
+     *
+     * @param {HTMLElement} el 热词容器
+     */
+    loadMoreHot(el) {
+      if (!el || !this.hotHasMore) return;
+      // 距底还有余量：说明用户尚未滚到底，等下一次 scroll
+      if (el.scrollHeight - el.scrollTop - el.clientHeight > HOT_PREFETCH_PX) return;
+      this.hotVisible += HOT_PAGE_SIZE;
+      this.$nextTick(() => this.loadMoreHot(el));
+    },
+
+    /** 容器未撑出一屏时持续补足（否则没有滚动条，scroll 事件永远不会来） */
+    fillHotViewport() {
+      const el = this.$refs.hotWords;
+      if (!el || !this.hotHasMore) return;
+      // 容器不可见（浏览区被隐藏 / 正在搜索）时量不出尺寸：此时必须收手，
+      // 否则 0 - 0 永远不满足阈值，会把整份词表一次性渲染出来
+      if (el.clientHeight === 0) return;
+      if (el.scrollHeight - el.clientHeight > HOT_PREFETCH_PX) return;
+      this.hotVisible += HOT_PAGE_SIZE;
+      this.$nextTick(() => this.fillHotViewport());
     },
 
     /** 重新拉取热词（黑名单变化后被过滤的词可能重新出现） */
@@ -749,7 +852,7 @@ export const registerApp = () => {
         return;
       }
       // 从全量缓存里摘掉：榜单与联想都立即生效（服务端下次也不会再返回它）
-      this.hotWords = (this.hotWords || []).filter((h) => h.term !== term);
+      this.hotWords = (this.hotWords || []).filter((h) => h !== term);
       if (this.editMode) await this.loadBlacklist();
     },
 
@@ -796,6 +899,52 @@ export const registerApp = () => {
       } finally {
         this.busy.import = false;
       }
+    },
+
+    /* ============================ 拼音联想（词库懒加载） ============================ */
+
+    /**
+     * 构建 / 重建拼音索引。首次调用会下载对应档位的词库（标准档约 140 KB，
+     * 精确档再追加约 605 KB），所以**不阻塞 UI**：加载期间联想自动退回纯词面匹配，
+     * 就绪后 getter 立刻用上索引，用户无需任何额外操作。
+     */
+    async loadPinyinIndex() {
+      if (!this.pinyinOn || this.pinyinLoading) return;
+      this.pinyinLoading = true;
+      try {
+        this._pinyinIndex = await buildPinyinIndex(this.hotWords || [], {
+          precise: this.pinyinPrecise,
+        });
+        this.pinyinReady = true;
+      } catch (err) {
+        this.pinyinReady = false;
+        this._pinyinIndex = null;
+        showToast(`拼音词库加载失败：${err.message}`);
+      } finally {
+        this.pinyinLoading = false;
+      }
+    },
+
+    /** 拼音联想总开关 */
+    onPinyinToggle() {
+      setPinyinEnabled(this.pinyinOn);
+      if (this.pinyinOn) {
+        this.loadPinyinIndex();
+        return;
+      }
+      // 关闭即释放索引；已下载的词库仍在浏览器缓存里，重新开启无需再下
+      this._pinyinIndex = null;
+      this.pinyinReady = false;
+    },
+
+    /**
+     * 精确词典开关：切换后必须重建索引，否则沿用的仍是上一档词库算出的拼音。
+     * 注意 addDict 是不可撤销的全局副作用（与 navigation 项目的处理一致）：
+     * 关闭开关后已注入的词典不会退回，需刷新页面才会按当前设置重新加载。
+     */
+    onPreciseToggle() {
+      setPreciseEnabled(this.pinyinPrecise);
+      if (this.pinyinOn) this.loadPinyinIndex();
     },
 
     /* ============================ 设置面板：同步 / 重建 ============================ */

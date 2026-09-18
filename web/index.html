@@ -72,12 +72,12 @@
         <!-- 联想下拉：行内为高亮后的安全 HTML（见 util.highlightHtml） -->
         <div id="suggestions" x-show="suggestOpen" x-cloak class="absolute top-[calc(100%+6px)] left-0 right-0 z-50 max-h-[360px] overflow-y-auto bg-surface border border-line rounded-[10px] shadow-[0_10px_30px_rgba(0,0,0,0.4)] py-1.5 scrollbar-thin" role="listbox" aria-label="搜索建议">
           <template x-for="(s, i) in suggestionRows" :key="s.term">
-            <div class="flex items-center justify-between gap-3 px-3.5 py-2.5 cursor-pointer text-sm text-fg transition-colors hover:bg-brand/[0.16] [&.active]:bg-brand/[0.16]"
+            <div class="flex items-center px-3.5 py-2.5 cursor-pointer text-sm text-fg transition-colors hover:bg-brand/[0.16] [&.active]:bg-brand/[0.16]"
               :class="{ active: i === activeSuggestion }"
               x-effect="i === activeSuggestion && $el.scrollIntoView({ block: 'nearest' })"
               @mousedown.prevent="applySuggestion(s.term)" @mouseenter="activeSuggestion = i">
+              <!-- 词表顺序即热度排名，服务端不下发计数，故这里没有「N 条」那一列 -->
               <span class="overflow-hidden text-ellipsis whitespace-nowrap [&_mark]:bg-transparent [&_mark]:text-brand2 [&_mark]:font-semibold" x-html="s.html"></span>
-              <span class="shrink-0 text-xs text-muted whitespace-nowrap" x-text="s.countText"></span>
             </div>
           </template>
         </div>
@@ -119,14 +119,16 @@
     <!-- 设置面板 -->
     <div id="settingsDialog" x-show="settingsOpen" x-cloak class="fixed inset-0 z-[1000] flex items-center justify-center p-4">
       <div class="absolute inset-0 bg-black/60 backdrop-blur-[2px]" @click="closeSettings()"></div>
-      <div class="relative w-[min(420px,94vw)] p-0 border border-line rounded-[14px] text-fg bg-surface shadow-[0_24px_70px_rgba(0,0,0,0.55)] flex flex-col">
+      <div class="relative w-[min(420px,94vw)] max-h-[85vh] p-0 border border-line rounded-[14px] text-fg bg-surface shadow-[0_24px_70px_rgba(0,0,0,0.55)] flex flex-col">
         <div class="flex items-center gap-2.5 px-[18px] py-3.5 border-b border-line">
           <h2 class="m-0 flex-1 text-base font-semibold">设置</h2>
           <button id="settingsClose" @click="closeSettings()" class="flex-none inline-flex items-center justify-center size-[30px] p-0 rounded-lg border border-line bg-transparent text-fg cursor-pointer transition-colors hover:bg-white/[0.08]" type="button" aria-label="关闭" title="关闭">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
-      <div class="px-[18px] py-3.5">
+      <!-- 内容区独立滚动：flex-1 占满剩余高度，min-h-0 允许被压缩（flex 子项默认 min-height:auto
+           会拒绝收缩到内容高度以下，缺它则 overflow-y-auto 永不生效），标题栏与底部按钮固定不动 -->
+      <div class="flex-1 min-h-0 overflow-y-auto scrollbar-thin px-[18px] py-3.5">
         <div class="py-3.5 border-b border-line first:pt-0 last:border-b-0 last:pb-0">
           <div class="flex flex-col gap-1">
             <div class="text-sm font-medium">同步最新索引</div>
@@ -151,6 +153,33 @@
               </span>
             </label>
           </div>
+        </div>
+
+        <div class="py-3.5 border-b border-line first:pt-0 last:border-b-0 last:pb-0">
+          <div class="flex flex-col gap-1">
+            <div class="text-sm font-medium">拼音联想</div>
+            <div class="text-muted text-xs leading-[1.45]">输入拼音或首字母匹配热词（dianying / dy → 电影）。首次开启需下载约 140 KB 词库，之后由浏览器缓存长期持有；不开启则完全不加载。</div>
+            <!-- 开关：隐藏原生 checkbox（peer sr-only），用 track/thumb 模拟 -->
+            <label class="inline-flex items-center gap-2.5 mt-2.5 cursor-pointer select-none text-muted text-[13px]" title="开启后可用拼音检索热词">
+              <span>开启拼音联想</span>
+              <input type="checkbox" id="pinyinToggle" class="peer sr-only" x-model="pinyinOn" @change="onPinyinToggle()" />
+              <span class="relative flex-none w-10 h-[22px] rounded-full bg-line transition-colors peer-checked:grad-brand peer-checked:[&>span]:translate-x-[18px] peer-focus-visible:ring-[3px] peer-focus-visible:ring-accent/25">
+                <span class="absolute top-0.5 left-0.5 size-[18px] rounded-full bg-white transition-transform"></span>
+              </span>
+            </label>
+          </div>
+          <!-- 精确词典：仅在拼音联想开启后才有意义，故随它一起显隐 -->
+          <div class="flex flex-col gap-1 mt-3.5" x-show="pinyinOn" x-cloak>
+            <label class="inline-flex items-center gap-2.5 cursor-pointer select-none text-muted text-[13px]" title="额外加载完整的现代汉语词典，提升多音字判定准确率">
+              <span>更准确的拼音</span>
+              <input type="checkbox" id="pinyinPreciseToggle" class="peer sr-only" x-model="pinyinPrecise" @change="onPreciseToggle()" />
+              <span class="relative flex-none w-10 h-[22px] rounded-full bg-line transition-colors peer-checked:grad-brand peer-checked:[&>span]:translate-x-[18px] peer-focus-visible:ring-[3px] peer-focus-visible:ring-accent/25">
+                <span class="absolute top-0.5 left-0.5 size-[18px] rounded-full bg-white transition-transform"></span>
+              </span>
+            </label>
+            <div class="text-muted text-xs leading-[1.45]">再下载约 605 KB 完整词典，提升多音字准确率；关闭后需刷新页面才会退回基础词库</div>
+          </div>
+          <div class="text-muted text-xs mt-2" x-show="pinyinLoading" x-cloak>词库加载中…</div>
         </div>
 
         <div class="py-3.5 border-b border-line first:pt-0 last:border-b-0 last:pb-0">
@@ -198,16 +227,21 @@
         </label>
       </div>
       <div class="flex-1 min-h-0 w-full flex gap-5 items-stretch overflow-hidden max-[480px]:flex-col">
-        <div id="hotWords" class="flex-1 min-h-0 w-auto flex flex-wrap gap-2.5 py-4 overflow-y-auto scrollbar-thin">
+        <div id="hotWords" x-ref="hotWords" class="flex-1 min-h-0 w-auto flex flex-wrap gap-2.5 py-4 overflow-y-auto scrollbar-thin"
+          @scroll.passive="onHotWordsScroll()">
           <p class="text-muted text-center py-10 max-[480px]:py-6" x-show="hotList.length === 0">暂无热词数据</p>
-          <template x-for="it in hotList" :key="it.term">
+          <!-- 懒加载：首屏只渲染前 HOT_PAGE_SIZE 条，滚到底再追加（见 onHotWordsScroll） -->
+          <template x-for="term in hotList" :key="term">
             <button type="button" :class="{ editing: editMode }"
-              :title="editMode ? `点击右侧 × 将「${it.term}」加入黑名单` : `搜索「${it.term}」`"
-              @click="onHotWordClick(it.term)"
+              :title="editMode ? `点击右侧 × 将「${term}」加入黑名单` : `搜索「${term}」`"
+              @click="onHotWordClick(term)"
               class="inline-flex items-center rounded-full border border-line bg-card text-fg text-sm cursor-pointer px-4 py-2 transition-[border-color,background-color,transform] duration-150 hover:border-accent hover:bg-accent/10 hover:-translate-y-px max-[480px]:px-3 max-[480px]:py-1.5 max-[480px]:text-[13px]">
-              <span x-text="it.term"></span>
+              <span x-text="term"></span>
+              <!-- SVG 内联而非 x-html：x-for 直接克隆节点，省掉每条一次 innerHTML 解析 -->
               <span x-show="editMode" class="inline-flex items-center justify-center ml-1.5 size-4 rounded-full text-muted cursor-pointer transition-colors hover:text-red-400 hover:bg-red-400/15"
-                :aria-label="`将「${it.term}」加入黑名单`" x-html="ICONS.closeSm" @click.stop.prevent="addToBlacklist(it.term)"></span>
+                :aria-label="`将「${term}」加入黑名单`" @click.stop.prevent="addToBlacklist(term)">
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </span>
             </button>
           </template>
         </div>

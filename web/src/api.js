@@ -42,8 +42,22 @@ export const fetchMagnetFiles = (id) =>
 /** 已索引总数 */
 export const fetchCount = () => fetch('api/count').then(toJson).then((d) => d.count);
 
-/** 热词榜（同时用于默认视图与输入框联想） */
-export const fetchHot = (limit) => get('api/hot', { limit }).then((d) => d.items || []);
+/**
+ * 整份热词表：换行分隔的纯文本，顺序即热度排名。
+ *
+ * 联想完全在前端做（零延迟，且能做中文分词 / 多词权重），所以一次性把词表拉全，
+ * 之后不再请求。只传 term 不传计数——顺序本身就是排名。
+ * @returns {Promise<string[]>}
+ */
+export const fetchHot = (limit) => {
+  const qs = new URLSearchParams(limit ? { limit } : {}).toString();
+  return fetch(`api/hot${qs ? `?${qs}` : ''}`)
+    .then((resp) => {
+      if (!resp.ok) throw new Error(String(resp.status));
+      return resp.text();
+    })
+    .then((text) => (text ? text.split('\n') : []));
+};
 
 /* ---------- 热词黑名单 ---------- */
 

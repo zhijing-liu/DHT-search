@@ -15,6 +15,7 @@
 
 import path from 'node:path';
 import express from 'express';
+import compression from 'compression';
 import cron from 'node-cron';
 import { createMagnetDb } from './src/db.js';
 import { normalizeSearchQuery, normalizeLatestQuery } from './src/search/query.js';
@@ -168,6 +169,17 @@ if (TRUST_PROXY) app.set('trust proxy', TRUST_PROXY);
 app.use(createAccessControl({
   mode: ACCESS_CONTROL_MODE ?? 'off',
   allowed: ALLOWED_CLIENTS ?? [],
+}));
+
+// 响应压缩。热词表是一次性下发的整份词表（30000 条纯文本 234KB），压缩后 131KB；
+// 搜索结果等大 JSON 同样受益。阈值 1KB 以下不压（省 CPU 且收益为负）。
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => {
+    // SSE 是持续推送的流，一旦被压缩中间件缓冲住，进度条就再也推不动了
+    if (req.headers.accept === 'text/event-stream') return false;
+    return compression.filter(req, res);
+  },
 }));
 
 /** 请求日志中间件：只记录页面入口与 /api 接口，忽略 /public 静态资源噪音 */
@@ -483,10 +495,20 @@ app.get('/api/stats/stream', (req, res) => {
   res.on('error', cleanup);
 });
 
-/** 热词榜（暂未接入页面，用于验证落库数据） */
+/**
+ * 热词表：一次性下发整份词表，联想完全在前端做。
+ *
+ * 响应是**换行分隔的纯文本**而不是 JSON：
+ *   - 词表已是「按热度降序」的，顺序即排名，故不必传 doc_count / occurrences；
+ *   - 省掉 JSON 的引号与逗号，且重复结构让 gzip 压缩率更高（30000 条：234KB → 131KB）。
+ * 配合 compression 中间件，一次性加载后前端零延迟联想，也不再逐次请求。
+ */
 app.get('/api/hot', apiHandler((req, res) => {
+  // 不传 limit 即返回**全部**满足阈值的词（收录范围由 HOT_MIN_DOC_COUNT 决定，
+  // 而不是「取前 N 条」——后者会让边界词随索引增长被静默挤掉）
   const limit = Number(req.query.limit);
-  res.json({ items: api.topKeywords(Number.isFinite(limit) ? limit : 50) });
+  const words = api.topKeywords(Number.isFinite(limit) ? limit : Infinity);
+  res.type('text/plain; charset=utf-8').send(words.join('\n'));
 }));
 
 /** 热词过滤词列表 */

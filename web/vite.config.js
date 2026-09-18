@@ -30,6 +30,10 @@ export default defineConfig({
     outDir: '../public',
     // outDir 位于项目根之外，Vite 默认不会清空，必须显式声明
     emptyOutDir: true,
+    // 拼音词库的两个 chunk（pinyin-pro 约 290 KB / modern 词典约 1.7 MB）天生超过默认
+    // 500 KB 阈值，但它们是设置面板开关后才动态 import 的独立 chunk，主 bundle 仍只有
+    // 约 87 KB。抬高阈值以免每次构建都报「chunk 过大」的误导性警告。
+    chunkSizeWarningLimit: 2000,
   },
   server: {
     proxy: {

@@ -71,6 +71,7 @@ export const {
   ENABLE_MMAP,
   FILES_COMPRESS,
   FILES_REWRITE_ON_REBUILD: FILES_REWRITE_ON_REBUILD_RAW,
+  HOT_MIN_DOC_COUNT: HOT_MIN_DOC_COUNT_RAW,
 } = loaded;
 
 /** mmap 总开关：默认开启（仅显式 false 才关闭），避免缺失配置时静默关掉加速 */
@@ -89,6 +90,18 @@ export const FILES_COMPRESS_ENABLED = FILES_COMPRESS !== false;
  * 这是拆分冷库最大的重建收益）。源库会 UPDATE 既有行时改 true，代价是每次重建全量重写。
  */
 export const FILES_REWRITE_ON_REBUILD = FILES_REWRITE_ON_REBUILD_RAW === true;
+
+/**
+ * 下发给前端的词表收录阈值：只下发 doc_count ≥ 本值的词。
+ *
+ * keyword_stats 是完整的原始统计（129 万词），但 77% 的词只出现过 1 次——对热词榜
+ * 与联想都无意义，却会把下发的词表撑到几十 MB。按阈值筛完约 2.6 万词（≥50），
+ * 前端拿去本地匹配即可，服务端不再参与联想。
+ */
+export const HOT_MIN_DOC_COUNT = (() => {
+  const v = Number(HOT_MIN_DOC_COUNT_RAW);
+  return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 50;
+})();
 
 /**
  * 索引库读连接 mmap 窗口（MB）：统一控制主进程只读连接与搜索子进程。

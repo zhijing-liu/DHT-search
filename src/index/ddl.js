@@ -11,7 +11,7 @@
  * contentless_delete 在引擎支持时开启。
  */
 import { sql } from 'drizzle-orm';
-import { allRows, execRaw } from '../db-driver.js';
+import { allRows, execRaw, prepareStmt, transaction } from '../db-driver.js';
 import { log } from '../logger.js';
 import {
   FTS_TABLE,
@@ -20,6 +20,10 @@ import {
   DOCS_INDEX_DEFS,
   DOCS_INFOHASH_INDEX,
   KEYWORD_TABLE,
+  KEYWORD_RANK_INDEX,
+  HOT_TABLE,
+  HOT_COLUMN_DEFS,
+  HOT_RANK_INDEX,
   KEYWORD_FILTER_TABLE,
   TOKENIZER,
 } from '../store.js';
@@ -51,6 +55,13 @@ const KEYWORD_STATS_DDL = `(
     doc_count INTEGER NOT NULL DEFAULT 0,
     occurrences INTEGER NOT NULL DEFAULT 0
   )`;
+
+/** 由列定义拼建表语句 */
+const ddlOf = (table, defs) =>
+  `CREATE TABLE IF NOT EXISTS ${table} (\n    ${defs.map(([name, decl]) => `${name} ${decl}`).join(',\n    ')}\n  )`;
+
+/** 热词候选表 keyword_hot 的建表语句 */
+const HOT_DDL = ddlOf(HOT_TABLE, HOT_COLUMN_DEFS);
 
 /** 给已存在的表补齐缺失列（老库平滑升级；新增列必须可空或带默认值） */
 const ensureColumns = (db, table, columns) => {
@@ -107,6 +118,77 @@ export const ensureDocsIndexes = (db) => {
 };
 
 /**
+ * 热词榜的驱动索引（幂等，缺失才建）。
+ *
+ * 没有它时 /api/hot 的计划是：全表扫 keyword_stats（129 万行）+ 每行一次黑名单点查
+ * + 129 万行的 TEMP B-TREE 排序，实测 445ms——而且是同步调用，直接阻塞主进程。
+ *
+ * 有了 (doc_count DESC, occurrences DESC)，planner 沿索引顺序扫描、边扫边用黑名单
+ * 过滤，凑够 LIMIT 就停。黑名单占热词比例约 0.19%，取 1000 条只需扫约 1002 行，
+ * 实测 445ms → 3ms；建索引本身约 530ms（一次性，在维护线程里付）。
+ *
+ * **必须在灌数据之后建**：populate 的热词写入是 upsert（doc_count 累加），
+ * 带索引时每次更新都要删旧条目再插新条目，会明显拖慢写入。
+ *
+ * @param {object} db drizzle 可写连接
+ */
+export const ensureKeywordIndexes = (db) => {
+  db.run(
+    sql`CREATE INDEX IF NOT EXISTS ${sql.raw(KEYWORD_RANK_INDEX)}
+        ON ${sql.raw(KEYWORD_TABLE)}(doc_count DESC, occurrences DESC)`
+  );
+};
+
+/** 全部二级索引的幂等确保入口：调用方只需关心这一个 */
+export const ensureIndexes = (db) => {
+  ensureDocsIndexes(db);
+  ensureKeywordIndexes(db);
+  db.run(
+    sql`CREATE INDEX IF NOT EXISTS ${sql.raw(HOT_RANK_INDEX)}
+        ON ${sql.raw(HOT_TABLE)}(doc_count DESC)`
+  );
+};
+
+/**
+ * 幂等确保 keyword_hot 表存在（内容由 rebuildHotTable 填充）。
+ * 全新库 / 尚未生成过时这张表是空的，查询返回空而不是 no such table。
+ */
+export const ensureHotTable = (db) => {
+  db.run(sql.raw(HOT_DDL));
+};
+
+/**
+ * 重建热词候选表：从完整统计 keyword_stats 里筛出 doc_count ≥ 阈值的词。
+ *
+ * 筛选走 KEYWORD_RANK_INDEX 的范围扫描（只取前 N 行而不是全表 129 万行），
+ * 因此一次重建约 130ms——增量同步后也能随手重建，无须攒到全量重建。
+ *
+ * DELETE + INSERT 在同一事务内：并发查询要么看到旧榜单、要么看到新榜单，
+ * 不会看到「清空后未填充」的空窗。
+ *
+ * @param {object} db    可写 drizzle 连接
+ * @param {number} minDocCount 收录阈值（doc_count ≥ 该值）
+ * @returns {number} 收录的词的条数
+ */
+export const rebuildHotTable = (db, minDocCount) => {
+  const raw = db.$client ?? db.session?.client;
+  const threshold = Number.isFinite(Number(minDocCount)) && Number(minDocCount) >= 1
+    ? Math.floor(Number(minDocCount))
+    : 1;
+  const rows = allRows(
+    raw,
+    `SELECT term, doc_count FROM ${KEYWORD_TABLE} WHERE doc_count >= ? ORDER BY doc_count DESC`,
+    [threshold]
+  );
+  transaction(raw, () => {
+    execRaw(raw, `DELETE FROM ${HOT_TABLE}`);
+    const ins = prepareStmt(raw, `INSERT INTO ${HOT_TABLE} (term, doc_count) VALUES (?, ?)`);
+    for (const r of rows) ins.run([r.term, r.doc_count]);
+  })();
+  return rows.length;
+};
+
+/**
  * 幂等建表：全新索引库 / sync:false 打开时使用，并给老库补齐缺失列
  * （格式迁移期间线上仍用旧库回答查询，缺列会直接报 "no such column"）。
  *
@@ -121,6 +203,8 @@ export const ensureSchema = (db, caps = DEFAULT_FTS_CAPS, { indexes = true } = {
   db.run(sql`CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT)`);
   // 热词统计表（全量重建时会 DROP 重建，保证干净）
   db.run(sql`CREATE TABLE IF NOT EXISTS ${sql.raw(KEYWORD_TABLE)} ${sql.raw(KEYWORD_STATS_DDL)}`);
+  // 热词候选表：查询路径实际读的那张小表，内容由 rebuildHotTable 填充
+  ensureHotTable(db);
   // 热词过滤表（用户配置；reindex 不清除）
   db.run(sql`CREATE TABLE IF NOT EXISTS ${sql.raw(KEYWORD_FILTER_TABLE)} (
     term TEXT PRIMARY KEY,
@@ -133,8 +217,8 @@ export const ensureSchema = (db, caps = DEFAULT_FTS_CAPS, { indexes = true } = {
   ensureColumns(db, DOCS_TABLE, DOCS_ADDITIVE_COLUMNS);
   db.run(sql.raw(ftsDdl(caps, { ifNotExists: true })));
   // 二级索引同样幂等确保：已有索引时只是目录探查，却能让「全新库 / 索引被删掉的旧库」
-  // 一打开就具备列排序快路径，不必等下一次重建
-  if (indexes) ensureDocsIndexes(db);
+  // 一打开就具备列排序快路径与热词榜快路径，不必等下一次重建
+  if (indexes) ensureIndexes(db);
 };
 
 /**

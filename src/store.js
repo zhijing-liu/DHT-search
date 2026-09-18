@@ -105,8 +105,14 @@ export const FILES_TABLE = 'magnets_files';
 /** 冷库中的预览小列（列表按需按 id 批量回查，每次仅一页的条数） */
 export const PREVIEW_TABLE = 'magnets_preview';
 
-/** 热词统计表名（构建索引时随 populate 统计写入） */
+/** 热词统计表名（构建索引时随 populate 统计写入；保持全量，是唯一的统计真相源） */
 export const KEYWORD_TABLE = 'keyword_stats';
+/**
+ * 热词候选表名：按 doc_count 阈值从 keyword_stats 筛出的小表（约 2.5 万行）。
+ * 热词榜与联想都只查它——查询路径从此不碰 129 万行的大表。
+ * 每次维护收尾重建（实测约 130ms），keyword_stats 完整所以随时可重建。
+ */
+export const HOT_TABLE = 'keyword_hot';
 /** 热词过滤表名（用户配置的噪声词；reindex 不清除） */
 export const KEYWORD_FILTER_TABLE = 'keyword_filter';
 
@@ -206,6 +212,44 @@ export const DOCS_INDEX_DEFS = Object.freeze([
 
 /** infohash 表达式索引名（lower(infohash)：hash 检索点查 + 前缀 LIKE） */
 export const DOCS_INFOHASH_INDEX = 'idx_magnets_docs_infohash_lower';
+
+/**
+ * keyword_stats 的热度索引：(doc_count DESC, occurrences DESC)。
+ * 现在只服务「生成 keyword_hot」这一步——沿它做范围扫描，只取前 2.5 万行，
+ * 因此每次重建 keyword_hot 只要约 130ms。查询路径不再直接读 keyword_stats。
+ */
+export const KEYWORD_RANK_INDEX = 'idx_keyword_stats_rank';
+
+/** keyword_hot 的热度索引：热词榜（/api/hot）沿它取 top N */
+export const HOT_RANK_INDEX = 'idx_keyword_hot_rank';
+
+/** keyword_hot 列定义 */
+export const HOT_COLUMN_DEFS = Object.freeze([
+  ['term', 'TEXT PRIMARY KEY'],
+  ['doc_count', 'INTEGER NOT NULL DEFAULT 0'],
+]);
+
+/**
+ * 前缀查询的上界后缀：U+10FFFF 是 Unicode 最大码位，任何字符都小于它，
+ * 故 `term >= q AND term < q || SUFFIX` 精确等价于「以 q 开头」。
+ */
+export const TERM_PREFIX_MAX = '\u{10FFFF}';
+
+/** 联想候选的默认条数与上限 */
+export const SUGGEST_DEFAULT_LIMIT = 10;
+export const SUGGEST_MAX_LIMIT = 50;
+
+/**
+ * 下发到前端的整份热词表的**防御性硬上限**。
+ *
+ * 实际收录范围由 settings 的 HOT_MIN_DOC_COUNT 决定（默认 ≥50，实测约 2.6 万词），
+ * 上限只用于兜底「阈值被配得过低」的情况，避免把整张 129 万行的表吐给前端。
+ *
+ * 联想完全在前端做（零延迟 + 可做中文分词 / 多词权重），所以词表要一次性下发；
+ * 顺序即热度排名，故只传 term 不传计数。
+ * 实测：2.6 万条 → 纯文本 208KB，gzip 后约 110KB（一次性，之后不再请求）。
+ */
+export const HOT_WORDS_MAX = 100000;
 
 /**
  * 索引状态表的键。按写入时机分三类，混用会破坏失败恢复：

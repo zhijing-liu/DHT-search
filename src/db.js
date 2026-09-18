@@ -58,7 +58,8 @@ import { spawnChild } from './child-process.js';
 import {
   ensureSchema,
   resetIndexTables,
-  ensureDocsIndexes,
+  ensureIndexes,
+  rebuildHotTable,
   hasTable,
   DEFAULT_FTS_CAPS,
   INDEX_FORMAT,
@@ -92,12 +93,18 @@ import {
   RECORD_COLUMNS,
   KEYWORD_TABLE,
   KEYWORD_FILTER_TABLE,
+  HOT_WORDS_MAX,
   TOKENIZER,
   STATE_TABLE,
   STATE_KEYS,
   BUILD_MODES,
 } from './store.js';
-import { SOURCE_READ_MMAP_MB, MMAP_ENABLED, INDEX_MMAP_SIZE_MB } from './settings.js';
+import {
+  SOURCE_READ_MMAP_MB,
+  MMAP_ENABLED,
+  INDEX_MMAP_SIZE_MB,
+  HOT_MIN_DOC_COUNT,
+} from './settings.js';
 import { buildSearchApi } from './search/api.js';
 
 /** 热词统计来源列：只统计 name，避开 files JSON 键名（path/size）噪声 */
@@ -106,8 +113,8 @@ const KEYWORD_SOURCE = 'name';
 const MIN_KEYWORD_LEN = 2;
 /** 热词过滤：纯数字 token（年份/大小等噪声）丢弃 */
 const NUMERIC_ONLY = /^\d+$/;
-/** 热词榜单次返回上限（topKeywords 的 limit 钳制上界；缓存也一次查到该条数） */
-const HOT_LIMIT_MAX = 1000;
+/** 热词榜单次返回上限与词表上限（缓存一次查到该条数，任意 limit 在其上切片） */
+const HOT_LIMIT_MAX = HOT_WORDS_MAX;
 
 /* ------------------------------------------------------------------ */
 /* 工具函数                                                            */
@@ -547,8 +554,10 @@ const indexPass = (db, src, { reset, filesRaw = null }, onFlush, timer = NOOP_TI
       //  - (totalSize DESC, id DESC) / (fetchedAt DESC, id DESC)：列排序快路径的驱动索引，
       //    检索侧 INDEXED BY 强制沿它扫描（覆盖索引，不回表）
       //  - lower(infohash)：hash 检索（?by=hash）走点查；无此索引会全表扫
+      //  - 热词榜 idx_keyword_stats_rank：让 /api/hot 沿 doc_count 序扫描、凑够 LIMIT 即停
+      //    （无它时要对 129 万行做 TEMP B-TREE 排序，445ms 且阻塞主进程）
       report('index');
-      timer.measure('index', () => ensureDocsIndexes(db));
+      timer.measure('index', () => ensureIndexes(db));
       // 结构水位：只有整库重建成功走到这里才写，中途失败留在旧值，下次启动仍判定需重建
       setMeta(db, STATE_KEYS.tokenizer, TOKENIZER);
       setMeta(db, STATE_KEYS.filesFormat, INDEX_FORMAT);
@@ -557,7 +566,7 @@ const indexPass = (db, src, { reset, filesRaw = null }, onFlush, timer = NOOP_TI
     } else {
       // 自修复：已存在但未触发整库重建的库（部署前建、索引被外部删掉）可能缺二级索引；
       // IF NOT EXISTS 保证只对缺失索引建一次（建全量索引是一次性开销），之后仅为目录探查
-      ensureDocsIndexes(db);
+      ensureIndexes(db);
       if (max > from) {
         // 数据水位取扫描前的 max（本轮补录到的行）。只在真有新增时推进：写小会导致下次重扫
         setMeta(db, STATE_KEYS.dataWatermark, String(max));
@@ -666,6 +675,15 @@ export const createMagnetDb = (options = {}) => {
       (opts.indexDbPath ? `${indexPath}.files.db` : CONFIG.filesDbPath ?? DEFAULT_FILES_DB_PATH)
   );
 
+  // 词表收录阈值：下发给前端的词必须满足 doc_count ≥ 该值。
+  // 允许调用方覆盖 —— 测试夹具的词频只有个位数，用默认阈值会被整份筛空。
+  const hotMinDocCount = clampInt(
+    opts.hotMinDocCount ?? HOT_MIN_DOC_COUNT,
+    HOT_MIN_DOC_COUNT,
+    1,
+    Number.MAX_SAFE_INTEGER
+  );
+
   fs.mkdirSync(path.dirname(path.resolve(indexPath)), { recursive: true });
   fs.mkdirSync(path.dirname(path.resolve(filesPath)), { recursive: true });
 
@@ -723,7 +741,7 @@ export const createMagnetDb = (options = {}) => {
     // 建表语句收敛在 index/ddl.js（幂等）：全新 / 子进程内打开的库也能被安全读写。
     // 索引先不建：若本次就要全量重建，建索引是白等（重建会重建）且会同步阻塞启动。
     ensureSchema(db, caps, { indexes: false });
-    if (!needsFullRebuild(db)) ensureDocsIndexes(db);
+    if (!needsFullRebuild(db)) ensureIndexes(db);
 
     // 上次维护是否被中断（build_mode 非 idle 即上次没走完）
     const interrupted = getMeta(db, STATE_KEYS.buildMode);
@@ -929,24 +947,36 @@ export const createMagnetDb = (options = {}) => {
   };
 
   /**
-   * 热词榜：按文档频率降序返回 top N 关键词。
-   * @param {number} [limit=50] 返回条数，钳制 1..1000
-   * @returns {Array<{term: string, doc_count: number, occurrences: number}>}
+   * 热词表：返回**全部**文档频率 ≥ HOT_MIN_DOC_COUNT 的词，按热度降序（只返回 term）。
+   *
+   * 收录范围由阈值决定，而不是「取前 N 条」——后者会让边界词随索引增长被静默挤掉。
+   * HOT_WORDS_MAX 只是防御性硬上限（阈值被配得过低时不至于把整张表吐出去）。
+   *
+   * 不返回 doc_count / occurrences：顺序本身就是热度排名，前端在已排好序的数组上
+   * 顺序扫描取前 N 个匹配项，得到的自然就是「最热的 N 个」。响应体因此省掉两个
+   * 整数字段，前端匹配逻辑也不必依赖服务端下发的计数。
+   *
+   * 缓存整份词表（查一次约 150ms），任意 limit 都在其上切片；失效点见 invalidateHot()。
+   *
+   * @param {number} [limit=Infinity] 额外截断条数（不传即全量）
+   * @returns {string[]} 按热度降序的词
    */
-  const topKeywords = (limit = 50) => {
+  const topKeywords = (limit = Infinity) => {
     requireIndexReady();
-    const n = clampInt(limit, 50, 1, HOT_LIMIT_MAX);
+    const n = clampInt(limit, HOT_LIMIT_MAX, 1, HOT_LIMIT_MAX);
     if (hotCache === null) {
-      // 一次查到上限条数并缓存：任意 limit 都在其上切片，命中时零 DB 成本
-      hotCache = dbRO.all(sql`
-        SELECT term, doc_count, occurrences
+      hotCache = dbRO
+        .all(sql`
+        SELECT k.term AS term
         FROM ${sql.raw(KEYWORD_TABLE)} k
-        WHERE NOT EXISTS (
-          SELECT 1 FROM ${sql.raw(KEYWORD_FILTER_TABLE)} f WHERE f.term = k.term
-        )
-        ORDER BY doc_count DESC, occurrences DESC
+        WHERE k.doc_count >= ${hotMinDocCount}
+          AND NOT EXISTS (
+            SELECT 1 FROM ${sql.raw(KEYWORD_FILTER_TABLE)} f WHERE f.term = k.term
+          )
+        ORDER BY k.doc_count DESC, k.occurrences DESC
         LIMIT ${HOT_LIMIT_MAX}
-      `);
+      `)
+        .map((r) => r.term);
     }
     return hotCache.slice(0, n);
   };

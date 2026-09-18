@@ -62,7 +62,36 @@ export const isInfohash = (q) => {
   return /^[a-f0-9]{40}$/.test(s);
 };
 
-/* ---------- 输入联想（编辑距离 + 分组排序） ---------- */
+/* ---------- 输入联想（分词 + 权重累加） ---------- */
+
+/**
+ * 浏览器原生分词器。零依赖、零体积，且中文按词切分（不是逐字）：
+ *   "高清影视之家发布" → ["高清","影视","之家","发布"]
+ *   "movie 1080p"     → ["movie","1080p"]（ASCII 组合词不会被拆散）
+ *   "同人cg集"        → ["同人","cg","集"]
+ */
+const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter
+  ? new Intl.Segmenter('zh-CN', { granularity: 'word' })
+  : null;
+
+/** 无 Intl.Segmenter 时的降级规则：ASCII 连成串，CJK 逐字 */
+const FALLBACK_TOKEN = /[A-Za-z0-9]+|[\p{Script=Han}]/gu;
+
+/**
+ * 把输入切成匹配用的 token 数组（已小写折叠，与词表存储形态一致）。
+ * @param {string} input
+ * @returns {string[]}
+ */
+export const tokenize = (input) => {
+  const s = String(input ?? '').trim().toLowerCase();
+  if (!s) return [];
+  if (!segmenter) return s.match(FALLBACK_TOKEN) ?? [];
+  const out = [];
+  for (const seg of segmenter.segment(s)) {
+    if (seg.isWordLike) out.push(seg.segment);
+  }
+  return out.length ? out : (s.match(FALLBACK_TOKEN) ?? []);
+};
 
 /** Levenshtein 编辑距离 */
 const editDistance = (a, b) => {
@@ -88,28 +117,133 @@ const isFuzzyMatch = (term, query) => {
   return d <= 1 || (query.length >= 4 && d <= 2);
 };
 
+/** 匹配类型权重：完全相等 > 前缀 > 包含 > 模糊 */
+const W_EXACT = 100;
+const W_PREFIX = 60;
+const W_INCLUDE = 30;
+const W_FUZZY = 8;
+
 /**
- * 从热词中相似匹配：完全相等 > 前缀 > 包含 > 模糊；组间按优先级、组内按热度。
- * 注意分组各自排序后再拼接，统一 sort 会打散分组优先级。
+ * 拼音匹配权重。
+ *
+ * 层级刻意嵌进原文匹配的档位之间，而不是整体压在最下面：
+ *   原文精确 100 > 拼音精确 90 > 原文前缀 60 = 拼音首字母 60
+ *   > 拼音全拼 45 > 原文包含 30 > 拼音包含 22 > 原文模糊 8
+ *
+ * 关键在首字母取 60（与「原文前缀」同级）。实测取 14 / 38 时，输入 dy 会有几十条
+ * 「词面以 dy 开头」的英文词（dygang / dynasty / dytt89 …）加上几百条「词面含 dy」的
+ * 词（阳光电影dygod）把「电影」「第一会所」这类首字母命中挤出前 12 名（中文占比 0/12）。
+ * 取 60 让两者同分，改由词表热度序决定先后，中文词因此能进入可见范围
+ * （实测 dy 的 top12 中文占比 0/12 → 6/12）；再取更高就会喧宾夺主，
+ * 让拼音命中压过词面直接命中。
+ *
+ * 首字母只做前缀、不做包含：包含太宽松（任何同时含 d 和 y 的词都会被 dy 命中）。
  */
-export const matchSuggestions = (items, q, max = 8) => {
-  const query = String(q).trim().toLowerCase();
-  if (!query) return [];
-  const groups = { exact: [], prefix: [], include: [], fuzzy: [] };
-  for (const it of items) {
-    const term = String(it.term).toLowerCase();
-    if (term === query) groups.exact.push(it);
-    else if (term.startsWith(query)) groups.prefix.push(it);
-    else if (term.includes(query)) groups.include.push(it);
-    else if (isFuzzyMatch(term, query)) groups.fuzzy.push(it);
+const W_PY_EXACT = 90;
+const W_PY_PREFIX = 45;
+const W_PY_INCLUDE = 22;
+const W_PY_INITIAL = 60;
+
+/** 拼音匹配的最短 token：单字符命中面太广（d 会命中所有 d 开头的词），无实用价值 */
+const PY_MIN_TOKEN = 2;
+
+/**
+ * 模糊（编辑距离）只对最热的这些词做。
+ * 编辑距离是 O(n·m) 的 DP，对整份 3 万词表逐条算要几十毫秒、且每次按键都要付一遍；
+ * 而冷门词的拼写容错几乎没有价值，故只在头部区间启用。
+ */
+const FUZZY_SCAN_MAX = 3000;
+
+/** 单个 token 对一个词的匹配权重（0 = 不匹配） */
+const tokenScore = (term, token, allowFuzzy) => {
+  if (term === token) return W_EXACT;
+  if (term.startsWith(token)) return W_PREFIX;
+  if (term.includes(token)) return W_INCLUDE;
+  return allowFuzzy && isFuzzyMatch(term, token) ? W_FUZZY : 0;
+};
+
+/**
+ * 单个 token 对一条拼音记录的匹配权重（0 = 不匹配）。
+ * @param {{ full: string, initials: string }} rec 拼音索引条目
+ * @param {string} token 已小写折叠的输入 token
+ */
+const pyTokenScore = (rec, token) => {
+  if (rec.full === token) return W_PY_EXACT;
+  if (rec.full.startsWith(token)) return W_PY_PREFIX;
+  // 「女」的 ü 在索引里写作 v，但用户也可能按 ü 本音输 u（nushen）：
+  // 索引侧含 v 时补一条 v→u 的容错，避免两套写法互相搜不到
+  if (rec.full.includes('v') && rec.full.replace(/v/g, 'u').startsWith(token)) return W_PY_PREFIX;
+  if (rec.initials.startsWith(token)) return W_PY_INITIAL;
+  if (rec.full.includes(token)) return W_PY_INCLUDE;
+  return 0;
+};
+
+/**
+ * 从词表里匹配联想候选。
+ *
+ * 两段式：先把输入切成多个 token，再让**每个 token 独立匹配整份词表**，同一条词被
+ * 多个 token 命中时把权重**相加**。于是「同时命中更多关键词」的词自然排到前面，
+ * 而不再依赖固定分组的优先级硬拼。
+ *
+ * 词表本身已按热度降序，故同分时用原始下标兜底 —— 权重相同则更热的在前。
+ * 正因顺序即排名，服务端不必下发 doc_count，省掉两个整数字段。
+ *
+ * 传入 pyIndex 时额外跑一轮拼音匹配：索引只含含汉字的词（约为词表的 1/20，
+ * 见 pinyin.js），两轮命中同一条词时权重继续累加 —— 词面与读音都命中是更强的信号。
+ *
+ * @param {string[]} words 按热度降序的词表
+ * @param {string} query 用户输入
+ * @param {number} [max=12] 返回条数
+ * @param {Array<{term: string, full: string, initials: string, i: number}>|null} [pyIndex]
+ *        拼音索引；null / 空数组表示本次不做拼音匹配（功能未开启或索引未就绪）
+ * @returns {string[]} 命中的词（按「权重降序 → 热度降序」）
+ */
+export const matchSuggestions = (words, query, max = 12, pyIndex = null) => {
+  const tokens = tokenize(query);
+  if (tokens.length === 0) return [];
+
+  // term -> { term, score, i }：两轮命中同一条词时累加权重，顺带避免结果里出现重复词
+  const acc = new Map();
+  const add = (term, score, i) => {
+    const key = String(term);
+    const prev = acc.get(key);
+    if (prev) prev.score += score;
+    else acc.set(key, { term, score, i });
+  };
+
+  /* 轮 1：词面匹配（遍历整份词表） */
+  for (let i = 0; i < words.length; i += 1) {
+    const term = String(words[i]).toLowerCase();
+    const allowFuzzy = i < FUZZY_SCAN_MAX;
+    let score = 0;
+    for (const token of tokens) {
+      const s = tokenScore(term, token, allowFuzzy);
+      // 乘 token 长度：越长的 token 越有区分度（单字「中」不该与 movie 同权）
+      if (s > 0) score += s * token.length;
+    }
+    if (score > 0) add(words[i], score, i);
   }
-  const byHot = (a, b) => b.doc_count - a.doc_count || b.occurrences - a.occurrences;
-  return [
-    ...groups.exact.sort(byHot),
-    ...groups.prefix.sort(byHot),
-    ...groups.include.sort(byHot),
-    ...groups.fuzzy.sort(byHot),
-  ].slice(0, max);
+
+  /* 轮 2：拼音匹配（只遍历索引，规模远小于词表） */
+  if (pyIndex && pyIndex.length) {
+    const pyTokens = tokens.filter((t) => t.length >= PY_MIN_TOKEN);
+    if (pyTokens.length) {
+      for (const rec of pyIndex) {
+        let score = 0;
+        for (const token of pyTokens) {
+          const s = pyTokenScore(rec, token);
+          if (s > 0) score += s * token.length;
+        }
+        if (score > 0) add(rec.term, score, rec.i);
+      }
+    }
+  }
+
+  // i 即热度序：同分时保留词表原本的顺序
+  return [...acc.values()]
+    .sort((a, b) => b.score - a.score || a.i - b.i)
+    .slice(0, max)
+    .map((x) => x.term);
 };
 
 /* ---------- 高亮（输出可直接 x-html 的安全字符串） ---------- */
