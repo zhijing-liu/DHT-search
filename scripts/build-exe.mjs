@@ -44,6 +44,9 @@ const args = [
   'build',
   path.join(ROOT, 'exe-entry.js'),
   '--compile',
+  // 压缩应用侧代码。收益有限（实测 83.52 → 83.08 MB）是因为产物约 98% 是 Bun 运行时本体
+  // （空 hello-world 编译即 82.1 MB），但编译耗时无增加，故默认开启。
+  '--minify',
   '--outfile', path.join(DIST, OUTFILE),
   // 注：better-sqlite3 / drizzle-orm/better-sqlite3（Node 专用依赖）不需要也不应
   // 标记 external —— db-driver.js 已把这两个包名改为运行时拼接（编译态打包器无法

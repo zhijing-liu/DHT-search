@@ -4,8 +4,9 @@
  * 只做压缩，不做构建（构建请先执行 `npm run build:exe`）。
  *   用法：npm run pack:zip ；产物：release/DHT-Search-v<版本号>.zip
  *
- * zip 内含顶层目录 DHT-Search/，空目录也会写入条目；exe / db 等高熵二进制走 store
- * （仅归档不压缩）。
+ * zip 内含顶层目录 DHT-Search/，空目录也会写入条目，全部内容按 deflate 压缩：Bun 编译产物
+ * 虽是二进制，实测仍可压到 46.7%（zip 83.6 MB → 39.0 MB，约 −53%），故不跳过压缩。
+ * data/ 下运行时产生的数据库 / WAL / SHM 一律不入包。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -41,8 +42,12 @@ const done = new Promise((resolve, reject) => {
 });
 archive.pipe(output);
 
-// exe / db 已是高熵二进制，压缩收益趋近于零，走 store 模式显著提速
-const storeRe = /\.(exe|db|zip|7z|gz)$/i;
+// data/ 下是运行时产生的 SQLite 库（主文件 + WAL/SHM/journal）：属本机私有状态，
+// 且 -wal/-shm 是进程态文件，本就不该分发。本地反复构建时它们会残留在 dist/data/，
+// 统一在此排除，保证发布包内只留一个空的 data/ 目录（运行时自建）。
+const RUNTIME_DATA_RE = /\.(?:db|sqlite3?)(?:-(?:wal|shm|journal))?$/i;
+const isRuntimeData = (relPath) => relPath.startsWith('data/') && RUNTIME_DATA_RE.test(relPath);
+let skippedData = 0;
 
 /** 递归收集 dist 下所有文件与目录，zip 内统一挂在 DHT-Search/ 顶层目录下 */
 function addDir(dir, rel = '') {
@@ -54,7 +59,12 @@ function addDir(dir, rel = '') {
       if (addDir(abs, relPath)) hasContent = true;
       continue;
     }
-    archive.file(abs, { name: `${ZIP_ROOT}/${relPath}`, store: storeRe.test(entry.name) });
+    // 运行时数据不入包（见上方 RUNTIME_DATA_RE 注释）
+    if (isRuntimeData(relPath)) {
+      skippedData += 1;
+      continue;
+    }
+    archive.file(abs, { name: `${ZIP_ROOT}/${relPath}` });
     hasContent = true;
   }
   // 空目录不会随文件进 zip：显式写目录条目，保证解压后结构完整（如空的 data/）
@@ -62,6 +72,9 @@ function addDir(dir, rel = '') {
   return hasContent;
 }
 addDir(DIST);
+if (skippedData > 0) {
+  console.log(`[pack] 已排除 data/ 下 ${skippedData} 个运行时数据文件（数据库 / WAL / SHM）`);
+}
 
 await archive.finalize();
 await done;
