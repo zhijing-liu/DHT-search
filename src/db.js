@@ -71,7 +71,6 @@ import {
   ensureFilesSchema,
   closeFilesDb,
   createFilesWriter,
-  readFiles,
 } from './index/files-store.js';
 import {
   SCAN_BATCH,

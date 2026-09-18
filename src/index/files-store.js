@@ -131,7 +131,7 @@ function toBuffer(value) {
  * @param {boolean} compress 是否启用压缩
  * @returns {{ fmt: number, data: Buffer }}
  */
-export function encodeFiles(rawText, compress = true) {
+function encodeFiles(rawText, compress = true) {
   const text = String(rawText ?? '');
   const buf = Buffer.from(text, 'utf8');
   if (!compress || buf.length < COMPRESS_MIN_BYTES) return { fmt: FILES_FMT.raw, data: buf };
@@ -235,18 +235,3 @@ export function createFilesWriter(raw, { mode = 'append', compress = true } = {}
   };
 }
 
-/* ------------------------------------------------------------------ */
-/* 读取（查询期点查）                                                   */
-/* ------------------------------------------------------------------ */
-
-/**
- * 取一条 files 原文（详情接口唯一入口，主键点查）。
- * @param {object} raw 冷库只读连接
- * @param {number} id
- * @returns {string|null} 该 id 不存在时返回 null
- */
-export function readFiles(raw, id) {
-  const row = getRow(raw, `SELECT fmt, files FROM ${FILES_TABLE} WHERE id = ?`, [id]);
-  if (!row) return null;
-  return decodeFiles(Number(row.fmt), row.files);
-}

@@ -1,7 +1,7 @@
 /**
  * 单文件 exe 构建脚本（bun build --compile 的编译与收尾步骤）
  * ------------------------------------------------------------------
- * 完整的 build:exe 在 package.json 中用 `&` 串联两步（前端构建 + 本脚本），本脚本职责：
+ * 完整的 build:exe 在 package.json 中用 `&&` 串联两步（前端构建 + 本脚本），本脚本职责：
  *   1. bun build --compile → dist/DHT-Search.exe（内含后端与两个执行体，前端资源不进 exe）
  *   2. public/ → dist/public/（前端静态资源随目录分发）
  *   3. 复制外置 config.js / README.md（config 运行时优先读 exe 同目录这份）
@@ -39,7 +39,7 @@ if (tempConfig) {
   });
 }
 
-/* 1. bun 打包（前端构建已由 package.json 的 & 链先行完成） ---------- */
+/* 1. bun 打包（前端构建已由 package.json 的 && 链先行完成） ---------- */
 fs.mkdirSync(DIST, { recursive: true });
 const args = [
   'build',
@@ -58,7 +58,7 @@ if (r.status !== 0) process.exit(r.status ?? 1);
 /* 2. public → dist/public（前端构建产物在仓库根 public/） ---------- */
 const PUBLIC = path.join(ROOT, 'public');
 if (!fs.existsSync(PUBLIC)) {
-  console.error('[build-exe] 找不到 public/ —— build:web 是否已执行？（package.json 的 build:exe 已用 & 链在其前）');
+  console.error('[build-exe] 找不到 public/ —— build:web 是否已执行？（package.json 的 build:exe 已用 && 链在其前）');
   process.exit(1);
 }
 fs.rmSync(path.join(DIST, 'public'), { recursive: true, force: true });

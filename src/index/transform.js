@@ -15,7 +15,7 @@
  */
 
 /** preview 小列最多收录的文件条数（卡片只展示 5 条，多留几条给关键字优先挑选） */
-export const PREVIEW_MAX_FILES = 8;
+const PREVIEW_MAX_FILES = 8;
 
 /**
  * @param {string|null|undefined} rawFiles 源库 files 列原文

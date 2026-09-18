@@ -4,7 +4,7 @@
  * 集中存放跨模块共享的「配置 + 约定常量」，只放约定不放实现：
  *   - CONFIG           来自 config.js 的运行期配置（具名 export const 聚合）
  *   - 库路径 / 表名     DEFAULT_DB_PATH / DEFAULT_INDEX_DB_PATH / DEFAULT_FILES_DB_PATH，各表名
- *   - 列清单            DOCS_COLUMN_DEFS / RECORD_COLUMNS / DOCS_SELECT_COLUMNS（唯一来源）
+ *   - 列清单            DOCS_COLUMN_DEFS / RECORD_COLUMNS / DOCS_LIST_SELECT（唯一来源）
  *   - 索引与排序约定    TOKENIZER / DEFAULT_LIMIT / MAX_LIMIT / SORT_COLUMNS
  * 查询实现细节在 search/query.js，token 规则在 util.js，DDL 与老库补列在 index/ddl.js。
  *
@@ -163,16 +163,11 @@ export const RECORD_COLUMNS = [
 ].join(', ');
 
 /**
- * 带 `m.` 前缀的列清单：检索 JOIN 的取列白名单（别名 m 指向副本表）。
- * @deprecated 与 DOCS_LIST_SELECT 已等价（副本表不再含大列），保留仅为兼容旧引用。
+ * 列表路径取列：副本表全列，带 `m.` 前缀（检索 SQL 的别名指向副本表）。
+ * v4 起副本表已是窄表，不再需要 CASE 回退去读 files；preview 不在其中——
+ * 它由冷库按页回查后附着（见 search/api.js 的 attachPreviews）。
  */
-export const DOCS_SELECT_COLUMNS = DOCS_COLUMN_NAMES.map((name) => `m.${name}`).join(', ');
-
-/**
- * 列表路径取列：副本表全列（v4 起已是窄表，不再需要 CASE 回退去读 files）。
- * preview 不在其中——它由冷库按页回查后附着（见 search/api.js 的 attachPreviews）。
- */
-export const DOCS_LIST_SELECT = DOCS_SELECT_COLUMNS;
+export const DOCS_LIST_SELECT = DOCS_COLUMN_NAMES.map((name) => `m.${name}`).join(', ');
 
 /* ------------------------------------------------------------------ */
 /* 冷库表（magnets_files / magnets_preview）列清单                     */
