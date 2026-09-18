@@ -226,6 +226,10 @@ export const registerApp = () => {
     _pinyinIndex: null,
     /** 热词榜 scroll 的 rAF 句柄（同帧多次 scroll 只处理一次，见 onHotWordsScroll） */
     _hotScrollRaf: null,
+    /** 热词追加链是否在跑（首屏补足与滚动追加共用这把锁，见 _startHotChain） */
+    _hotLoading: false,
+    /** 热词追加链的 rAF 句柄（链路的递归由它驱动，销毁时必须取消） */
+    _hotChainRaf: null,
 
     /* ============================ 派生值 ============================ */
 
@@ -419,7 +423,9 @@ export const registerApp = () => {
       window.removeEventListener('hashchange', this._onLocationChange);
       clearTimeout(this._loadingTimer);
       clearTimeout(this._blurTimer);
-      cancelAnimationFrame(this._hotScrollRaf); // cancelAnimationFrame(null) 是安全的无操作
+      // cancelAnimationFrame(null) 是安全的无操作，未排队的句柄直接忽略
+      cancelAnimationFrame(this._hotScrollRaf);
+      cancelAnimationFrame(this._hotChainRaf);
       this.stopStats();
     },
 
@@ -769,50 +775,88 @@ export const registerApp = () => {
     },
 
     /**
-     * 热词榜滚动懒加载：接近底部时再渲染一批。
+     * 热词榜滚动懒加载：接近底部时再追加一批。
      *
      * 用 requestAnimationFrame 把同一帧内的多次 scroll 合并成一次：scroll 是每秒几十次的
-     * 高频事件，而 loadMoreHot 要读 scrollHeight / scrollTop / clientHeight 三个布局属性，
+     * 高频事件，而判定要读 scrollHeight / scrollTop / clientHeight 三个布局属性，
      * 浏览器每次都得先结算掉挂起的样式变更才能给出准确值（forced synchronous layout）。
      * 合并后这笔开销与「帧数」同阶，而不再与「滚动事件数」同阶。
      *
-     * 容器由 $refs 取得而非 event.target：回调已推迟到下一帧，不再依赖事件对象。
+     * 追加链在跑时直接丢弃：那期间的 scroll 多半是刚追加的内容自己引发的，
+     * 放进去只会让判定链重入（见 _startHotChain 里的锁）。
      */
     onHotWordsScroll() {
-      if (this._hotScrollRaf) return; // 本帧已排队，丢弃后续事件
+      if (this._hotLoading || this._hotScrollRaf) return;
       this._hotScrollRaf = requestAnimationFrame(() => {
         this._hotScrollRaf = null;
         this.loadMoreHot(this.$refs.hotWords);
       });
     },
 
+    /** 容器是否已出现滚动条（内容高于可视区） */
+    _hotScrollable(el) {
+      return el.scrollHeight > el.clientHeight;
+    },
+
+    /** 是否已接近底部（滚动追加的触发条件） */
+    _hotNearBottom(el) {
+      return el.scrollHeight - el.scrollTop - el.clientHeight <= HOT_PREFETCH_PX;
+    },
+
     /**
-     * 追加一批并检查是否仍需补足。
+     * 启动一条追加链：每追加一批，等浏览器**完成一次渲染**（requestAnimationFrame）
+     * 后再执行 shouldContinue 判定，判定通过才追加下一批。
      *
-     * 必须递归补足：容器是 flex-wrap 的，若当前这批还没把容器撑出一屏，
-     * 就没有滚动条、也就永远触发不了 scroll 事件 —— 榜单会卡在第一批。
-     * 宽屏（一行放得下很多词）下尤其明显。
+     * 两个要点，缺任何一个懒加载都会失效：
      *
+     * 1. **用 rAF 而不是 $nextTick**。$nextTick 是微任务，整条递归链会在同一个宏任务里
+     *    连续跑完，中间没有一次真实渲染帧 —— 表现为打开页面就把词表一口气灌进去。
+     *    rAF 挂在渲染帧之后，每批之间必定隔一次真实布局。
+     *
+     * 2. **同一时刻只允许一条链**。首屏补足与滚动追加都会自增 hotVisible，
+     *    不加锁时两条链并发累加，一次滚动就能灌进好几批。
+     *
+     * @param {HTMLElement} el 热词容器
+     * @param {(el: HTMLElement) => boolean} shouldContinue 是否再追加一批
+     */
+    _startHotChain(el, shouldContinue) {
+      if (this._hotLoading || !this.hotHasMore) return;
+      // 容器不可见（浏览区被隐藏 / 正在搜索）时量不出尺寸：scrollHeight 与 clientHeight
+      // 同为 0，判定会永远通过 —— 必须在这里收手，否则会把整份词表渲染出来
+      if (el.clientHeight === 0) return;
+      this._hotLoading = true;
+      this._hotChainStep(el, shouldContinue);
+    },
+
+    /** 追加链的一步：判定 → 追加一批 → 等下一个渲染帧再判（递归由 rAF 驱动） */
+    _hotChainStep(el, shouldContinue) {
+      if (!this.hotHasMore || !shouldContinue(el)) {
+        this._hotLoading = false; // 释放锁，后续交给 scroll 事件
+        this._hotChainRaf = null;
+        return;
+      }
+      this.hotVisible += HOT_PAGE_SIZE;
+      this._hotChainRaf = requestAnimationFrame(() => this._hotChainStep(el, shouldContinue));
+    },
+
+    /**
+     * 滚动追加：接近底部时补一批，填不满预加载区才继续补。
      * @param {HTMLElement} el 热词容器
      */
     loadMoreHot(el) {
-      if (!el || !this.hotHasMore) return;
-      // 距底还有余量：说明用户尚未滚到底，等下一次 scroll
-      if (el.scrollHeight - el.scrollTop - el.clientHeight > HOT_PREFETCH_PX) return;
-      this.hotVisible += HOT_PAGE_SIZE;
-      this.$nextTick(() => this.loadMoreHot(el));
+      if (!el) return;
+      this._startHotChain(el, (e) => this._hotNearBottom(e));
     },
 
-    /** 容器未撑出一屏时持续补足（否则没有滚动条，scroll 事件永远不会来） */
+    /**
+     * 首屏补足：追加到容器出现滚动条为止。
+     * 容器是 flex-wrap 的，一批未必撑得出一屏；没有滚动条就永远触发不了 scroll 事件，
+     * 榜单会卡在第一批（宽屏一行放得下很多词时尤其明显）。
+     */
     fillHotViewport() {
       const el = this.$refs.hotWords;
-      if (!el || !this.hotHasMore) return;
-      // 容器不可见（浏览区被隐藏 / 正在搜索）时量不出尺寸：此时必须收手，
-      // 否则 0 - 0 永远不满足阈值，会把整份词表一次性渲染出来
-      if (el.clientHeight === 0) return;
-      if (el.scrollHeight - el.clientHeight > HOT_PREFETCH_PX) return;
-      this.hotVisible += HOT_PAGE_SIZE;
-      this.$nextTick(() => this.fillHotViewport());
+      if (!el) return;
+      this._startHotChain(el, (e) => !this._hotScrollable(e));
     },
 
     /** 重新拉取热词（黑名单变化后被过滤的词可能重新出现） */

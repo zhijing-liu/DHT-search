@@ -19,6 +19,98 @@ const fileMatchScore = (name, tokens) => {
 };
 
 /* ------------------------------------------------------------------ */
+/* 文件分类（彩虹条占比 + 树过滤共用一套判定）                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 分类定义：order 即彩虹条分段与复选框的展示顺序，`other` 是兜底分类必须放最后。
+ * 扩展名一律小写、不含点；color 同时用于彩虹条分段与复选框的选中色块。
+ */
+export const FILE_CATEGORIES = Object.freeze([
+  {
+    id: 'video',
+    label: '视频',
+    color: '#3b82f6',
+    exts: [
+      'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'rmvb', 'rm', 'ts', 'm2ts', 'mts', 'mpg', 'mpeg',
+      'mpe', 'm2v', 'm1v', 'mpv', 'vob', 'webm', 'm4v', '3gp', 'asf', 'f4v', 'ogv', 'divx', 'mxf',
+    ],
+  },
+  {
+    id: 'audio',
+    label: '音频',
+    color: '#a855f7',
+    exts: [
+      'mp3', 'flac', 'wav', 'aac', 'm4a', 'ogg', 'oga', 'wma', 'ape', 'opus', 'alac', 'aiff', 'aif',
+      'ac3', 'dts', 'mka', 'mid', 'midi', 'amr', 'ra', 'wv', 'tak', 'tta',
+    ],
+  },
+  {
+    id: 'image',
+    label: '图片',
+    color: '#22c55e',
+    exts: [
+      'jpg', 'jpeg', 'jpe', 'png', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'svg', 'ico', 'heic', 'heif',
+      'avif', 'jfif', 'psd', 'raw', 'cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'pef', 'srw',
+      'tga', 'ppm', 'pgm', 'pbm', 'xcf',
+    ],
+  },
+  {
+    id: 'archive',
+    label: '压缩包',
+    color: '#f59e0b',
+    exts: [
+      'zip', 'rar', '7z', 'tar', 'gz', 'tgz', 'bz2', 'tbz', 'xz', 'txz', 'zst', 'cab', 'arj', 'lzh',
+      'ace', 'iso', 'img', 'lz', 'lzma', 'z', 'br', 'r00', 'r01', '001', '002', 'gzip',
+    ],
+  },
+  // 兜底：未命中上面任何扩展名（含无扩展名）都归到这里
+  { id: 'other', label: '其他', color: '#64748b', exts: [] },
+]);
+
+/** 扩展名 → 分类 id 的反查表（构建期一次） */
+const EXT_TO_CATEGORY = new Map();
+for (const c of FILE_CATEGORIES) for (const e of c.exts) EXT_TO_CATEGORY.set(e, c.id);
+
+/**
+ * 取扩展名（小写、不含点）。
+ * 前置条件 i > 0 排除了 `.gitignore` 这类以点开头的隐藏文件（它没有扩展名）。
+ */
+const extOf = (name) => {
+  const s = String(name);
+  const i = s.lastIndexOf('.');
+  return i > 0 && i < s.length - 1 ? s.slice(i + 1).toLowerCase() : '';
+};
+
+/** 按扩展名归类；未命中任何列表（含无扩展名）归入兜底的 other */
+export const classifyByExt = (name) => EXT_TO_CATEGORY.get(extOf(name)) ?? 'other';
+
+/**
+ * 统计各分类的文件数与总字节，**只返回实际存在的分类**（count > 0）。
+ *
+ * 直接扫扁平数组而不是嵌套树：目录节点不参与统计（它的 size 已由子孙汇总），
+ * 而扁平数组里文件节点就是这个含义，扫一遍即可。
+ *
+ * 「只返回存在的分类」正是 UI 侧「没有该类型就不显示复选框」的依据。
+ *
+ * @param {Array} flat 后端下发的扁平树
+ * @returns {Array<{ id: string, label: string, color: string, count: number, size: number }>}
+ */
+export const summarizeCategories = (flat) => {
+  const list = Array.isArray(flat) ? flat : [];
+  const acc = new Map();
+  for (const n of list) {
+    if (!n || n.isDir) continue;
+    const id = classifyByExt(n.name ?? n.path ?? '');
+    const hit = acc.get(id) ?? { count: 0, size: 0 };
+    hit.count += 1;
+    hit.size += Number(n.size) || 0;
+    acc.set(id, hit);
+  }
+  return FILE_CATEGORIES.filter((c) => acc.has(c.id)).map((c) => ({ ...c, ...acc.get(c.id) }));
+};
+
+/* ------------------------------------------------------------------ */
 /* 扁平树 → 渲染用父子关系                                              */
 /* ------------------------------------------------------------------ */
 
@@ -32,12 +124,16 @@ const toNestedTree = (flat) => {
   const wrapped = new Array(list.length);
   for (let i = 0; i < list.length; i += 1) {
     const n = list[i] || {};
+    // 退化兜底：老格式（尚未重建完成）的节点是 { path, size }，没有 name/isDir，
+    // 这里平铺成根级文件显示原始路径，而不是渲染出一堆空名字行
+    const name = String(n.name ?? n.path ?? '');
+    const isDir = !!n.isDir;
     wrapped[i] = {
-      // 退化兜底：老格式（尚未重建完成）的节点是 { path, size }，没有 name/isDir，
-      // 这里平铺成根级文件显示原始路径，而不是渲染出一堆空名字行
-      name: String(n.name ?? n.path ?? ''),
-      isDir: !!n.isDir,
+      name,
+      isDir,
       size: Number(n.size) || 0,
+      // 分类只对文件成立；目录的分类恒为 null（它由子孙组成，可能混合多类）
+      category: isDir ? null : classifyByExt(name),
       children: new Map(),
     };
   }
@@ -49,6 +145,35 @@ const toNestedTree = (flat) => {
     parent.children.set(i, wrapped[i]);
   }
   return root;
+};
+
+/**
+ * 按勾选的分类原地剪枝。
+ *
+ * 两条规则：
+ *   1. 文件节点只在分类被勾选时保留；
+ *   2. 目录节点**剪完子树后仍有子**才保留 —— 这就是「过滤出来的树只展示有子的父级」。
+ *
+ * 顺带把每个目录的 size 重算为「可见子孙之和」，否则过滤后树里的数字会与彩虹条对不上。
+ *
+ * @param {object} node 嵌套树节点（原地修改）
+ * @param {Set<string>} selected 勾选的分类 id
+ */
+const pruneTree = (node, selected) => {
+  const kept = [];
+  for (const child of node.children.values()) {
+    if (child.isDir) {
+      pruneTree(child, selected);
+      if (child.children.size > 0) kept.push(child);
+    } else if (selected.has(child.category)) {
+      kept.push(child);
+    }
+  }
+  // key 原本是扁平数组下标，剪枝后已无意义 —— 渲染侧只用 values() 与 size
+  node.children = new Map(kept.map((c, i) => [i, c]));
+  let total = 0;
+  for (const c of kept) total += c.size;
+  node.size = total;
 };
 
 /* ------------------------------------------------------------------ */
@@ -111,6 +236,34 @@ const sortChildren = (node, tokens) => {
   });
 };
 
+/** 分类 id → 颜色（与彩虹条、复选框同一套色值，三者肉眼可对应） */
+const CATEGORY_COLOR = new Map(FILE_CATEGORIES.map((c) => [c.id, c.color]));
+
+/** 行首分类色块：形状与复选框色块一致（小圆角方块），宽度固定以保持名称对齐 */
+const DOT_CLASS = 'flex-none w-2 h-2 rounded-[2px]';
+
+/**
+ * 生成行首的分类标记。
+ *
+ * 文件行用**亮色实心块**（该文件的分类色）；目录行没有单一类型（由子孙组成，
+ * 可能混合多类），用**暗色实心块**（--color-line #334155）而不是留空位：
+ *   - 留空位会让目录行的名称相对文件行更靠左，缩进层级看起来是乱的；
+ *   - 暗色块与亮色块尺寸完全一致（都是 size-2），对齐天然成立；
+ *   - 暗色是相对文件行的低饱和灰，不抢眼又能一眼看出「这是容器」；
+ *     比「其他」分类的灰（#64748b）更暗，两者不会混淆。
+ *
+ * 注：早期试过用 1px 空心描边，但 #334155 的描边在 #111827 的弹窗底色上
+ * 对比度太低，肉眼几乎看不见，等于没加 —— 故改回实心填充。
+ */
+const createCategoryDot = (category) => {
+  const dot = document.createElement('span');
+  dot.className = DOT_CLASS;
+  const color = category ? CATEGORY_COLOR.get(category) : null;
+  if (color) dot.style.background = color;
+  else dot.classList.add('bg-line');
+  return dot;
+};
+
 /** 单行：文件行 = 名称 + 大小；目录行 = 把手 + 名称 + 大小 + 懒加载的子层 */
 const createRow = (child, depth, tokens, budget) => {
   const li = document.createElement('li');
@@ -127,7 +280,7 @@ const createRow = (child, depth, tokens, budget) => {
     const size = document.createElement('span');
     size.className = SIZE_CLASS;
     size.textContent = formatBytes(Number(child.size));
-    row.append(toggle, name, size);
+    row.append(toggle, createCategoryDot(child.category), name, size);
     li.append(row);
     return li;
   }
@@ -136,7 +289,7 @@ const createRow = (child, depth, tokens, budget) => {
   size.className = SIZE_CLASS;
   size.textContent = `· ${formatBytes(Number(child.size))}`;
   highlightInto(name, child.name, tokens);
-  row.append(toggle, name, size);
+  row.append(toggle, createCategoryDot(null), name, size);
 
   const sub = document.createElement('ul');
   sub.className = CHILDREN_CLASS;
@@ -181,7 +334,7 @@ const createMoreRow = (node, depth, tokens, budget, next, rest) => {
   const more = document.createElement('span');
   more.className = MORE_CLASS;
   more.textContent = `…还有 ${rest} 项，点击展开`;
-  row.append(pad, more);
+  row.append(pad, createCategoryDot(null), more);
   li.append(row);
 
   more.addEventListener('click', () => {
@@ -211,8 +364,14 @@ const renderChildren = (node, depth, tokens, budget, from = 0) => {
 
 /**
  * 渲染整棵文件树，返回可直接插进容器的 Fragment。
- * budget 只由「打开弹窗」的那次调用给出，用于决定第一层目录是否默认展开。
+ *
  * @param {Array} nodes 后端下发的扁平树
+ * @param {string[]} tokens 关键词高亮与「命中优先」排序用
+ * @param {{rows: number}} [budget] 只由「打开弹窗」那次调用给出，决定第一层目录是否默认展开
+ * @param {Set<string>|null} [selected] 勾选的分类 id；null / 省略表示不做分类过滤
  */
-export const renderFileTree = (nodes, tokens, budget = { rows: INITIAL_ROWS }) =>
-  renderChildren(toNestedTree(nodes), 0, tokens, budget);
+export const renderFileTree = (nodes, tokens, budget = { rows: INITIAL_ROWS }, selected = null) => {
+  const root = toNestedTree(nodes);
+  if (selected) pruneTree(root, selected);
+  return renderChildren(root, 0, tokens, budget);
+};
