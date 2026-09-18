@@ -332,8 +332,11 @@ app.get('/api/search', apiHandler(async (req, res) => {
  */
 app.get('/api/latest', apiHandler(async (req, res) => {
   const s = normalizeLatestQuery(req.query);
+  // 复用事件驱动的内存总数（与子进程全表 count(*) 同义且等价），省掉每次翻页的重复计数；
+  // 为空时先懒加载一次。子进程侧缺失该值会自动回退自算，故直接调用仍安全。
+  if (indexedCountCache.value == null) syncIndexedCount();
   await runQuery(req, res, {
-    params: { ...s, mode: 'latest' },
+    params: { ...s, mode: 'latest', total: indexedCountCache.value ?? undefined },
     key: latestCacheKey(s),
     describe: describeLatest(s),
   });

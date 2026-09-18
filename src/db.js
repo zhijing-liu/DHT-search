@@ -113,6 +113,8 @@ const KEYWORD_SOURCE = 'name';
 const MIN_KEYWORD_LEN = 2;
 /** 热词过滤：纯数字 token（年份/大小等噪声）丢弃 */
 const NUMERIC_ONLY = /^\d+$/;
+/** 热词榜单次返回上限（topKeywords 的 limit 钳制上界；缓存也一次查到该条数） */
+const HOT_LIMIT_MAX = 1000;
 
 /* ------------------------------------------------------------------ */
 /* 工具函数                                                            */
@@ -693,6 +695,17 @@ export function createMagnetDb(options = {}) {
   let rdb = null;
   let dbRO = null;
   let search = null;
+  /**
+   * 热词榜缓存：keyword_stats 已持久化，且热词结果只在「黑名单变更 / 索引变更」时改变，
+   * 而 topKeywords 的查询是「全表排序 + 每行反连接」，代价随词表规模增长（实测 50 万词约
+   * 114ms）。故一次性查到上限条数并缓存，任意 limit 请求在其上切片。
+   * 失效点：黑名单增删改、索引维护（重建 / 增量同步）完成 —— 见 invalidateHot()。
+   */
+  let hotCache = null;
+  /** 置空热词榜缓存（任何会改变热词结果的操作后调用） */
+  function invalidateHot() {
+    hotCache = null;
+  }
   /** 切换索引库文件前的钩子，由 HTTP 层注册（回收持有旧库句柄的搜索子进程） */
   let beforeSwap = null;
   /** 切换完成（或失败回滚）后的钩子：让 HTTP 层解除前一个钩子造成的暂停 */
@@ -936,15 +949,20 @@ export function createMagnetDb(options = {}) {
    */
   function topKeywords(limit = 50) {
     requireIndexReady();
-    return dbRO.all(sql`
-      SELECT term, doc_count, occurrences
-      FROM ${sql.raw(KEYWORD_TABLE)} k
-      WHERE NOT EXISTS (
-        SELECT 1 FROM ${sql.raw(KEYWORD_FILTER_TABLE)} f WHERE f.term = k.term
-      )
-      ORDER BY doc_count DESC, occurrences DESC
-      LIMIT ${clampInt(limit, 50, 1, 1000)}
-    `);
+    const n = clampInt(limit, 50, 1, HOT_LIMIT_MAX);
+    if (hotCache === null) {
+      // 一次查到上限条数并缓存：任意 limit 都在其上切片，命中时零 DB 成本
+      hotCache = dbRO.all(sql`
+        SELECT term, doc_count, occurrences
+        FROM ${sql.raw(KEYWORD_TABLE)} k
+        WHERE NOT EXISTS (
+          SELECT 1 FROM ${sql.raw(KEYWORD_FILTER_TABLE)} f WHERE f.term = k.term
+        )
+        ORDER BY doc_count DESC, occurrences DESC
+        LIMIT ${HOT_LIMIT_MAX}
+      `);
+    }
+    return hotCache.slice(0, n);
   }
 
   /** 列出当前热词过滤词（按 term 排序） */
@@ -964,6 +982,7 @@ export function createMagnetDb(options = {}) {
     if (!t) throw new TypeError('addKeywordFilter: term 不能为空，且需包含字母或数字');
     db.run(sql`INSERT OR IGNORE INTO ${sql.raw(KEYWORD_FILTER_TABLE)} (term, created_at)
       VALUES (${t}, ${Date.now()})`);
+    invalidateHot(); // 黑名单变化 → 热词榜结果变化
     return t;
   }
 
@@ -990,6 +1009,7 @@ export function createMagnetDb(options = {}) {
     transaction(raw, (list) => {
       for (const t of list) runStmt(stmt, [t, now]);
     })([...unique]);
+    invalidateHot(); // 批量导入黑名单 → 热词榜结果变化
     return unique.size;
   }
 
@@ -1002,6 +1022,7 @@ export function createMagnetDb(options = {}) {
     const t = String(term ?? '').trim().toLowerCase();
     if (!t) throw new TypeError('removeKeywordFilter: term 不能为空');
     db.run(sql`DELETE FROM ${sql.raw(KEYWORD_FILTER_TABLE)} WHERE term = ${t}`);
+    invalidateHot(); // 删除黑名单词 → 该词应重新出现在热词榜
     return t;
   }
 
@@ -1094,6 +1115,8 @@ export function createMagnetDb(options = {}) {
           );
         }
         runtimeStats.indexing = { ...runtimeStats.indexing, running: false, mode: null, done: 0, total: 0 };
+        // 索引内容已变（重建 / 增量），热词榜结果可能失效
+        invalidateHot();
         return r;
       })
       .catch((e) => { runtimeStats.indexing = { ...runtimeStats.indexing, running: false, mode: null, done: 0, total: 0 }; throw e; })

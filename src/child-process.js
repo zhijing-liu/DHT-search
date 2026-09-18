@@ -34,5 +34,7 @@ export function spawnChild({ entryPath, flag, env = process.env, heapMb = 0, std
   if (!isCompiledExe) args.push(entryPath);
   args.push(flag);
 
-  return spawn(process.execPath, args, { stdio, env });
+  // 标记为执行体子进程：它们继承父控制台，代码页已由父进程设置好，
+  // logger 据此跳过重复的 chcp（见 logger.js）。
+  return spawn(process.execPath, args, { stdio, env: { ...env, DHT_WORKER_CHILD: '1' } });
 }

@@ -188,9 +188,13 @@ export function buildSearchApi(dbRO, filesRO = null) {
     }
     return {
       join: sql``,
+      // 前缀检索用范围条件而非 LIKE：LIKE 的左操作数是 lower(...) 表达式，无法使用
+      // lower(infohash) 表达式索引（SQLite 的 LIKE 优化只认裸列），会导致整个 OR 退化
+      // 成全索引扫描；换成范围条件后 OR 优化生效，三个分支各自走索引（实测 100 万行
+      // SCAN 109ms → MULTI-INDEX OR 0.1ms）。上界取 \uffff 保证覆盖所有前缀。
       cond: sql`lower(m.infohash) = lower(${raw})
         OR lower(m.infohash) = lower(${'hash' + raw})
-        OR lower(m.infohash) LIKE lower(${raw + '%'})`,
+        OR (lower(m.infohash) >= lower(${raw}) AND lower(m.infohash) < lower(${raw + '\uffff'}))`,
     };
   }
 
@@ -500,9 +504,11 @@ export function buildSearchApi(dbRO, filesRO = null) {
    */
   function listLatestSync(options) {
     const { limit, offset } = normalizeLatestQuery(options);
-    const total = Number(
-      dbRO.all(sql`SELECT count(*) AS total FROM ${sql.raw(DOCS_TABLE)}`)[0]?.total ?? 0
-    );
+    // total 优先用调用方传入值：主进程已有事件驱动的全表总数，省掉子进程每次重新
+    // count(*)（O(n)，需扫描最小索引）。子进程被单独调用（测试等）时缺失该值，回退自算。
+    const total = Number.isFinite(options?.total)
+      ? Number(options.total)
+      : Number(dbRO.all(sql`SELECT count(*) AS total FROM ${sql.raw(DOCS_TABLE)}`)[0]?.total ?? 0);
     const items = attachPreviews(
       dbRO.all(sql`
       SELECT ${sql.raw(DOCS_LIST_SELECT)} FROM ${sql.raw(DOCS_TABLE)} m

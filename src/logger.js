@@ -5,9 +5,10 @@
 import chalk from 'chalk';
 import { execSync } from 'node:child_process';
 
-// Windows 控制台默认代码页为 GBK，会把 UTF-8 中文解成乱码，故首次加载切到 UTF-8；
-// 非 Windows 或切换失败（服务 / 无控制台态）忽略。
-if (process.platform === 'win32') {
+// Windows 控制台默认代码页为 GBK，会把 UTF-8 中文解成乱码，故切到 UTF-8。
+// 只在主进程执行：执行体子进程 stdio 继承父控制台，代码页已由父进程设置，
+// 重复执行只是每次 spawn 白付一次同步 shell 调用（实测约 19ms）。
+if (process.platform === 'win32' && process.env.DHT_WORKER_CHILD !== '1') {
   try {
     execSync('chcp 65001 > nul', { stdio: 'ignore' });
   } catch { /* 无控制台时忽略 */ }
