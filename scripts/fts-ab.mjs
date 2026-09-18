@@ -163,7 +163,7 @@ function runConfig(cfg, rows, textMode, queries) {
   try {
     const db = createDrizzle(raw);
     resetIndexTables(db, cfg.caps);
-    // 本脚本要按 files 原文统计相关性，而副本表（v4 起）已不含 files 列，
+    // 本脚本要按 files 原文统计相关性，而副本表已不含 files 列，
     // 故在临时库里额外留一张旁路表专存原文，只服务下面的 precision 统计。
     execRaw(raw, 'CREATE TABLE ab_files (id INTEGER PRIMARY KEY, files TEXT)');
 

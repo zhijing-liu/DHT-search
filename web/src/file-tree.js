@@ -10,13 +10,13 @@
 import { formatBytes } from './util.js';
 
 /** 文件命中查询 token 的数量评分，用于「匹配关键词优先」排序（仅本模块内部使用） */
-function fileMatchScore(name, tokens) {
+const fileMatchScore = (name, tokens) => {
   if (!tokens || tokens.length === 0) return 0;
   const lower = String(name).toLowerCase();
   let s = 0;
   for (const t of tokens) if (lower.includes(t)) s++;
   return s;
-}
+};
 
 /* ------------------------------------------------------------------ */
 /* 扁平树 → 渲染用父子关系                                              */
@@ -27,7 +27,7 @@ function fileMatchScore(name, tokens) {
  * parent 只认「已经出现过的下标」，非法值一律当作根级（避免脏数据成环）；
  * 返回虚拟根节点，其 children 即全部根级节点。
  */
-function toNestedTree(flat) {
+const toNestedTree = (flat) => {
   const list = Array.isArray(flat) ? flat : [];
   const wrapped = new Array(list.length);
   for (let i = 0; i < list.length; i += 1) {
@@ -49,7 +49,7 @@ function toNestedTree(flat) {
     parent.children.set(i, wrapped[i]);
   }
   return root;
-}
+};
 
 /* ------------------------------------------------------------------ */
 /* 渲染（light DOM：全部用 Tailwind 工具类，无需组件样式文件）          */
@@ -79,7 +79,7 @@ const BATCH_SIZE = 200;
 const INITIAL_ROWS = 200;
 
 /** 把 text 中命中 tokens 的片段以 <mark> 写入 container（全程 DOM API，无注入风险） */
-function highlightInto(container, text, tokens) {
+const highlightInto = (container, text, tokens) => {
   container.replaceChildren();
   if (!tokens || tokens.length === 0 || !text) {
     container.textContent = text || '';
@@ -98,10 +98,10 @@ function highlightInto(container, text, tokens) {
     if (m.index === re.lastIndex) re.lastIndex++; // 防止零宽匹配死循环
   }
   if (last < text.length) container.appendChild(document.createTextNode(text.slice(last)));
-}
+};
 
 /** 子节点排序：目录优先 → 命中关键词优先 → 名称自然序 */
-function sortChildren(node, tokens) {
+const sortChildren = (node, tokens) => {
   return [...node.children.values()].sort((a, b) => {
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
     const sa = fileMatchScore(a.name, tokens);
@@ -109,10 +109,10 @@ function sortChildren(node, tokens) {
     if (sa !== sb) return sb - sa;
     return a.name.localeCompare(b.name, 'en', { numeric: true });
   });
-}
+};
 
 /** 单行：文件行 = 名称 + 大小；目录行 = 把手 + 名称 + 大小 + 懒加载的子层 */
-function createRow(child, depth, tokens, budget) {
+const createRow = (child, depth, tokens, budget) => {
   const li = document.createElement('li');
   li.className = ROW_ITEM_CLASS;
   const row = document.createElement('div');
@@ -167,10 +167,10 @@ function createRow(child, depth, tokens, budget) {
     toggle.textContent = collapsing ? '▸' : '▾';
   });
   return li;
-}
+};
 
 /** 「…还有 N 项，点击展开」：按批续渲染剩余行，本行用完即移除 */
-function createMoreRow(node, depth, tokens, budget, next, rest) {
+const createMoreRow = (node, depth, tokens, budget, next, rest) => {
   const li = document.createElement('li');
   li.className = ROW_ITEM_CLASS;
   const row = document.createElement('div');
@@ -191,14 +191,14 @@ function createMoreRow(node, depth, tokens, budget, next, rest) {
     li.remove();
   });
   return li;
-}
+};
 
 /**
  * 渲染 node 的一层子节点，返回 DocumentFragment。
  * 单层一次最多建 BATCH_SIZE 行，其余交给「…还有 N 项」按批补。
  * @param {number} from 从第几个子节点开始（续渲染用）
  */
-function renderChildren(node, depth, tokens, budget, from = 0) {
+const renderChildren = (node, depth, tokens, budget, from = 0) => {
   const frag = document.createDocumentFragment();
   const arr = sortChildren(node, tokens);
   const batch = arr.slice(from, from + BATCH_SIZE);
@@ -207,13 +207,12 @@ function renderChildren(node, depth, tokens, budget, from = 0) {
   const rest = arr.length - from - batch.length;
   if (rest > 0) frag.appendChild(createMoreRow(node, depth, tokens, budget, from + batch.length, rest));
   return frag;
-}
+};
 
 /**
  * 渲染整棵文件树，返回可直接插进容器的 Fragment。
  * budget 只由「打开弹窗」的那次调用给出，用于决定第一层目录是否默认展开。
  * @param {Array} nodes 后端下发的扁平树
  */
-export function renderFileTree(nodes, tokens, budget = { rows: INITIAL_ROWS }) {
-  return renderChildren(toNestedTree(nodes), 0, tokens, budget);
-}
+export const renderFileTree = (nodes, tokens, budget = { rows: INITIAL_ROWS }) =>
+  renderChildren(toNestedTree(nodes), 0, tokens, budget);

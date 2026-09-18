@@ -85,7 +85,7 @@ npm run build:web           # web/ → public/（Vite + Tailwind）
 | `SOURCE_DB_PATH` | `data/magnet.db` | 源库路径（含 `magnets` 表） |
 | `INDEX_DB_PATH` | `data/dht.search.db` | 影子索引库（热库）路径 |
 | `FILES_DB_PATH` | `data/dht.files.db` | 冷库路径：`files` 原文 + 预览小列，只按 id 点查、不参与原子切换，可指向另一块盘 |
-| `FILES_COMPRESS` | `true` | 冷库 `files` 用 zlib 压缩（实测约 5×），仅详情接口付一次解压 |
+| `FILES_COMPRESS` | `true` | 冷库 `files` 用 zlib 压缩，仅详情接口付一次解压 |
 | `FILES_REWRITE_ON_REBUILD` | `false` | 全量重建时是否无条件重写冷库。默认 `false`：按「源文长度指纹」只重写真正变过的行，重建因此不必重写几个 GB 的大对象 |
 | `PORT` | `3000` | HTTP 服务端口 |
 | `WEB_BASE_PATH` | `'/dht'` | 前端产物部署前缀：空 = 站点根；`/dht` 适合反代子路径。改后需重新构建前端 |
@@ -242,15 +242,8 @@ dist/
 - `keyword_stats` / `keyword_filter`：热词统计与过滤表。
 
 冷库内含 2 张表（`magnets_files` / `magnets_preview`）。**为什么要拆**：`files` + `preview` 占
-原副本表体积的 94%（313 万行实测 8.8GB → 0.68GB），而所有慢查询的形状都是「取到 N 个匹配
-rowid → 逐个回表主键查找」，成本取决于副本表的页数——表宽时必然随机磁盘 IO，窄表则整个
-装得进缓存。同条件实测（搜索子进程 `cache_size=2MB`）：
-
-| 查询（关键词 `mp4`，105 万匹配） | 拆分前 | 拆分后 |
-|---|---:|---:|
-| `count` + 大小筛选（105 万次主键回查） | 31.6 s | 0.87 s |
-| 按抓取时间排序（缺该索引时的退化形状） | 30.8 s | 1.22 s |
-| 资源库深分页 `OFFSET 100000` | 225 ms | 4 ms |
+原副本表体积的绝大部分，而所有慢查询的形状都是「取到 N 个匹配 rowid → 逐个回表主键查找」，
+成本取决于副本表的页数——表宽时必然随机磁盘 IO，窄表则整个装得进缓存。
 
 冷库只追加、不参与索引库的原子切换，因此全量重建不必重写几个 GB 的大对象；
 `FILE_REWRITE_ON_REBUILD` 可切回无条件全量重写。

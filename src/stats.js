@@ -31,60 +31,46 @@ export const runtimeStats = {
 /* ------------------------------------------------------------------ */
 
 /** 缓存命中 +1（自进程启动累计，不随 searchCache.clear() 清零） */
-export function markCacheHit() {
-  runtimeStats.cache.hit += 1;
-}
+export const markCacheHit = () => { runtimeStats.cache.hit += 1; };
 
 /** 缓存未命中 +1（同上，累计值） */
-export function markCacheMiss() {
-  runtimeStats.cache.miss += 1;
-}
+export const markCacheMiss = () => { runtimeStats.cache.miss += 1; };
 
 /* ------------------------------------------------------------------ */
 /* 全量重建                                                            */
 /* ------------------------------------------------------------------ */
 
 /** 重建开始 */
-export function beginReindex() {
-  runtimeStats.reindex = { running: true, done: 0, total: 0 };
-}
+export const beginReindex = () => { runtimeStats.reindex = { running: true, done: 0, total: 0 }; };
 
 /** 重建进度（由 api.reindex 的 onProgress 回调驱动；step 为当前阶段名） */
-export function setReindexProgress(done, total, step = null) {
+export const setReindexProgress = (done, total, step = null) => {
   runtimeStats.reindex = { running: true, done, total, step };
-}
+};
 
 /** 重建结束（成功/失败都要调，建议放在 finally 中） */
-export function endReindex() {
-  runtimeStats.reindex = { running: false, done: 0, total: 0 };
-}
+export const endReindex = () => { runtimeStats.reindex = { running: false, done: 0, total: 0 }; };
 
 /* ------------------------------------------------------------------ */
 /* 增量同步                                                            */
 /* ------------------------------------------------------------------ */
 
 /** 同步开始 */
-export function beginSync() {
-  runtimeStats.sync.running = true;
-}
+export const beginSync = () => { runtimeStats.sync.running = true; };
 
 /**
  * 同步结束（成功/失败都要调，建议放在 finally 中）。只记录本轮结果，
  * 下次触发时刻由调度器提供（见 index.js 的 getNextSyncAt）。
  * @param {number} added 本轮补录行数；异常时为 0
  */
-export function endSync(added) {
+export const endSync = (added) => {
   runtimeStats.sync.running = false;
   runtimeStats.sync.lastAt = Date.now();
   runtimeStats.sync.lastAdded = added;
-}
+};
 
 /**
  * 写入下次同步时刻：来源是 cron 表达式的推算值，而非「上次 + 固定间隔」。
  * @param {number|null} at 时间戳；非有限值按 null 处理（未启用 / 无法推算）
  */
-export function setNextSyncAt(at) {
-  runtimeStats.sync.nextAt = Number.isFinite(at) ? at : null;
-}
-
-
+export const setNextSyncAt = (at) => { runtimeStats.sync.nextAt = Number.isFinite(at) ? at : null; };

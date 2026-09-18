@@ -9,7 +9,7 @@ import { showToast } from './toast.js';
 /* ---------- 数据规范化与格式化 ---------- */
 
 /** 把字节数格式化为带单位的可读字符串 */
-export function formatBytes(n) {
+export const formatBytes = (n) => {
   if (!Number.isFinite(n) || n < 0) return '-';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let i = 0;
@@ -19,55 +19,53 @@ export function formatBytes(n) {
     i += 1;
   }
   return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
-}
+};
 
 const pad2 = (x) => String(x).padStart(2, '0');
 
 /** 把时间戳格式化为 YYYY-MM-DD HH:mm */
-export function formatDate(ts) {
+export const formatDate = (ts) => {
   if (!Number.isFinite(Number(ts))) return '-';
   const d = new Date(Number(ts));
   if (Number.isNaN(d.getTime())) return '-';
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-}
+};
 
 /** 把毫秒差格式化为 mm:ss / h:mm:ss（用于同步倒计时） */
-export function formatCountdown(ms) {
+export const formatCountdown = (ms) => {
   if (!Number.isFinite(ms) || ms < 0) return '-';
   const s = Math.round(ms / 1000);
   return s >= 3600
     ? `${Math.floor(s / 3600)}:${pad2(Math.floor((s % 3600) / 60))}:${pad2(s % 60)}`
     : `${pad2(Math.floor(s / 60))}:${pad2(s % 60)}`;
-}
+};
 
 const numberFmt = new Intl.NumberFormat('zh-CN');
 
 /** 千分位整数 */
-export function formatCount(n) {
-  return numberFmt.format(Number(n) || 0);
-}
+export const formatCount = (n) => numberFmt.format(Number(n) || 0);
 
 /* ---------- 查询解析 ---------- */
 
 /** 从查询串提取高亮 token（与后端 buildMatchExpression 保持一致：字母数字、小写、去重） */
-export function extractTokens(q) {
+export const extractTokens = (q) => {
   const m = String(q).match(/[\p{L}\p{N}]+/gu);
   if (!m) return [];
   return [...new Set(m.map((t) => t.toLowerCase()))];
-}
+};
 
 /** 判断输入是否为 infohash：连续 40 位十六进制，或带 urn:btih: / hash 前缀 */
-export function isInfohash(q) {
+export const isInfohash = (q) => {
   const s = String(q).trim().toLowerCase();
   if (s.includes('urn:btih:')) return /^.*urn:btih:[a-f0-9]{40}$/.test(s);
   if (s.startsWith('hash')) return /^hash[a-f0-9]{40}$/.test(s);
   return /^[a-f0-9]{40}$/.test(s);
-}
+};
 
 /* ---------- 输入联想（编辑距离 + 分组排序） ---------- */
 
 /** Levenshtein 编辑距离 */
-function editDistance(a, b) {
+const editDistance = (a, b) => {
   const m = a.length;
   const n = b.length;
   if (m === 0) return n;
@@ -81,20 +79,20 @@ function editDistance(a, b) {
     prev = cur;
   }
   return prev[n];
-}
+};
 
 /** term 是否与 query 模糊相似：编辑距离阈值随长度放宽 */
-function isFuzzyMatch(term, query) {
+const isFuzzyMatch = (term, query) => {
   if (Math.abs(term.length - query.length) > 2) return false;
   const d = editDistance(term, query);
   return d <= 1 || (query.length >= 4 && d <= 2);
-}
+};
 
 /**
  * 从热词中相似匹配：完全相等 > 前缀 > 包含 > 模糊；组间按优先级、组内按热度。
  * 注意分组各自排序后再拼接，统一 sort 会打散分组优先级。
  */
-export function matchSuggestions(items, q, max = 8) {
+export const matchSuggestions = (items, q, max = 8) => {
   const query = String(q).trim().toLowerCase();
   if (!query) return [];
   const groups = { exact: [], prefix: [], include: [], fuzzy: [] };
@@ -112,30 +110,28 @@ export function matchSuggestions(items, q, max = 8) {
     ...groups.include.sort(byHot),
     ...groups.fuzzy.sort(byHot),
   ].slice(0, max);
-}
+};
 
 /* ---------- 高亮（输出可直接 x-html 的安全字符串） ---------- */
 
 /** 转义正则元字符，避免 token 破坏构造出的正则 */
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** HTML 转义：x-html 绑定的所有文本都必须先过这里（仅本模块内部使用） */
-function escapeHtml(text) {
+const escapeHtml = (text) => {
   return String(text ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
-}
+};
 
 /**
  * 把 text 中命中 tokens 的片段用 <mark> 高亮，返回转义后的安全 HTML。
  * tokens 为空时退化为纯转义文本。
  */
-export function highlightHtml(text, tokens) {
+export const highlightHtml = (text, tokens) => {
   const s = String(text ?? '');
   if (!tokens || tokens.length === 0) return escapeHtml(s);
   const re = new RegExp(`(${tokens.map(escapeRegExp).join('|')})`, 'gi');
@@ -148,12 +144,12 @@ export function highlightHtml(text, tokens) {
     last = m.index + m[0].length;
   }
   return out + escapeHtml(s.slice(last));
-}
+};
 
 /* ---------- 浏览器能力：复制 / 下载 / 迅雷链接 ---------- */
 
 /** 复制文本到剪贴板（带 execCommand 降级）。两条路都失败时抛错，交由调用方提示失败。 */
-export async function copyToClipboard(text) {
+export const copyToClipboard = async (text) => {
   try {
     await navigator.clipboard.writeText(text);
     return;
@@ -167,10 +163,10 @@ export async function copyToClipboard(text) {
   const ok = document.execCommand('copy');
   ta.remove();
   if (!ok) throw new Error('复制失败');
-}
+};
 
 /** 触发浏览器下载一个文本文件 */
-export function downloadText(filename, text) {
+export const downloadText = (filename, text) => {
   const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
   const a = document.createElement('a');
   a.href = url;
@@ -179,15 +175,15 @@ export function downloadText(filename, text) {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
-}
+};
 
 /** 把 magnet 链接编码成迅雷 thunder:// 协议链接 */
-export function toThunder(magnet) {
+export const toThunder = (magnet) => {
   if (!magnet) return '';
   const raw = 'AA' + magnet + 'ZZ';
   const b64 = btoa(String.fromCharCode(...new TextEncoder().encode(raw)));
   return 'thunder://' + b64;
-}
+};
 
 /* ---------- RPC 推送（aria2 / Motrix JSON-RPC 2.0） ---------- */
 
@@ -196,26 +192,26 @@ const RPC_SECRET_KEY = 'dht_rpc_secret';
 const DEFAULT_RPC_URL = 'http://localhost:16800/jsonrpc';
 
 /** 读取 RPC 推送配置（地址默认 localhost:16800，密钥默认空） */
-export function getRpcConfig() {
+export const getRpcConfig = () => {
   return {
     url: (localStorage.getItem(RPC_URL_KEY) || DEFAULT_RPC_URL).trim(),
     secret: (localStorage.getItem(RPC_SECRET_KEY) || '').trim(),
   };
-}
+};
 
 /** 保存 RPC 推送配置到 localStorage（空值则清除对应键，回退默认） */
-export function saveRpcConfig({ url, secret } = {}) {
+export const saveRpcConfig = ({ url, secret } = {}) => {
   if (url && url.trim()) localStorage.setItem(RPC_URL_KEY, url.trim());
   else localStorage.removeItem(RPC_URL_KEY);
   if (secret) localStorage.setItem(RPC_SECRET_KEY, secret);
   else localStorage.removeItem(RPC_SECRET_KEY);
-}
+};
 
 /**
  * 把磁力链接推送到 aria2 / Motrix 下载器（JSON-RPC 2.0 的 aria2.addUri）。
  * 设了密钥时按 aria2 约定在 params 头部加 `token:<secret>`；结果用 toast 反馈。
  */
-export async function pushToAria2(magnet) {
+export const pushToAria2 = async (magnet) => {
   if (!magnet) {
     showToast('没有可推送的磁力链接');
     return;
@@ -235,4 +231,4 @@ export async function pushToAria2(magnet) {
   } catch (err) {
     showToast(`推送出错：${err.message}`);
   }
-}
+};

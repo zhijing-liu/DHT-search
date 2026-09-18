@@ -9,9 +9,8 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const ROOT = path.resolve(import.meta.dirname, '..');
 const DIST = path.join(ROOT, 'dist');
 const RELEASE = path.join(ROOT, 'release');
 const ZIP_ROOT = 'DHT-Search'; // zip 内的顶层目录名

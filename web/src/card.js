@@ -24,12 +24,12 @@ const COPIED_MS = 1200;
 
 const TREE_CACHE_MAX = 32;
 const treeCache = new Map();
-function cacheTree(id, nodes) {
+const cacheTree = (id, nodes) => {
   if (treeCache.size >= TREE_CACHE_MAX) treeCache.delete(treeCache.keys().next().value);
   treeCache.set(id, nodes);
-}
+};
 
-export function registerCard() {
+export const registerCard = () => {
   Alpine.data('magnetCard', (item, tokens = []) => ({
     item,
     tokens,
@@ -142,4 +142,4 @@ export function registerCard() {
       }
     },
   }));
-}
+};

@@ -1,27 +1,22 @@
 /**
  * 冷库（大对象）访问层：data/dht.files.db
  * ------------------------------------------------------------------
- * v4 起把两个「大列」从热库副本表移到这里：
+ * 两个「大列」（files 原文与预览）独立于此：
  *
  *   magnets_files(id PK, fmt, files BLOB)   —— files 原文（zlib 压缩）
  *   magnets_preview(id PK, preview TEXT)    —— 列表预览小列
  *
- * 为什么拆（313 万行实测，搜索子进程 cache_size=2MB）：
- *
- *   files 8.27GB + preview，占副本表体积的 94%；把它们移出后副本表 12.0GB → 0.68GB。
- *   所有慢查询的形状都是「取到 N 个匹配 rowid → 逐个回表主键查找」，成本取决于
- *   副本表的页数（8.8GB≈220 万页 vs 0.68GB≈17 万页）：前者必然随机磁盘 IO，后者
- *   整个装得进缓存。实测三条典型查询：
- *     count(JOIN+大小筛选) 31.6s → 0.87s ｜ 按 fetchedAt 排序 30.8s → 1.27s
- *     ｜ 按 totalSize 排序 OFFSET 100000 30.7s → 1.40s
+ * 为什么拆：files + preview 占副本表体积的绝大部分；移出后副本表大幅瘦身。
+ * 所有慢查询的形状都是「取到 N 个匹配 rowid → 逐个回表主键查找」，成本取决于
+ * 副本表的页数：表宽时必然随机磁盘 IO，窄表则整个装得进缓存。
  *
  * 为什么是「独立库」而不是「同库另一张表」：查询提速两者等价（SQLite 按页缓存、
- * 按 B-tree 定位），独立库额外拿到——热库瘦身（备份 / VACUUM / mmap 覆盖率高一个量级）、
- * 全量重建不必重写几个 GB 的大对象（只追加缺失 id）、可放到另一块盘。
+ * 按 B-tree 定位），独立库额外拿到——热库瘦身（备份 / VACUUM / mmap 覆盖率高）、
+ * 全量重建不必重写大对象（只追加缺失 id）、可放到另一块盘。
  *
- * 为什么不外置成「一个 id 一个文件」：files 长尾极重（76% 的行 < 512B，只有 331 行
- * > 1MB），一刀切外置会让绝大多数行变慢（多三次系统调用且失去事务性），并在 NTFS
- * 下制造几百万个小文件。压缩后最大单条约 1.5MB，稳稳在 SQLite 的舒适区内。
+ * 为什么不外置成「一个 id 一个文件」：files 长尾极重（多数行很小，只有极少数很大），
+ * 一刀切外置会让绝大多数行变慢（多三次系统调用且失去事务性），并在 NTFS 下制造
+ * 几百万个小文件。
  *
  * 一致性：冷库只按 id 点查、只追加，不参与热库的原子切换（swapIndex）。
  * 热库有而冷库无的行，详情退化为「无文件列表」，不影响检索正确性。
@@ -61,7 +56,7 @@ const ddlOf = (table, defs) =>
 /**
  * 冷库的页大小：大 blob 用大页能显著缩短 overflow 页链（16KB 页下单条 1MB 只需
  * 64 个溢出页，4KB 页要 256 个）。仅对「尚未建表的新库」生效，已有库静默忽略
- * （改页大小需要 VACUUM，不值得为它重写几个 GB）。
+ * （改页大小需要 VACUUM，不值得为它重写大对象）。
  */
 const FILES_PAGE_SIZE = 16384;
 
@@ -72,7 +67,7 @@ const FILES_PAGE_SIZE = 16384;
  * @param {{ readonly?: boolean, cacheSizeKb?: number }} [opts]
  * @returns {{ raw: object, db: object }} raw = 原生连接，db = drizzle 包装
  */
-export function openFilesDb(filePath, { readonly = false, cacheSizeKb = 2048 } = {}) {
+export const openFilesDb = (filePath, { readonly = false, cacheSizeKb = 2048 } = {}) => {
   const raw = openDatabase(filePath, { readonly });
   setPragma(raw, 'busy_timeout', 5000);
   setPragma(raw, 'cache_size', -Math.max(1, Math.trunc(cacheSizeKb)));
@@ -88,13 +83,13 @@ export function openFilesDb(filePath, { readonly = false, cacheSizeKb = 2048 } =
     /* 驱动不支持时按默认页大小继续 */
   }
   return { raw, db: createDrizzle(raw) };
-}
+};
 
 /** 幂等建表（全新库 / 只读打开时都能安全调用），并给老库补齐缺失列 */
-export function ensureFilesSchema(raw) {
+export const ensureFilesSchema = (raw) => {
   execRaw(raw, ddlOf(FILES_TABLE, FILES_COLUMN_DEFS));
   execRaw(raw, ddlOf(PREVIEW_TABLE, PREVIEW_COLUMN_DEFS));
-  // 老库补列（冷库 v4 首发之后新增的列走这里，避免 no such column）
+  // 老库补列（冷库后续新增的列走这里，避免 no such column）
   const existing = new Set(
     allRows(raw, `PRAGMA table_info(${FILES_TABLE})`).map((r) => r.name)
   );
@@ -102,12 +97,10 @@ export function ensureFilesSchema(raw) {
     if (name === 'id' || existing.has(name)) continue;
     execRaw(raw, `ALTER TABLE ${FILES_TABLE} ADD COLUMN ${name} ${decl}`);
   }
-}
+};
 
 /** 关闭冷库连接（幂等） */
-export function closeFilesDb(raw) {
-  closeDb(raw);
-}
+export const closeFilesDb = (raw) => closeDb(raw);
 
 /* ------------------------------------------------------------------ */
 /* 压缩编解码                                                          */
@@ -120,10 +113,8 @@ export function closeFilesDb(raw) {
 const COMPRESS_MIN_BYTES = 256;
 
 /** 统一转成 Buffer（bun:sqlite 返回 Uint8Array，其 toString 不接受编码参数） */
-function toBuffer(value) {
-  if (value == null) return null;
-  return Buffer.isBuffer(value) ? value : Buffer.from(value);
-}
+const toBuffer = (value) =>
+  value == null ? null : Buffer.isBuffer(value) ? value : Buffer.from(value);
 
 /**
  * 编码一条 files 原文。
@@ -131,12 +122,12 @@ function toBuffer(value) {
  * @param {boolean} compress 是否启用压缩
  * @returns {{ fmt: number, data: Buffer }}
  */
-function encodeFiles(rawText, compress = true) {
+const encodeFiles = (rawText, compress = true) => {
   const text = String(rawText ?? '');
   const buf = Buffer.from(text, 'utf8');
   if (!compress || buf.length < COMPRESS_MIN_BYTES) return { fmt: FILES_FMT.raw, data: buf };
   return { fmt: FILES_FMT.zlib, data: zlib.deflateSync(buf, { level: 1 }) };
-}
+};
 
 /**
  * 解码一条 files 原文（容错：格式标记未知 / 数据损坏时按原文处理，不让详情接口抛错）。
@@ -144,7 +135,7 @@ function encodeFiles(rawText, compress = true) {
  * @param {Buffer|Uint8Array} data
  * @returns {string}
  */
-export function decodeFiles(fmt, data) {
+export const decodeFiles = (fmt, data) => {
   const buf = toBuffer(data);
   if (!buf || buf.length === 0) return '';
   if (fmt === FILES_FMT.zlib) {
@@ -155,7 +146,7 @@ export function decodeFiles(fmt, data) {
     }
   }
   return buf.toString('utf8');
-}
+};
 
 /* ------------------------------------------------------------------ */
 /* 写入（索引期批量）                                                   */
@@ -174,7 +165,7 @@ export function decodeFiles(fmt, data) {
  * @param {'append'|'rewrite'} [opts.mode='append'] rewrite = 无条件全量重写（不比对，最慢但最直白）
  * @param {boolean} [opts.compress=true]
  */
-export function createFilesWriter(raw, { mode = 'append', compress = true } = {}) {
+export const createFilesWriter = (raw, { mode = 'append', compress = true } = {}) => {
   // 「写不写」由下面的指纹比对决定；一旦决定写就用 REPLACE——
   // IGNORE 会让「files 变了但 preview 被忽略」这类半更新状态出现，两者必须同进同退
   const insertFiles = prepareStmt(
@@ -233,5 +224,4 @@ export function createFilesWriter(raw, { mode = 'append', compress = true } = {}
       })(rows);
     },
   };
-}
-
+};

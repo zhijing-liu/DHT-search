@@ -49,20 +49,17 @@ export { isBun, Database };
  * 打开连接：抹平构造选项差异，并统一「只读 = 文件必须已存在」的语义。
  *
  * 只读打开一律不允许隐式建库：源库 / 索引库路径配错时，宁可直接报错，
- * 也不要在错误的位置留下一个 0 字节的空库（历史上就因此在项目 data/ 下
- * 留下过空的 magnet.db，排查时极易误导）。
+ * 也不要在错误的位置留下一个 0 字节的空库（易误导排查）。
  *   - Node：better-sqlite3 的 fileMustExist
  *   - Bun ：bun:sqlite 的 create（默认 true，必须显式关掉才是「缺失即报错」）
  */
-export function openDatabase(filePath, { readonly = false } = {}) {
-  if (isBun) return new Database(filePath, { readonly, create: !readonly });
-  return new Database(filePath, readonly ? { readonly: true, fileMustExist: true } : {});
-}
+export const openDatabase = (filePath, { readonly = false } = {}) =>
+  isBun
+    ? new Database(filePath, { readonly, create: !readonly })
+    : new Database(filePath, readonly ? { readonly: true, fileMustExist: true } : {});
 
 /** 用对应驱动把原生连接包成 drizzle 实例 */
-export function createDrizzle(rawDb) {
-  return drizzle(rawDb);
-}
+export const createDrizzle = (rawDb) => drizzle(rawDb);
 
 /* ------------------------------------------------------------------ */
 /* PRAGMA                                                              */
@@ -72,69 +69,54 @@ export function createDrizzle(rawDb) {
  * 设置 PRAGMA。统一走 raw SQL 的 exec（bun 无 .pragma()，better-sqlite3 无 .run()）。
  * name / value 均为内部常量（白名单），无注入风险。
  */
-export function setPragma(rawDb, name, value) {
-  rawDb.exec(`PRAGMA ${name} = ${value}`);
-}
+export const setPragma = (rawDb, name, value) => rawDb.exec(`PRAGMA ${name} = ${value}`);
 
 /** 读 PRAGMA 当前值；直接复用 getRow 抹平两种驱动的差异 */
-export function getPragma(rawDb, name) {
-  return getRow(rawDb, `PRAGMA ${name}`);
-}
+export const getPragma = (rawDb, name) => getRow(rawDb, `PRAGMA ${name}`);
 
 /* ------------------------------------------------------------------ */
 /* 原生语句执行（参数统一为数组）                                       */
 /* ------------------------------------------------------------------ */
 
 /** 执行 DDL / 多语句 */
-export function execRaw(rawDb, sql) {
-  rawDb.exec(sql);
-}
+export const execRaw = (rawDb, sql) => rawDb.exec(sql);
 
 /** 取单行 */
-export function getRow(rawDb, sql, params = []) {
-  return isBun ? rawDb.query(sql).get(params) : rawDb.prepare(sql).get(params);
-}
+export const getRow = (rawDb, sql, params = []) =>
+  isBun ? rawDb.query(sql).get(params) : rawDb.prepare(sql).get(params);
 
 /** 取全部行 */
-export function allRows(rawDb, sql, params = []) {
-  return isBun ? rawDb.query(sql).all(params) : rawDb.prepare(sql).all(params);
-}
+export const allRows = (rawDb, sql, params = []) =>
+  isBun ? rawDb.query(sql).all(params) : rawDb.prepare(sql).all(params);
 
 /** 等价 better-sqlite3 的 .pluck().all()：只取每行首列 */
-export function pluckAll(rawDb, sql, params = []) {
-  return allRows(rawDb, sql, params).map((row) => Object.values(row)[0]);
-}
+export const pluckAll = (rawDb, sql, params = []) =>
+  allRows(rawDb, sql, params).map((row) => Object.values(row)[0]);
 
 /** 预编译一条语句（bun 的 query 自带字节码缓存，正好替代手工复用 prepare 的优化） */
-export function prepareStmt(rawDb, sql) {
-  return isBun ? rawDb.query(sql) : rawDb.prepare(sql);
-}
+export const prepareStmt = (rawDb, sql) => (isBun ? rawDb.query(sql) : rawDb.prepare(sql));
 
 /** 执行预编译语句（写），返回 { lastInsertRowid, changes } */
-export function runStmt(stmt, params = []) {
-  return stmt.run(params);
-}
+export const runStmt = (stmt, params = []) => stmt.run(params);
 
 /** 事务：两种驱动都是 db.transaction(fn) 返回可调用包装 */
-export function transaction(rawDb, fn) {
-  return rawDb.transaction(fn);
-}
+export const transaction = (rawDb, fn) => rawDb.transaction(fn);
 
 /* ------------------------------------------------------------------ */
 /* 连接状态                                                            */
 /* ------------------------------------------------------------------ */
 
 /** 关闭连接（Bun 的 close 后状态位不更新，故用幂等 try/catch，不依赖状态判断） */
-export function closeDb(rawDb) {
+export const closeDb = (rawDb) => {
   try {
     rawDb.close();
   } catch {
     /* 已关闭或无需关闭 */
   }
-}
+};
 
 /** 是否仍处于打开状态（better-sqlite3 用 .open；Bun 无该属性，用 SELECT 1 探测） */
-export function isOpen(rawDb) {
+export const isOpen = (rawDb) => {
   if (isBun) {
     try {
       rawDb.query('SELECT 1').get();
@@ -144,7 +126,7 @@ export function isOpen(rawDb) {
     }
   }
   return rawDb.open;
-}
+};
 
 /* ------------------------------------------------------------------ */
 /* 引擎能力探测                                                        */
@@ -154,13 +136,13 @@ export function isOpen(rawDb) {
  * SQLite 引擎版本（日志与能力判定用）。
  * @returns {string} 形如 '3.50.4'；查询失败时返回 'unknown'
  */
-function sqliteVersion(rawDb) {
+const sqliteVersion = (rawDb) => {
   try {
     return String(getRow(rawDb, 'SELECT sqlite_version() AS v')?.v ?? 'unknown');
   } catch {
     return 'unknown';
   }
-}
+};
 
 let ftsCapsCache = null;
 
@@ -171,7 +153,7 @@ let ftsCapsCache = null;
  * @returns {{ sqliteVersion: string, contentlessDelete: boolean, detailNone: boolean,
  *             detailColumn: boolean, threads: number|null }}
  */
-export function probeFtsCapabilities() {
+export const probeFtsCapabilities = () => {
   if (ftsCapsCache) return ftsCapsCache;
 
   const raw = openDatabase(':memory:');
@@ -205,4 +187,4 @@ export function probeFtsCapabilities() {
     closeDb(raw);
   }
   return ftsCapsCache;
-}
+};

@@ -7,17 +7,17 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { sql } from 'drizzle-orm';
-import { createMagnetDb, normalizeSearchQuery } from '../src/db.js';
+import { createMagnetDb } from '../src/db.js';
+import { normalizeSearchQuery } from '../src/search/query.js';
 import { runtimeStats } from '../src/stats.js';
 import { MAX_LIMIT } from '../src/store.js';
 import { INDEX_FORMAT } from '../src/index/ddl.js';
-import { createIndexTimer } from '../src/index/timing.js';
+import { IndexTimer } from '../src/index/timing.js';
 import { openDatabase, setPragma, execRaw, closeDb, allRows } from '../src/db-driver.js';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HERE = import.meta.dirname;
 const SMOKE_DB = path.join(HERE, 'data', 'smoke.db');
 const SMOKE_INDEX = path.join(HERE, 'data', 'smoke.search.db');
 
@@ -658,8 +658,6 @@ console.log('\n[15b] 索引格式版本变更时，增量同步自动改跑全�
 }
 
 // 放在最后一个：本段会主动制造维护失败（源库缺列），验证 reject 与状态机复位。
-// 注：执行载体统一为 spawn 子进程后，原先 worker.terminate() 在 Node 退出阶段偶发的
-// V8 fatal（DisposeIsolate）已消失；此处保留在末尾只为维持既有用例顺序。
 console.log('\n[15c] 数据水位与数据同事务推进（断点续跑幂等的基础）');
 {
   const index = idxFor('15c');
@@ -770,7 +768,7 @@ console.log('\n[16] 源库 schema 校验 + 维护失败传播');
 
 console.log('\n[16b] 索引分段计时器（exclude 只记净耗时，各段互斥可直接相加）');
 {
-  const t = createIndexTimer();
+  const t = new IndexTimer();
   t.measure('inner', () => {
     const s = performance.now();
     while (performance.now() - s < 20); // 忙等 20ms，保证 inner 明显大于 0

@@ -20,19 +20,21 @@ export const TOKEN_PATTERN = /[\p{L}\p{N}]+/gu;
  * @param {number} max
  * @returns {number}
  */
-export function clampInt(value, fallback, min, max) {
+export const clampInt = (value, fallback, min, max) => {
   const num = Number(value);
   if (!Number.isFinite(num)) return fallback;
   return Math.min(Math.max(Math.floor(num), min), max);
-}
+};
+
+/** 是否含字母或数字（normalizeKeyword 的有效性判据） */
+const KEYWORD_HAS_ALNUM = /[\p{L}\p{N}]/u;
 
 /**
  * 归一化热词 / 过滤词：去首尾空白 + 小写折叠；不含字母或数字时返回空串。
  * @param {unknown} term
  * @returns {string} 归一化后的词；无效输入返回空串
  */
-const KEYWORD_HAS_ALNUM = /[\p{L}\p{N}]/u;
-export function normalizeKeyword(term) {
+export const normalizeKeyword = (term) => {
   const t = String(term ?? '').trim().toLowerCase();
   return KEYWORD_HAS_ALNUM.test(t) ? t : '';
-}
+};

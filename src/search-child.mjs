@@ -9,11 +9,11 @@
  */
 import { openDatabase, createDrizzle, setPragma } from './db-driver.js';
 import { CONFIG, resolveDbPath, DEFAULT_INDEX_DB_PATH, DEFAULT_FILES_DB_PATH } from './store.js';
-import { buildSearchApi } from './db.js';
+import { buildSearchApi } from './search/api.js';
 import { openFilesDb } from './index/files-store.js';
 import { SEARCH_WORKER_FLAG } from './worker-flags.js';
 
-function main() {
+const main = () => {
   const indexPath = resolveDbPath(
     // 优先用主进程经环境变量传来的实际索引路径（见 searchPool.js），
     // 否则与主进程一致：取 config.js 的 indexDbPath（CONFIG 恒非空，env 兜底永不生效）
@@ -71,7 +71,7 @@ function main() {
       });
     }
   });
-}
+};
 
 // 只有被显式标记为搜索子进程时才执行（fork / exe 自拉起都带此标记）
 if (process.argv.includes(SEARCH_WORKER_FLAG)) main();

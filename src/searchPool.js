@@ -11,15 +11,15 @@
  *
  * 取消是两级的：仍在队列中直接移除；已派发则 SIGKILL 该进程。
  */
-import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { log } from './logger.js';
 import { clampInt } from './util.js';
 import { spawnChild } from './child-process.js';
 import { SEARCH_WORKER_FLAG } from './worker-flags.js';
 
-const CHILD_PATH = fileURLToPath(new URL('./search-child.mjs', import.meta.url));
+const CHILD_PATH = path.join(import.meta.dirname, 'search-child.mjs');
 
-export class SearchExecutor {
+class SearchExecutor {
   /**
    * @param {object} opts
    * @param {number} [opts.maxProcesses=2]       最大并发进程数
@@ -218,7 +218,6 @@ export class SearchExecutor {
         return;
       }
       // queueMax=0 语义为「不排队」：仅当有空闲槽位或还能扩容时立即执行，否则快速失败。
-      // （旧实现 `queue.length >= 0` 恒真，会把所有请求无差别拒绝）
       const canRunNow =
         this.pool.some((s) => !s.busy && !s.dead) || this.pool.length < this.maxProcesses;
       const saturated = this.queueMax === 0 ? !canRunNow : this.queue.length >= this.queueMax;
@@ -316,6 +315,4 @@ export class SearchExecutor {
   }
 }
 
-export function createSearchExecutor(options) {
-  return new SearchExecutor(options);
-}
+export const createSearchExecutor = (options) => new SearchExecutor(options);

@@ -28,13 +28,13 @@ export const INDEX_DB_PATH = 'data/dht.search.db';
 
 /**
  * 冷库路径：files 原文与预览小列存这里（都是「按 id 点查、列表路径不碰」的大对象）。
- * 拆分后热库只放检索/排序/筛选要用的窄列，随机主键回查从磁盘 IO 变成缓存命中
- * （313 万行实测：宽词列排序 30s → 1.4s）。可指向另一块盘。
+ * 拆分后热库只放检索/排序/筛选要用的窄列，随机主键回查从磁盘 IO 变成缓存命中。
+ * 可指向另一块盘。
  */
 export const FILES_DB_PATH = 'data/dht.files.db';
 
 /**
- * 冷库 files 是否压缩存储（zlib level 1，实测约 5× 压缩率）。
+ * 冷库 files 是否压缩存储（zlib level 1）。
  * 只在「查看全部文件」时付一次解压开销，列表检索完全不受影响。
  */
 export const FILES_COMPRESS = true;

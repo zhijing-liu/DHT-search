@@ -10,12 +10,11 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { KEYWORD_FILTER_TABLE, DEFAULT_INDEX_DB_PATH } from '../src/store.js';
 import { openDatabase, setPragma, execRaw, prepareStmt, runStmt, transaction, closeDb, getRow } from '../src/db-driver.js';
-import { normalizeKeyword } from '../src/db.js';
+import { normalizeKeyword } from '../src/util.js';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HERE = import.meta.dirname;
 const WORDS_FILE = path.join(HERE, 'hot-filter-words.txt');
 // 索引库路径：环境变量优先，否则用 db.js 的默认路径（data/dht.search.db）
 const indexPath = path.resolve(process.env.DHT_INDEX_DB_PATH || DEFAULT_INDEX_DB_PATH);

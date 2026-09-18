@@ -24,7 +24,7 @@ const DEFAULT_STDIO = ['ignore', 'inherit', 'inherit', 'ipc'];
  * @param {string[]} [opts.stdio]  stdio 配置，默认 [ignore, inherit, inherit, ipc]
  * @returns {import('node:child_process').ChildProcess} 已挂上 ipc 通道的子进程
  */
-export function spawnChild({ entryPath, flag, env = process.env, heapMb = 0, stdio = DEFAULT_STDIO }) {
+export const spawnChild = ({ entryPath, flag, env = process.env, heapMb = 0, stdio = DEFAULT_STDIO }) => {
   const args = [];
   const heap = Number(heapMb);
   if (Number.isFinite(heap) && heap > 0) {
@@ -37,4 +37,4 @@ export function spawnChild({ entryPath, flag, env = process.env, heapMb = 0, std
   // 标记为执行体子进程：它们继承父控制台，代码页已由父进程设置好，
   // logger 据此跳过重复的 chcp（见 logger.js）。
   return spawn(process.execPath, args, { stdio, env: { ...env, DHT_WORKER_CHILD: '1' } });
-}
+};

@@ -8,14 +8,13 @@
  *   - 索引与排序约定    TOKENIZER / DEFAULT_LIMIT / MAX_LIMIT / SORT_COLUMNS
  * 查询实现细节在 search/query.js，token 规则在 util.js，DDL 与老库补列在 index/ddl.js。
  *
- * 双库分工（v4 起）：
+ * 双库分工：
  *   热库（INDEX_DB_PATH）—— magnets_docs（窄表：只放检索/排序/筛选要用的列）+ magnets_fts
  *   冷库（FILES_DB_PATH）—— magnets_files（files 原文）+ magnets_preview（预览小列）
  *   拆分理由见 src/index/files-store.js 文件头；清单策略是「扫描路径绝不触碰大列」。
  */
 
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { isCompiledExe } from './db-driver.js';
 import {
   SOURCE_DB_PATH,
@@ -42,7 +41,7 @@ import {
   FILES_REWRITE_ON_REBUILD,
 } from './settings.js';
 
-const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const MODULE_DIR = import.meta.dirname;
 /**
  * 根基准目录：相对路径（config.js 的 data/… 路径项）都以它为基。
  * 源码态是仓库根；编译产物（bun --compile）内 import.meta.url 指向虚拟文件系统，
@@ -82,10 +81,10 @@ export const CONFIG = {
 };
 
 /** 把配置里的库路径解析为绝对路径：绝对路径原样使用，相对路径基于项目根目录 */
-export function resolveDbPath(p) {
+export const resolveDbPath = (p) => {
   if (!p) return p;
   return path.isAbsolute(p) ? p : path.join(ROOT_DIR, p);
-}
+};
 
 /** 源库（其他应用写入）默认路径 */
 export const DEFAULT_DB_PATH = path.join(ROOT_DIR, 'data', 'magnet.db');
@@ -130,8 +129,7 @@ export const STATE_TABLE = 'sync_meta';
  * 「只取排序列」的扫描（count + 大小筛选、列排序回退形状）停在记录头部。
  *
  * **不含 files 与 preview 两个大列**：它们在冷库（见 FILES_TABLE / PREVIEW_TABLE）。
- * 这是 v4 提速的根本——窄表让 313 万行的副本表从 8.8GB 降到 ~0.7GB，随机主键回查
- * 从磁盘 IO 变成缓存命中。
+ * 窄表使随机主键回查从磁盘 IO 变成缓存命中。
  */
 export const DOCS_COLUMN_DEFS = Object.freeze([
   ['id', 'INTEGER PRIMARY KEY'],
@@ -144,7 +142,7 @@ export const DOCS_COLUMN_DEFS = Object.freeze([
 ]);
 
 /** 列名数组（顺序即 DDL 顺序） */
-export const DOCS_COLUMN_NAMES = Object.freeze(DOCS_COLUMN_DEFS.map(([name]) => name));
+const DOCS_COLUMN_NAMES = Object.freeze(DOCS_COLUMN_DEFS.map(([name]) => name));
 
 /**
  * 索引期派生列：源库没有这些列，由 index/transform.js 在索引时算出。
@@ -164,8 +162,7 @@ export const RECORD_COLUMNS = [
 
 /**
  * 列表路径取列：副本表全列，带 `m.` 前缀（检索 SQL 的别名指向副本表）。
- * v4 起副本表已是窄表，不再需要 CASE 回退去读 files；preview 不在其中——
- * 它由冷库按页回查后附着（见 search/api.js 的 attachPreviews）。
+ * preview 不在其中——它由冷库按页回查后附着（见 search/api.js 的 attachPreviews）。
  */
 export const DOCS_LIST_SELECT = DOCS_COLUMN_NAMES.map((name) => `m.${name}`).join(', ');
 

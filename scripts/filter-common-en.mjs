@@ -8,11 +8,10 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { KEYWORD_TABLE, KEYWORD_FILTER_TABLE, DEFAULT_INDEX_DB_PATH } from '../src/store.js';
 import { openDatabase, setPragma, allRows, pluckAll, closeDb } from '../src/db-driver.js';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HERE = import.meta.dirname;
 const indexPath = path.resolve(process.env.DHT_INDEX_DB_PATH || DEFAULT_INDEX_DB_PATH);
 const commonPath = path.join(HERE, '..', 'data', 'common-english.txt');
 const outPath = path.join(HERE, 'hot-filter-en.auto.txt');

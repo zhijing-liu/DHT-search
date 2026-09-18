@@ -20,9 +20,8 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HERE = import.meta.dirname;
 const ROOT = path.resolve(HERE, '..');
 const TEST_DATA = path.join(ROOT, 'test', 'data');
 

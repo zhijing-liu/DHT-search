@@ -21,7 +21,7 @@ import { INDEX_WORKER_FLAG } from './worker-flags.js';
 const DBG = process.env.DHT_REINDEX_DEBUG === '1';
 const trace = (...args) => { if (DBG) console.log('[reindex-worker]', ...args); };
 
-function main() {
+const main = () => {
   const { sourcePath, indexPath, filesPath, mode } = JSON.parse(process.env.DHT_REINDEX_JOB || '{}');
   trace(`执行体启动 mode=${mode} indexPath=${indexPath} filesPath=${filesPath}`);
 
@@ -64,7 +64,7 @@ function main() {
     // 结果已发出，稍作停留让 IPC 帧冲刷完毕后自行退出，进程不残留
     setTimeout(() => process.exit(0), 100);
   }
-}
+};
 
 // 只认命令行标记：被普通 import 时 main() 不执行
 if (process.argv.includes(INDEX_WORKER_FLAG)) main();

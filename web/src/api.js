@@ -4,26 +4,26 @@
  */
 
 /** 解析响应；非 2xx 抛错，错误信息优先取后端返回的 error 字段 */
-async function toJson(resp) {
+const toJson = async (resp) => {
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.error || String(resp.status));
   return data;
-}
+};
 
 /** GET + query 参数 */
-function get(path, params, signal) {
+const get = (path, params, signal) => {
   const qs = new URLSearchParams(params ?? {}).toString();
   return fetch(`${path}${qs ? `?${qs}` : ''}`, { signal }).then(toJson);
-}
+};
 
 /** JSON body 的 POST */
-function post(path, body) {
+const post = (path, body) => {
   return fetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   }).then(toJson);
-}
+};
 
 /* ---------- 检索 ---------- */
 
@@ -80,7 +80,7 @@ export const syncIndex = () => post('api/sync');
  * @param {() => void} onError 连接中断（EventSource 自带重连）
  * @returns {EventSource} 由调用方负责 close()
  */
-export function openStatsStream(onStats, onError) {
+export const openStatsStream = (onStats, onError) => {
   const source = new EventSource('api/stats/stream');
   source.addEventListener('stats', (e) => {
     try {
@@ -91,4 +91,4 @@ export function openStatsStream(onStats, onError) {
   });
   source.onerror = onError;
   return source;
-}
+};

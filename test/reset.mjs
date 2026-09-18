@@ -10,10 +10,9 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HERE = import.meta.dirname;
 const ROOT = path.resolve(HERE, '..');
 const SCRIPT = path.join(ROOT, 'scripts', 'reset.mjs');
 const DIR = path.join(HERE, 'data', 'reset-case');

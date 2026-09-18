@@ -14,10 +14,11 @@
  */
 
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cron from 'node-cron';
-import { createMagnetDb, normalizeSearchQuery, normalizeLatestQuery, normalizeKeyword } from './src/db.js';
+import { createMagnetDb } from './src/db.js';
+import { normalizeSearchQuery, normalizeLatestQuery } from './src/search/query.js';
+import { normalizeKeyword } from './src/util.js';
 import { createSearchExecutor } from './src/searchPool.js';
 import { createAccessControl } from './src/accessControl.js';
 import { isCompiledExe } from './src/db-driver.js';
@@ -38,9 +39,7 @@ import {
 } from './src/stats.js';
 
 // 编译产物（bun --compile）内 import.meta.url 指向虚拟文件系统，静态资源取 exe 同目录的 public/
-const __dirname = isCompiledExe
-  ? path.dirname(process.execPath)
-  : path.dirname(fileURLToPath(import.meta.url));
+const __dirname = isCompiledExe ? path.dirname(process.execPath) : import.meta.dirname;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 // 端口唯一来源是 config.js
@@ -213,7 +212,7 @@ function apiHandler(fn, status = 500, defaultMessage = INTERNAL_ERROR) {
   };
 }
 
-// 站点根（或前缀根）统一落到 index.html；PREFIX='' 时行为与原来一致
+// 站点根（或前缀根）统一落到 index.html
 app.get('/', (_req, res) => res.redirect(`${PREFIX}/index.html`));
 
 // 静态资源与 API 一样经前缀剥除中间件后在此命中（不带前缀的直连路径也可用）
@@ -336,7 +335,7 @@ app.get('/api/latest', apiHandler(async (req, res) => {
   // 为空时先懒加载一次。子进程侧缺失该值会自动回退自算，故直接调用仍安全。
   if (indexedCountCache.value == null) syncIndexedCount();
   await runQuery(req, res, {
-    params: { ...s, mode: 'latest', total: indexedCountCache.value ?? undefined },
+    params: { ...s, mode: 'latest', total: indexedCountCache.value },
     key: latestCacheKey(s),
     describe: describeLatest(s),
   });

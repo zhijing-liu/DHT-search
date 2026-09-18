@@ -40,6 +40,4 @@ export const toastStore = {
  * 弹出提示。经 Alpine store 代理写入，保证响应式生效；
  * Alpine 未启动时（极早期调用）退化为直接写原对象。
  */
-export function showToast(message) {
-  (Alpine.store('toast') || toastStore).push(message);
-}
+export const showToast = (message) => (Alpine.store('toast') || toastStore).push(message);

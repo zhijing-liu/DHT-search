@@ -13,11 +13,10 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { openDatabase, closeDb, execRaw } from '../src/db-driver.js';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HERE = import.meta.dirname;
 const DATA_DIR = path.join(HERE, 'data');
 const SRC = path.join(DATA_DIR, 'bench-src.db');
 const CHILD = path.join(HERE, 'bench-child.mjs');

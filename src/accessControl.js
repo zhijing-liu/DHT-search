@@ -14,7 +14,7 @@ import { log } from './logger.js';
  * 拒绝页（整页内联，无外部资源）：白名单挡下时给用户可读的页面，而非裸 403 文本。
  * @param {string} rawIp 客户端地址（仅作文本展示，已做 HTML 转义）
  */
-function deniedPage(rawIp) {
+const deniedPage = (rawIp) => {
   const ip = String(rawIp ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
@@ -58,36 +58,36 @@ function deniedPage(rawIp) {
   </div>
 </body>
 </html>`;
-}
+};
 
 /** 去掉 IPv6 字面量可能携带的方括号与端口（[2001:db8::1]:3000 → 2001:db8::1） */
-function stripPort(raw) {
+const stripPort = (raw) => {
   const s = String(raw ?? '').trim();
   if (!s.startsWith('[')) return s;
   const end = s.indexOf(']');
   return end === -1 ? s : s.slice(1, end);
-}
+};
 
 /**
  * 解析客户端地址；非法输入返回 null（不抛错，调用方按「不命中」处理）。
  * process() 会把 IPv4 映射 IPv6（::ffff:a.b.c.d）归一化成 IPv4，
  * 于是「客户端报 ::ffff:192.168.1.5、白名单写 192.168.0.0/16」能正确命中。
  */
-function parseAddr(raw) {
+const parseAddr = (raw) => {
   if (!raw) return null;
   try {
     return ipaddr.process(stripPort(raw));
   } catch {
     return null;
   }
-}
+};
 
 /**
  * 解析白名单规则（精确 IP 或 CIDR）为 [地址, 前缀长度] 元组；非法返回 null。
  * 必须产出元组：ipaddr 的 match() 只接受 [address, prefixLength] 或两个参数。
  * 地址与 CIDR 基地址都先做 IPv4 映射归一化，映射形式的前缀同步减去 96。
  */
-function parseRule(raw) {
+const parseRule = (raw) => {
   const s = stripPort(raw);
   if (!s) return null;
   try {
@@ -104,29 +104,29 @@ function parseRule(raw) {
   } catch {
     return null;
   }
-}
+};
 
 /** 地址是否命中某条已解析规则（协议族不同时 ipaddr.match 直接判否） */
-function matches(addr, rule) {
+const matches = (addr, rule) => {
   try {
     return addr.match(rule);
   } catch {
     return false;
   }
-}
+};
 
 /**
  * 判断地址（字符串）是否命中规则（字符串）。供中间件与单测复用。
  * @param {string} addr  客户端地址（支持 ::ffff: 映射 IPv6）
  * @param {string} rule  白名单规则（精确 IP 或 CIDR）
  */
-export function ipMatches(addr, rule) {
+export const ipMatches = (addr, rule) => {
   const a = parseAddr(addr);
   if (!a) return false;
   const r = parseRule(rule);
   if (!r) return false;
   return matches(a, r);
-}
+};
 
 /**
  * 构造接入层访问控制中间件。
@@ -135,7 +135,7 @@ export function ipMatches(addr, rule) {
  * @param {string[]} opts.allowed  允许访问的 IP / CIDR 清单
  * @returns {import('express').RequestHandler}
  */
-export function createAccessControl({ mode = 'off', allowed = [] } = {}) {
+export const createAccessControl = ({ mode = 'off', allowed = [] } = {}) => {
   const enabled = mode === 'ip-whitelist';
   const rules = enabled
     ? (Array.isArray(allowed) ? allowed : []).map(parseRule).filter(Boolean)
@@ -145,7 +145,7 @@ export function createAccessControl({ mode = 'off', allowed = [] } = {}) {
     log.warn('[ACCESS] 白名单模式已开启但规则为空，将拒绝全部请求（请检查 ALLOWED_CLIENTS）');
   }
 
-  return function accessControl(req, res, next) {
+  return (req, res, next) => {
     // 关闭模式：直接放行
     if (!enabled) return next();
 
@@ -164,6 +164,6 @@ export function createAccessControl({ mode = 'off', allowed = [] } = {}) {
     log.warn(`[ACCESS] 拒绝 ${rawIp || '(未知)'} ${req.method} ${req.originalUrl}`);
     res.status(403).type('text/html; charset=utf-8').send(deniedPage(rawIp));
   };
-}
+};
 
 export default createAccessControl;

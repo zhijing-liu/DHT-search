@@ -21,7 +21,7 @@ const PREVIEW_MAX_FILES = 8;
  * @param {string|null|undefined} rawFiles 源库 files 列原文
  * @returns {{ ftsText: string, fileCount: number, preview: string }}
  */
-export function transformFiles(rawFiles) {
+export const transformFiles = (rawFiles) => {
   if (rawFiles === null || rawFiles === undefined) return { ftsText: '', fileCount: 0, preview: '' };
 
   let parsed;
@@ -57,4 +57,4 @@ export function transformFiles(rawFiles) {
     paths.push(p);
   }
   return { ftsText: paths.join('\n'), fileCount, preview };
-}
+};

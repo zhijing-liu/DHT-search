@@ -118,7 +118,7 @@ const EMPTY_STATS = {
 };
 
 /** 读取地址栏状态：视图类型取自 hash（#latest），检索状态取自 query string */
-function readUrlParams() {
+const readUrlParams = () => {
   const params = new URLSearchParams(location.search);
   return {
     view: location.hash.replace(/^#/, ''),
@@ -130,9 +130,9 @@ function readUrlParams() {
     sizeRange: params.get('sizeRange'),
     searchIn: params.get('searchIn'),
   };
-}
+};
 
-export function registerApp() {
+export const registerApp = () => {
   Alpine.data('searchPage', () => ({
     ICONS,
 
@@ -425,7 +425,7 @@ export function registerApp() {
         if (seq !== this._seq) return; // 已有更新的请求，丢弃本次
 
         this.total = Number(data.total) || 0;
-        // 每条结果带一个本次请求唯一的 key，翻页时整批重建卡片（与旧实现一致）
+        // 每条结果带一个本次请求唯一的 key，翻页时整批重建卡片
         this.items = (data.items || []).map((item, i) => ({ ...item, key: `${seq}-${i}` }));
         this.resultsVisible = true;
         this.stopLoading();
@@ -1043,4 +1043,4 @@ export function registerApp() {
       this.showBrowseView();
     },
   }));
-}
+};

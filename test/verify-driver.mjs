@@ -13,7 +13,6 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { sql } from 'drizzle-orm';
 import {
   isBun,
@@ -33,7 +32,7 @@ import {
   isOpen,
 } from '../src/db-driver.js';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HERE = import.meta.dirname;
 const TMP = path.join(HERE, 'data', 'verify-driver.tmp.db');
 for (const s of ['', '-wal', '-shm']) {
   try {

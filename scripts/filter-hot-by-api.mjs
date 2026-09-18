@@ -14,7 +14,7 @@
  * 用法：node scripts/filter-hot-by-api.mjs [limit]
  * 默认 limit=1000（接口单页上限）。脚本会先打印分类明细，再入库。
  */
-import { normalizeKeyword } from '../src/db.js';
+import { normalizeKeyword } from '../src/util.js';
 
 const BASE = process.env.DHT_BASE_URL || 'http://127.0.0.1:3000/dht';
 const LIMIT = Math.min(Math.max(Number(process.argv[2]) || 1000, 1), 1000);

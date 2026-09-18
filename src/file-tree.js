@@ -16,7 +16,7 @@
  * 判定层级分隔符（'' = 不拆分）：优先 '/'；其次 ','，但仅当「首段」被多个文件共用时
  * 才算目录分隔符（文件名本身带逗号时首段各不相同，不会被误判成层级）。
  */
-function detectSeparator(paths) {
+const detectSeparator = (paths) => {
   if (paths.some((p) => p.includes('/'))) return '/';
 
   const heads = new Map();
@@ -34,12 +34,10 @@ function detectSeparator(paths) {
   let shared = 0;
   for (const n of heads.values()) if (n > 1) shared += n;
   return shared * 2 > commaFiles ? ',' : '';
-}
+};
 
 /** 同父下的节点唯一键：目录与文件共用同一命名空间（与前端 Map<name, node> 的语义一致） */
-function keyOf(parent, name) {
-  return `${parent}\u0000${name}`;
-}
+const keyOf = (parent, name) => `${parent}\u0000${name}`;
 
 /**
  * 把 [{ path, size }]（或单个对象）还原成扁平树数组；目录大小已按子孙累加好。
@@ -47,7 +45,7 @@ function keyOf(parent, name) {
  * @param {Array|object|null} files 源库 files 原文解析结果
  * @returns {Array<{ name: string, parent: number, isDir: boolean, size: number, path?: string }>}
  */
-export function buildFlatTree(files) {
+export const buildFlatTree = (files) => {
   const list = Array.isArray(files) ? files : files && typeof files === 'object' ? [files] : [];
   if (list.length === 0) return [];
 
@@ -95,4 +93,4 @@ export function buildFlatTree(files) {
     if (n.parent >= 0) nodes[n.parent].size += n.size;
   }
   return nodes;
-}
+};

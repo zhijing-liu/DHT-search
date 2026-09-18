@@ -37,7 +37,7 @@ const DEFAULT_LATEST_LIMIT = 30;
  * @param {string} [field] 限定检索字段：'name' 只搜 name 列；不传/其它值搜全部列（name+files）
  * @returns {string|null} 清洗后的 MATCH 表达式；无有效 token 时返回 null
  */
-export function buildMatchExpression(input, field) {
+export const buildMatchExpression = (input, field) => {
   if (input === null || input === undefined) return null;
   const tokens = String(input).match(TOKEN_PATTERN);
   if (!tokens || tokens.length === 0) return null;
@@ -51,7 +51,7 @@ export function buildMatchExpression(input, field) {
     .join(' AND ');
   // 只搜 name 列：用列过滤语法 `name:(...)` 把整段表达式限定到该列（FTS5 虚表列名即 name/files）
   return field === 'name' ? `name:(${inner})` : inner;
-}
+};
 
 /**
  * 归一化 limit。
@@ -60,7 +60,7 @@ export function buildMatchExpression(input, field) {
  * - 缺省 / null / 非数值 / <= 0 → DEFAULT_LIMIT
  * - 其余 → 钳制到 [1, MAX_LIMIT]
  */
-function toLimit(value) {
+const toLimit = (value) => {
   if (value === undefined || value === null) return DEFAULT_LIMIT;
   // -1 是「整集拉取」的内部标记（由本函数或 'all' 产生），必须原样保留：
   // normalizeSearchQuery 是幂等的、各层会重复调用它，若把 -1 当成「负数 → 分页」，
@@ -71,18 +71,17 @@ function toLimit(value) {
   const num = Number(text);
   if (!Number.isFinite(num) || num <= 0) return DEFAULT_LIMIT;
   return clampInt(num, DEFAULT_LIMIT, 1, MAX_LIMIT);
-}
+};
 
 /** 归一化大小筛选（字节）：非有限值或负数一律视为「不限制」 */
-function toSize(value) {
+const toSize = (value) => {
   const num = Number(value);
   return Number.isFinite(num) && num >= 0 ? num : undefined;
-}
+};
 
 /** 由已校验的 sortBy / order 取白名单内的 ORDER BY 片段 */
-export function orderSqlFor({ sortBy, order }) {
-  return ORDER_SQL[sortBy ? `${sortBy}:${order}` : `id:${order}`];
-}
+export const orderSqlFor = ({ sortBy, order }) =>
+  ORDER_SQL[sortBy ? `${sortBy}:${order}` : `id:${order}`];
 
 /**
  * 检索参数归一化——HTTP 层与数据层共用的唯一入口（幂等）：把任意来源的原始输入
@@ -96,7 +95,7 @@ export function orderSqlFor({ sortBy, order }) {
  *   limit 为 -1 表示整集拉取；cursor 为 keyset 深翻页游标（opaque token，原样回传）；
  *   searchIn 为 'name' 时只搜 name 列，其它/缺省搜全部列（name+files）
  */
-export function normalizeSearchQuery(raw = {}) {
+export const normalizeSearchQuery = (raw = {}) => {
   const source = raw ?? {};
   // HTTP 查询串的值可能是数组（?q=a&q=b），取首个而不是静默丢弃为空串
   const rawQuery = Array.isArray(source.query) ? source.query[0] : source.query;
@@ -117,7 +116,7 @@ export function normalizeSearchQuery(raw = {}) {
         ? source.cursor
         : undefined,
   };
-}
+};
 
 /**
  * 「最新入库」参数归一化——只有分页（列表固定按 id 倒序，不支持关键词 / 排序 / 过滤，
@@ -125,7 +124,7 @@ export function normalizeSearchQuery(raw = {}) {
  * @param {object} [raw] 原始参数（Express 的 req.query 或子进程转发对象）
  * @returns {{ limit: number, offset: number }}
  */
-export function normalizeLatestQuery(raw = {}) {
+export const normalizeLatestQuery = (raw = {}) => {
   const source = raw ?? {};
   const n = Number(source.limit);
   return {
@@ -133,4 +132,4 @@ export function normalizeLatestQuery(raw = {}) {
     limit: Number.isFinite(n) && n > 0 ? clampInt(n, DEFAULT_LATEST_LIMIT, 1, MAX_LIMIT) : DEFAULT_LATEST_LIMIT,
     offset: clampInt(source.offset, 0, 0, Number.MAX_SAFE_INTEGER),
   };
-}
+};

@@ -4,9 +4,9 @@
   "description": "A self-hosted magnet link search engine built on SQLite FTS5. Dual Node/Bun runtime, background incremental indexing, on-demand search child processes, and one-command single-file exe packaging.",
   "main": "index.js",
   "scripts": {
-    "start": "node scripts/win-codepage.cjs && node index.js",
-    "dev:node": "node scripts/win-codepage.cjs && nodemon index.js",
-    "dev:bun": "node scripts/win-codepage.cjs && bun --watch index.js",
+    "start": "node scripts/win-codepage.mjs && node index.js",
+    "dev:node": "node scripts/win-codepage.mjs && nodemon index.js",
+    "dev:bun": "node scripts/win-codepage.mjs && bun --watch index.js",
     "dev:web": "npm --prefix web run dev",
     "build:web": "npm --prefix web run build",
     "build:exe": "npm run build:web && bun scripts/build-exe.mjs",
@@ -53,6 +53,9 @@
     "url": "https://github.com/zhijing-liu/DHT-search/issues"
   },
   "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "alpinejs": "^3.17.3",

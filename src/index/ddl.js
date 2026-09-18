@@ -26,15 +26,11 @@ import {
 
 /**
  * 索引格式版本：写入 sync_meta.files_format，与库中值不一致即触发一次全量重建
- * （v2：FTS 索引文本改为纯路径、docs 增加 fileCount 列、FTS5 表参数纳入探测；
- *   v3：docs 增加 preview 派生列——列表路径不再拉 files 大列；
- *   v4：files / preview 移出副本表进冷库，副本表瘦身为窄表并重排列顺序，
- *       排序索引改为 (col DESC, id DESC) 复合形式）。
+ * （用于 FTS 索引文本形态、docs 列集合、FTS5 表参数等结构性变更的自动迁移）。
  */
 export const INDEX_FORMAT = 'v4';
 
 /** FTS5 建表参数默认值（detail / columnsize 保留 full + 1：降档会使 bm25 失效） */
-
 export const DEFAULT_FTS_CAPS = Object.freeze({
   detail: 'full', // 'full' | 'column' | 'none'
   columnsize: true, // false → columnsize=0（不存每列 token 数）
@@ -57,7 +53,7 @@ const KEYWORD_STATS_DDL = `(
   )`;
 
 /** 给已存在的表补齐缺失列（老库平滑升级；新增列必须可空或带默认值） */
-function ensureColumns(db, table, columns) {
+const ensureColumns = (db, table, columns) => {
   const raw = db.$client ?? db.session?.client;
   const existing = new Set(allRows(raw, `PRAGMA table_info(${table})`).map((r) => r.name));
   for (const [name, decl] of columns) {
@@ -65,28 +61,26 @@ function ensureColumns(db, table, columns) {
     execRaw(raw, `ALTER TABLE ${table} ADD COLUMN ${name} ${decl}`);
     log.warn(`索引库 ${table} 补列 ${name}（旧库升级，历史行的新列取默认值）`);
   }
-}
+};
 
 /** 由能力快照生成 FTS5 建表参数串（跟在列名之后） */
-export function ftsOptionSql(caps = DEFAULT_FTS_CAPS) {
+export const ftsOptionSql = (caps = DEFAULT_FTS_CAPS) => {
   const parts = [`content=''`, `tokenize='${TOKENIZER}'`];
   if (caps.detail && caps.detail !== 'full') parts.push(`detail=${caps.detail}`);
   if (caps.columnsize === false) parts.push('columnsize=0');
   if (caps.contentlessDelete) parts.push('contentless_delete=1');
   return parts.join(', ');
-}
+};
 
 /** FTS5 建表语句（完整 DDL 文本，便于日志与测试断言） */
-export function ftsDdl(caps = DEFAULT_FTS_CAPS, { ifNotExists = false, table = FTS_TABLE } = {}) {
-  return `CREATE VIRTUAL TABLE ${ifNotExists ? 'IF NOT EXISTS ' : ''}${table} USING fts5(
+const ftsDdl = (caps = DEFAULT_FTS_CAPS, { ifNotExists = false, table = FTS_TABLE } = {}) =>
+  `CREATE VIRTUAL TABLE ${ifNotExists ? 'IF NOT EXISTS ' : ''}${table} USING fts5(
     name, files, ${ftsOptionSql(caps)}
   )`;
-}
 
 /** 表是否已存在（drizzle 在 Bun 下的裸 db.get() 返回行数组而非单行对象，故取 [0]） */
-export function hasTable(db, name) {
-  return db.all(sql`SELECT 1 FROM sqlite_master WHERE name = ${name}`)[0] != null;
-}
+export const hasTable = (db, name) =>
+  db.all(sql`SELECT 1 FROM sqlite_master WHERE name = ${name}`)[0] != null;
 
 /**
  * 副本表的二级索引（幂等，缺失才建）。
@@ -95,11 +89,11 @@ export function hasTable(db, name) {
  * 省掉一次反向扫描或额外排序；检索侧用 INDEXED BY 强制走它（见 search/api.js）。
  *
  * 这三个索引是「列排序快路径」的唯一保障：没有它们，planner 会退化成
- * 「取全部匹配 rowid → 逐个回表主键查找 → TEMP B-TREE 排序」，实测 30s 级。
+ * 「取全部匹配 rowid → 逐个回表主键查找 → TEMP B-TREE 排序」，宽词时极慢。
  *
  * @param {object} db drizzle 可写连接
  */
-export function ensureDocsIndexes(db) {
+export const ensureDocsIndexes = (db) => {
   for (const [col, indexName] of DOCS_INDEX_DEFS) {
     db.run(
       sql`CREATE INDEX IF NOT EXISTS ${sql.raw(indexName)}
@@ -110,7 +104,7 @@ export function ensureDocsIndexes(db) {
     sql`CREATE INDEX IF NOT EXISTS ${sql.raw(DOCS_INFOHASH_INDEX)}
         ON ${sql.raw(DOCS_TABLE)}(lower(infohash))`
   );
-}
+};
 
 /**
  * 幂等建表：全新索引库 / sync:false 打开时使用，并给老库补齐缺失列
@@ -122,7 +116,7 @@ export function ensureDocsIndexes(db) {
  *   用于「本次启动就要全量重建」的库：那种情况下建索引纯属白等（重建会重建），
  *   而它是在打开连接时同步执行的，会实打实阻塞启动。
  */
-export function ensureSchema(db, caps = DEFAULT_FTS_CAPS, { indexes = true } = {}) {
+export const ensureSchema = (db, caps = DEFAULT_FTS_CAPS, { indexes = true } = {}) => {
   // 同步水位表（drizzle 不自动建表，由 raw DDL 维护）
   db.run(sql`CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT)`);
   // 热词统计表（全量重建时会 DROP 重建，保证干净）
@@ -141,18 +135,18 @@ export function ensureSchema(db, caps = DEFAULT_FTS_CAPS, { indexes = true } = {
   // 二级索引同样幂等确保：已有索引时只是目录探查，却能让「全新库 / 索引被删掉的旧库」
   // 一打开就具备列排序快路径，不必等下一次重建
   if (indexes) ensureDocsIndexes(db);
-}
+};
 
 /**
  * 重建用：清空并重建 FTS / docs / keyword_stats。
  * 调用方必须把它包在同一个事务里：DROP 与 CREATE 分处两个事务会让并发查询看到
  * 「表已 DROP、尚未 CREATE」的中间态（no such table）。
  */
-export function resetIndexTables(db, caps = DEFAULT_FTS_CAPS) {
+export const resetIndexTables = (db, caps = DEFAULT_FTS_CAPS) => {
   db.run(sql`DROP TABLE IF EXISTS ${sql.raw(FTS_TABLE)}`);
   db.run(sql.raw(ftsDdl(caps)));
   db.run(sql`DROP TABLE IF EXISTS ${sql.raw(DOCS_TABLE)}`);
   db.run(sql`CREATE TABLE ${sql.raw(DOCS_TABLE)} ${sql.raw(DOCS_COLUMNS_DDL)}`);
   db.run(sql`DROP TABLE IF EXISTS ${sql.raw(KEYWORD_TABLE)}`);
   db.run(sql`CREATE TABLE ${sql.raw(KEYWORD_TABLE)} ${sql.raw(KEYWORD_STATS_DDL)}`);
-}
+};

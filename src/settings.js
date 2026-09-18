@@ -13,11 +13,11 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import { isCompiledExe } from './db-driver.js';
 
 /** 源码态的两个候选配置：本地私有配置 + 随仓库分发的公共模板 */
-const LOCAL_CONFIG_PATH = fileURLToPath(new URL('../config.js', import.meta.url));
+const LOCAL_CONFIG_PATH = path.join(import.meta.dirname, '../config.js');
 
 let loaded = null;
 if (isCompiledExe) {
@@ -78,7 +78,7 @@ export const MMAP_ENABLED = ENABLE_MMAP !== false;
 
 /**
  * 冷库 files 是否压缩存储（zlib level 1）。
- * 路径文本重复度高，实测 5× 左右压缩率；只在详情接口付一次解压开销，
+ * 路径文本重复度高，压缩收益明显；只在详情接口付一次解压开销，
  * 列表路径完全不受影响。默认开启（仅显式 false 才关闭）。
  */
 export const FILES_COMPRESS_ENABLED = FILES_COMPRESS !== false;

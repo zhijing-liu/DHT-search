@@ -45,12 +45,11 @@ const COUNT_CACHE_MAX = 200;
  * keyset 游标编解码：base64url(JSON `{ v: 排序键值, i: 行id })`。v 仅列排序使用，
  * id 排序只用 i。游标是 opaque token：调用方必须原样回传上一次响应给出的 nextCursor。
  */
-function encodeCursor(v, id) {
-  return Buffer.from(JSON.stringify({ v, i: id })).toString('base64url');
-}
+const encodeCursor = (v, id) =>
+  Buffer.from(JSON.stringify({ v, i: id })).toString('base64url');
 
 /** 解码游标；非法输入直接抛错（比静默回退 offset 更利于暴露调用方 bug） */
-function decodeCursor(text) {
+const decodeCursor = (text) => {
   try {
     const o = JSON.parse(Buffer.from(String(text), 'base64url').toString('utf8'));
     if (o && Number.isFinite(o.v) && Number.isInteger(o.i) && o.i >= 0) {
@@ -60,20 +59,20 @@ function decodeCursor(text) {
     /* 落入下方统一报错 */
   }
   throw new TypeError('cursor 非法：请原样回传上一次响应的 nextCursor');
-}
+};
 
 /** 从检索词里提取「预览优先命中」用的 token（去重、小写；只做包含匹配，与 FTS 分词无关） */
-function queryTokens(query) {
+const queryTokens = (query) => {
   if (!query) return [];
   const matched = String(query).toLowerCase().match(TOKEN_PATTERN);
   return matched ? [...new Set(matched)] : [];
-}
+};
 
 /**
  * 从已解析的文件条目列表挑选预览 `[{ path, size }]`：有关键词时只保留路径命中者
  * （命中越多越靠前），否则按原顺序取前 N 条。这是列表路径上唯一读文件列表的地方。
  */
-function pickPreview(list, tokens) {
+const pickPreview = (list, tokens) => {
   const scored = [];
   for (let i = 0; i < list.length; i += 1) {
     const f = list[i];
@@ -89,10 +88,10 @@ function pickPreview(list, tokens) {
   }
   scored.sort((a, b) => b.score - a.score || a.i - b.i);
   return scored.slice(0, PREVIEW_LIMIT).map((x) => ({ path: x.path, size: x.size }));
-}
+};
 
 /** 从索引期派生的 preview 小列（前 N 条 {path,size} 的 JSON 文本）挑预览 */
-function buildStoredPreview(stored, tokens = []) {
+const buildStoredPreview = (stored, tokens = []) => {
   if (!stored) return [];
   let parsed;
   try {
@@ -101,7 +100,7 @@ function buildStoredPreview(stored, tokens = []) {
     return [];
   }
   return Array.isArray(parsed) ? pickPreview(parsed, tokens) : [];
-}
+};
 
 /**
  * 检索逻辑工厂：接收两个只读连接，返回同步检索函数。
@@ -111,18 +110,18 @@ function buildStoredPreview(stored, tokens = []) {
  *        检索子进程若不传，详情与该页预览会退化为空（检索本身仍可用）。
  * @returns {{ searchMagnetsSync: Function, listLatestSync: Function, getMagnetFilesSync: Function }}
  */
-export function buildSearchApi(dbRO, filesRO = null) {
+export const buildSearchApi = (dbRO, filesRO = null) => {
   /**
    * 给一页副本表行附着 preview（冷库按 id 批量回查，一次查询搞定整页）。
    *
    * preview 是纯「最后一公里」数据：count / 排序 / 筛选都不需要它，只有最终返回的
-   * 那几十行需要。放在冷库而不是副本表里，副本表就能保持窄表——这才是列排序从
-   * 30s 降到 1.4s 的关键（回表成本取决于副本表的页数）。
+   * 那几十行需要。放在冷库而不是副本表里，副本表就能保持窄表——这正是列排序快路径
+   * 的关键（回表成本取决于副本表的页数）。
    *
    * @param {Array<object>} rows 副本表行（不含 preview）
    * @param {string[]} tokens 查询 token（用于「命中优先」挑预览）
    */
-  function attachPreviews(rows, tokens = []) {
+  const attachPreviews = (rows, tokens = []) => {
     if (rows.length === 0) return [];
     const stored = new Map();
     if (filesRO) {
@@ -138,7 +137,7 @@ export function buildSearchApi(dbRO, filesRO = null) {
       }
     }
     return rows.map((row) => ({ ...row, preview: buildStoredPreview(stored.get(row.id), tokens) }));
-  }
+  };
   /** 整集拉取安全上限（与 config.js 的 MAX_RESULTS 对齐，配置缺失则回退 20000） */
   const WHOLESET_CAP =
     Number.isFinite(Number(MAX_RESULTS)) && Number(MAX_RESULTS) > 0 ? Number(MAX_RESULTS) : 20000;
@@ -147,7 +146,7 @@ export function buildSearchApi(dbRO, filesRO = null) {
    * 构造大小筛选片段（值已由 normalizeSearchQuery 校验为「有限非负」或 undefined）。
    * 无条件时返回空片段，调用方无需再判空。
    */
-  function buildSizeCond({ minSize, maxSize }) {
+  const buildSizeCond = ({ minSize, maxSize }) => {
     const conds = [];
     if (minSize !== undefined) conds.push(sql`m.totalSize >= ${minSize}`);
     if (maxSize !== undefined) conds.push(sql`m.totalSize <= ${maxSize}`);
@@ -155,18 +154,17 @@ export function buildSearchApi(dbRO, filesRO = null) {
     if (conds.length === 0) return sql``;
     if (conds.length === 1) return sql` AND ${conds[0]}`;
     return sql` AND ${conds[0]} AND ${conds[1]}`;
-  }
+  };
 
   /** 归一化 infohash：剥离 magnet 链接里的 urn:btih: 前缀，并去除所有非字母数字字符 */
-  function normalizeInfohash(query) {
-    return String(query ?? '')
+  const normalizeInfohash = (query) =>
+    String(query ?? '')
       .replace(/^.*urn:btih:/i, '')
       .replace(/[^a-zA-Z0-9]/g, '')
       .toLowerCase();
-  }
 
   /** FTS5 模糊检索：JOIN FTS 表，顺带剔除源库中已删除的残留索引行（保证 total 与返回数一致） */
-  function ftsWhere(query, field) {
+  const ftsWhere = (query, field) => {
     const match = buildMatchExpression(query, field);
     if (!match) {
       throw new TypeError('searchMagnets: options.query 不能为空，且需包含至少一个字母或数字');
@@ -178,10 +176,10 @@ export function buildSearchApi(dbRO, filesRO = null) {
       join: sql`JOIN ${sql.raw(FTS_TABLE)} f ON m.id = f.rowid`,
       cond: sql`${sql.raw(FTS_TABLE)} MATCH ${sql.raw(`'${match}'`)}`,
     };
-  }
+  };
 
   /** infohash 精确检索：无需 JOIN，直接匹配副本表，兼容「带/不带 hash 前缀」并支持前缀检索 */
-  function hashWhere(query) {
+  const hashWhere = (query) => {
     const raw = normalizeInfohash(query);
     if (!raw) {
       throw new TypeError('searchByHash: 未提供有效的 infohash');
@@ -190,19 +188,19 @@ export function buildSearchApi(dbRO, filesRO = null) {
       join: sql``,
       // 前缀检索用范围条件而非 LIKE：LIKE 的左操作数是 lower(...) 表达式，无法使用
       // lower(infohash) 表达式索引（SQLite 的 LIKE 优化只认裸列），会导致整个 OR 退化
-      // 成全索引扫描；换成范围条件后 OR 优化生效，三个分支各自走索引（实测 100 万行
-      // SCAN 109ms → MULTI-INDEX OR 0.1ms）。上界取 \uffff 保证覆盖所有前缀。
+      // 成全索引扫描；范围条件可走索引，使 OR 优化生效（三个分支各自走索引）。
+      // 上界取 \uffff 保证覆盖所有前缀。
       cond: sql`lower(m.infohash) = lower(${raw})
         OR lower(m.infohash) = lower(${'hash' + raw})
         OR (lower(m.infohash) >= lower(${raw}) AND lower(m.infohash) < lower(${raw + '\uffff'}))`,
     };
-  }
+  };
 
   /**
    * 由归一化参数构造 count / 分页 SQL 工厂（两种检索模式的差异只有是否 JOIN FTS 表
    * 与匹配条件，其余拼装共用。count 与 page 各针对宽泛词做了优化，见下方各处注释）。
    */
-  function prepareSearch(options) {
+  const prepareSearch = (options) => {
     const s = normalizeSearchQuery(options);
     const { join, cond } = s.by === 'hash' ? hashWhere(s.query) : ftsWhere(s.query, s.searchIn);
     const fromWhere = sql`
@@ -257,7 +255,7 @@ export function buildSearchApi(dbRO, filesRO = null) {
       // count 缓存键：同一检索词 + size 区间 + 搜索范围（name/files）的 total 相同（水位失效见 cachedTotal）
       countKey: `${s.by}|${s.query}|${s.searchIn ?? ''}|${s.minSize ?? ''}|${s.maxSize ?? ''}`,
     };
-  }
+  };
 
   /**
    * 同步检索：先 count 再取页（整集拉取则一次取到 CAP），一次性返回。
@@ -265,13 +263,13 @@ export function buildSearchApi(dbRO, filesRO = null) {
    * @returns {{ total: number, limit: number|'all', offset: number, items: Array, truncated?: boolean }}
    */
   /**
-   * count 水位缓存（D）：宽词 count 要枚举完整 doclist（50 万匹配 ≈ 秒级），而同词
+   * count 水位缓存（D）：宽词 count 要枚举完整 doclist（开销大），而同词
    * 翻页期间 total 不变。以 sync_meta 数据水位为失效依据：水位未变 ⇒ 数据未变。
-   * 读水位是一次主键查找（微秒级），远小于一次宽词 count 重算。
+   * 读水位是一次主键查找，远小于一次宽词 count 重算。
    */
   const countCache = new Map();
   /** 当前数据水位；sync_meta 不可读时返回 null（调用方据此跳过缓存写入） */
-  function readWatermark() {
+  const readWatermark = () => {
     try {
       return String(
         dbRO.all(sql`SELECT value FROM sync_meta WHERE key = ${STATE_KEYS.dataWatermark}`)[0]?.value ?? ''
@@ -279,8 +277,8 @@ export function buildSearchApi(dbRO, filesRO = null) {
     } catch {
       return null;
     }
-  }
-  function cachedTotal(key, compute) {
+  };
+  const cachedTotal = (key, compute) => {
     const wm = readWatermark();
     if (wm === null) return compute(); // sync_meta 不可读的异常环境：退化为不缓存
     const hit = countCache.get(key);
@@ -294,17 +292,17 @@ export function buildSearchApi(dbRO, filesRO = null) {
     countCache.set(key, { wm, total });
     if (countCache.size > COUNT_CACHE_MAX) countCache.delete(countCache.keys().next().value);
     return total;
-  }
+  };
 
   /**
    * 列排序第一步（A，只取 id）：INDEXED BY 强制沿排序列索引（覆盖索引，含 id）扫描，
    * IN 列表物化后走 bloom filter 做整型成员判定，凑够 LIMIT 即停。
-   * 形状决定索引价值：旧形状「IN 子查询 + ORDER BY」下 planner 走 TEMP B-TREE（物化
-   * 50 万匹配再排序，宽词 20s）；本形状宽词 166ms / 深分页 off100000 376ms / 窄词 1~5ms。
+   * 形状决定索引价值：若不加 INDEXED BY，planner 会走 TEMP B-TREE 物化全部匹配再排序
+   * （宽词极慢）；本形状下宽词与深分页都很快。
    * 投影刻意只有 id：不给 planner 任何「SELECT 含 files 大列就改写计划、逐行重跑 FTS」的机会。
-   * INDEXED BY 是硬约束（索引缺失直接报错），对缺索引的旧只读连接回退无提示形状（慢但正确）。
+   * INDEXED BY 是硬约束（索引缺失直接报错），对缺索引的只读连接回退无提示形状（慢但正确）。
    */
-  function buildColSortIds({ col, dir, cond, sizeCond, lim, off, cursor }) {
+  const buildColSortIds = ({ col, dir, cond, sizeCond, lim, off, cursor }) => {
     const op = dir === 'ASC' ? '>' : '<';
     // keyset（E）：游标模式用 (col,id) 谓词替代 OFFSET，深翻页不随页深线性变慢
     const keyset = cursor
@@ -325,17 +323,16 @@ export function buildSearchApi(dbRO, filesRO = null) {
         .all(sql`SELECT m.id FROM ${sql.raw(DOCS_TABLE)} m ${where} ${order} LIMIT ${lim} OFFSET ${off}`)
         .map((r) => r.id);
     }
-  }
+  };
 
   /**
    * TEMP 物化公共段（A）：把 FTS 匹配 rowid 物化进 TEMP 表（INTEGER PRIMARY KEY，
    * 主键探测 O(log n)），fn 在 hits 就绪后执行，结束必清表。
-   * 实测（313 万行、宽词 50 万匹配）：pluck 0.21s + 插入 0.53s；探测取页毫秒级。
    * TEMP 表需要连接允许写临时 schema：读连接开着 query_only=ON（连 temp 写入也拦），
    * 故期间临时切 OFF——主库文件本身以 readonly 模式打开，主库数据仍不可写；finally 恢复。
    * 个别驱动仍可能限制 TEMP 写入（抛错），由调用方回退通用 JOIN 路径。
    */
-  function withHits(match, fn) {
+  const withHits = (match, fn) => {
     const raw = dbRO.$client ?? dbRO.session?.client;
     execRaw(raw, 'PRAGMA query_only = OFF');
     try {
@@ -359,11 +356,11 @@ export function buildSearchApi(dbRO, filesRO = null) {
         /* 恢复失败只影响误写防护，不影响结果 */
       }
     }
-  }
+  };
 
   /** 「id 排序 + size 筛选 + 大匹配集」取页：主表沿 rowid 序扫描、逐行探测 hits 与 size
    *  条件，凑够 LIMIT 即停 —— 无 TEMP B-TREE 排序、不碰 files 大页（列表取列）。 */
-  function tempHitsPage({ match, dir, lim, off, cursor, sizeCond, tokens }) {
+  const tempHitsPage = ({ match, dir, lim, off, cursor, sizeCond, tokens }) => {
     if (!match) throw new TypeError('tempHitsPage: 缺少 MATCH 表达式');
     return withHits(match, () => {
       // keyset（E）：id 排序的游标就是 rowid 谓词
@@ -376,23 +373,22 @@ export function buildSearchApi(dbRO, filesRO = null) {
         LIMIT ${lim} OFFSET ${off}`);
       return attachPreviews(rows, tokens);
     });
-  }
+  };
 
-  function searchMagnetsSync(options) {
+  const searchMagnetsSync = (options) => {
     const { buildCount, buildPage, wholeSet, effLimit, effOffset, query, cond, s, countKey, cursor } =
       prepareSearch(options);
     // 预览按关键词优先挑：token 只算一次，本页所有行复用
     const tokens = queryTokens(query);
-    const toItem = (rows) => attachPreviews(rows, tokens);
     const hasSize = s.minSize !== undefined || s.maxSize !== undefined;
     // 游标模式下位置由游标决定，OFFSET 无意义；整集拉取从 0 开始
     const off0 = wholeSet || cursor ? 0 : effOffset;
     const sizeCond = buildSizeCond(s);
 
     /**
-     * 闸门用「未过滤的 FTS 匹配数」：FTS-only count 是 doclist 枚举快路径（宽词亚秒级）。
+     * 闸门用「未过滤的 FTS 匹配数」：FTS-only count 是 doclist 枚举快路径。
      * 若为决策先算 size 过滤的 JOIN count（宽词 = 匹配数 × 随机主键回查 docs），决策本身
-     * 就要十秒级。仅在大匹配集时才动用 TEMP 物化。
+     * 就要付出整轮回查的代价。仅在大匹配集时才动用 TEMP 物化。
      */
     const ftsTotal =
       s.by === 'fts' && hasSize
@@ -403,7 +399,7 @@ export function buildSearchApi(dbRO, filesRO = null) {
     const bigMatches = ftsTotal !== null && ftsTotal >= TEMP_HITS_MIN_TOTAL;
 
     // total：大匹配集的 size 过滤 count 走「hits 驱动的覆盖索引计数」（逐行主键探测，
-    // 规避 50 万次随机主键回查）；其余场景沿用原 count（FTS-only 或小集 JOIN）
+    // 规避大量随机主键回查）；其余场景沿用原 count（FTS-only 或小集 JOIN）
     const total =
       s.by === 'fts' && hasSize && bigMatches
         ? cachedTotal(countKey, () => {
@@ -437,7 +433,7 @@ export function buildSearchApi(dbRO, filesRO = null) {
     /** 可能还有下一页时给出 keyset 游标；整集拉取或未取满一页不产生。col=null 表示 id 排序 */
     const nextOf = (items, col, lim) => {
       if (wholeSet || items.length === 0 || items.length < lim) return null;
-      const last = items[items.length - 1];
+      const last = items.at(-1);
       return encodeCursor(col ? last[col] : last.id, last.id);
     };
 
@@ -485,15 +481,15 @@ export function buildSearchApi(dbRO, filesRO = null) {
 
     if (wholeSet) {
       // 一次性取到 CAP 上限，只排一次序（分批翻页会让带 bm25 的排序每轮重排一次匹配集）
-      const items = toItem(dbRO.all(buildPage(WHOLESET_CAP + 1, 0)));
+      const items = attachPreviews(dbRO.all(buildPage(WHOLESET_CAP + 1, 0)), tokens);
       const truncated = total > WHOLESET_CAP || items.length > WHOLESET_CAP;
       if (items.length > WHOLESET_CAP) items.length = WHOLESET_CAP;
       return { total, limit: 'all', offset: 0, items, truncated };
     }
-    const items = total ? toItem(dbRO.all(buildPage(effLimit, off0))) : [];
+    const items = total ? attachPreviews(dbRO.all(buildPage(effLimit, off0)), tokens) : [];
     // 通用路径（hash 模式 / relevance 排序 / 小集 + size）不支持 keyset，游标恒为 null
     return { total, limit: effLimit, offset: effOffset, items, nextCursor: null };
-  }
+  };
 
   /**
    * 「最新入库」列表：不经 FTS、无任何条件，固定按 id 倒序取一段。
@@ -502,7 +498,7 @@ export function buildSearchApi(dbRO, filesRO = null) {
    * @param {object} [options] 见 normalizeLatestQuery（只有 limit / offset）
    * @returns {{ total: number, limit: number, offset: number, items: Array }}
    */
-  function listLatestSync(options) {
+  const listLatestSync = (options) => {
     const { limit, offset } = normalizeLatestQuery(options);
     // total 优先用调用方传入值：主进程已有事件驱动的全表总数，省掉子进程每次重新
     // count(*)（O(n)，需扫描最小索引）。子进程被单独调用（测试等）时缺失该值，回退自算。
@@ -517,7 +513,7 @@ export function buildSearchApi(dbRO, filesRO = null) {
     `)
     );
     return { total, limit, offset, items };
-  }
+  };
 
   /**
    * 取某条 magnet 的完整文件树（扁平树：parent 指向父节点下标，根为 -1）。
@@ -526,7 +522,7 @@ export function buildSearchApi(dbRO, filesRO = null) {
    * @param {number} id magnet 主键
    * @returns {{ id: number, nodes: Array } | null} 该 id 在冷库中不存在时返回 null
    */
-  function getMagnetFilesSync(id) {
+  const getMagnetFilesSync = (id) => {
     const row = filesRO
       ? filesRO.all(sql`SELECT fmt, files FROM ${sql.raw(FILES_TABLE)} WHERE id = ${id}`)[0]
       : null;
@@ -539,22 +535,22 @@ export function buildSearchApi(dbRO, filesRO = null) {
       parsed = null; // 源数据本身不是合法 JSON：返回空树，前端显示「无文件列表」
     }
     return { id, nodes: buildFlatTree(parsed) };
-  }
+  };
 
   /**
-   * 冷库未命中时的兜底：读旧格式（v3 及更早）副本表里的 files 列原文。
+   * 冷库未命中时的兜底：读旧格式副本表里的 files 列原文。
    *
-   * 只在 v3→v4 迁移重建期间有意义：那时线上仍用旧的副本表服务，而冷库还是空的。
-   * v4 副本表没有 files 列，查询会抛错并被吞掉，回到「该 id 不存在」的正常语义。
+   * 只在格式迁移重建期间有意义：那时线上仍用旧副本表服务，而冷库还是空的。
+   * 当前副本表没有 files 列，查询会抛错并被吞掉，回到「该 id 不存在」的正常语义。
    */
-  function readLegacyFiles(id) {
+  const readLegacyFiles = (id) => {
     try {
       const row = dbRO.all(sql`SELECT files FROM ${sql.raw(DOCS_TABLE)} WHERE id = ${id}`)[0];
       return row ? String(row.files ?? '') : null;
     } catch {
-      return null; // 副本表已无 files 列（v4）：本兜底自然失效
+      return null; // 副本表已无 files 列：本兜底自然失效
     }
-  }
+  };
 
   return { searchMagnetsSync, listLatestSync, getMagnetFilesSync };
-}
+};

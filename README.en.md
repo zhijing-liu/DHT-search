@@ -77,7 +77,7 @@ All settings live in `config.js` as individual `export const` values; restart th
 | `SOURCE_DB_PATH` | `data/magnet.db` | Source DB path (contains the `magnets` table) |
 | `INDEX_DB_PATH` | `data/dht.search.db` | Shadow index DB (hot) path |
 | `FILES_DB_PATH` | `data/dht.files.db` | Cold DB path: `files` text + preview column, point-lookup only; may live on another disk |
-| `FILES_COMPRESS` | `true` | zlib-compress `files` in the cold DB (~5× measured); only the detail endpoint pays to inflate |
+| `FILES_COMPRESS` | `true` | zlib-compress `files` in the cold DB; only the detail endpoint pays to inflate |
 | `FILES_REWRITE_ON_REBUILD` | `false` | Unconditionally rewrite the cold DB on full rebuild. Default `false` rewrites only rows whose source-text length fingerprint changed |
 | `PORT` | `3000` | HTTP service port |
 | `WEB_BASE_PATH` | `'/dht'` | Deploy prefix of the frontend build: empty = site root; `/dht` suits reverse-proxy subpaths. Rebuild the frontend after changing |
@@ -233,17 +233,10 @@ The hot DB contains 4 kinds of objects:
 - `sync_meta`: index state (data watermark `last_rowid` / format version `files_format` / maintenance state `build_mode` / FTS merge counter `fts_pending`);
 - `keyword_stats` / `keyword_filter`: hot-keyword stats and the filter table.
 
-The cold DB holds `magnets_files` / `magnets_preview`. **Why split**: `files` + `preview` were 94% of
-the old copy table's volume (8.8GB → 0.68GB at 3.13M rows), and every slow query has the shape
-"collect N matching rowids → look each up by primary key", whose cost is governed by the copy table's
-page count — a wide table means random disk IO, a narrow one stays cached. Measured on the same box
-(search child `cache_size=2MB`):
-
-| Query (term `mp4`, 1.05M matches) | Before | After |
-|---|---:|---:|
-| `count` + size filter (1.05M PK lookups) | 31.6 s | 0.87 s |
-| Sort by fetch time (degenerate shape, index missing) | 30.8 s | 1.22 s |
-| Library deep paging `OFFSET 100000` | 225 ms | 4 ms |
+The cold DB holds `magnets_files` / `magnets_preview`. **Why split**: `files` + `preview` were most of
+the old copy table's volume, and every slow query has the shape "collect N matching rowids → look each
+up by primary key", whose cost is governed by the copy table's page count — a wide table means random
+disk IO, a narrow one stays cached.
 
 The cold DB is append-only and not part of the hot DB's atomic swap, so a full rebuild does not have to
 rewrite several GB of large objects; `FILE_REWRITE_ON_REBUILD` switches back to unconditional rewrite.
